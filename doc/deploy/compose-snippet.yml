@@ -1,0 +1,51 @@
+# Add to paperless-lxc/docker-compose.yml (services:) and set the secrets
+# shown at the bottom if not already present. Environment lives in
+# .env.paperless-rearchive (see .env.example next to this file).
+
+  paperless-rearchive:
+    build:
+      context: ../paperless-rearchive
+      dockerfile: docker/Dockerfile
+    image: paperless-rearchive:latest
+    container_name: paperless-rearchive
+    restart: unless-stopped
+    user: "1001:1001"
+    networks:
+      - backend
+    env_file:
+      - .env.paperless-rearchive
+    environment:
+      PAPERLESS_BASE_URL: "http://paperless:8000"
+      REARCHIVE_ARCHIVE_DIR: "/archives"
+      PAPERLESS_CHANDRA_SERVER_URL: "http://ai:8110/v1"
+      PAPERLESS_CHANDRA_MODEL_NAME: "chandra-ocr-2-q8"
+      PAPERLESS_CHANDRA_CONTENT_FORMAT: "markdown"
+      PAPERLESS_CHANDRA_API_KEY_FILE: /run/secrets/chandra_api_key
+      PAPERLESS_DBHOST: postgres
+      PAPERLESS_DBNAME: paperless
+      PAPERLESS_DBUSER: paperless
+      PAPERLESS_DBPASS_FILE: /run/secrets/paperless_db_paperless_passwd
+      REARCHIVE_POLL_INTERVAL: "300"
+      REARCHIVE_BATCH_LIMIT: "5"
+      REARCHIVE_OCR_CONCURRENCY: "2"
+      REARCHIVE_DRY_RUN: "false"
+    volumes:
+      # Read-write: archive files are replaced here (originals are NEVER touched).
+      - /data/paperless/media/documents/archive:/archives
+    secrets:
+      - chandra_api_key
+      - paperless_db_paperless_passwd
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        compress: "true"
+    depends_on:
+      - paperless
+
+# Secrets (already defined in the top-level `secrets:` section):
+#   chandra_api_key:
+#     file: ./secrets/chandra_api_key
+#   paperless_db_paperless_passwd:
+#     file: ./secrets/paperless_db_paperless_passwd

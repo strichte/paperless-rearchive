@@ -18,6 +18,6 @@ venv/
 .vscode/
 .DS_Store
 
-# Local deployment artefacts (secrets, staged tarballs)
-deploy/
+# Local deployment artefacts (secrets, staged tarballs) - top-level deploy dir
+/deploy/
 *.bak-*
