@@ -164,29 +164,49 @@ paperless-rearchive/
 - ✅ DB password from secret file `paperless_db_paperless_passwd`
 
 ### Phase 5 — Deployment & tests 🔧
-- ✅ Dockerfile (python3.12-slim + ghostscript/tesseract/qpdf/poppler + ocrmypdf + chandra-ocr)
+- ✅ Dockerfile (python:3.14-slim/trixie + ghostscript/tesseract/qpdf/pngquant/jbig2/poppler +
+  ocrmypdf + paperless-chandra from git master; image builds and all deps import on 3.14)
 - ✅ compose snippet + `.env.example`
 - ✅ unit tests (12 passing: replacer, runner args, config)
 - ✅ live smoke test (2026-09-15): dry-run cycle against the running instance
   (`http://localhost:8001`) — document 5488 tagged `re-ocr-content` + `re-ocr-all` was OCR'd
-  end-to-end via the live Chandra server (30,706 chars markdown sidecar produced, nothing
-  written, trigger tag kept). `re-ocr-all` archive path correctly halts when DB credentials are
-  absent (dry-run never touches tags — enforced in `pipeline._finish` call sites).
-- ⬜ full e2e in the container: build image, deploy via compose snippet, tag one
-  `re-ocr-content` document and one throwaway `re-ocr-all` document; verify content + tags +
-  archive replace + DB checksum update. Requires ghostscript/qpdf in the container (Dockerfile
-  installs them; the host shell lacked them, so local dry runs need
-  `REARCHIVE_OCR_OUTPUT_TYPE=pdf`).
+  end-to-end via the live Chandra server (~30k chars markdown sidecar produced, nothing
+  written, trigger tag kept). Dry-run never touches tags — enforced in `pipeline`.
+- ✅ in-container e2e of the OCR stage (`tests/size_compare.py`, run on the `backend` network
+  with real DB + API access): DB path resolution via `fetch_archive_filename`, checksum
+  verification, full ocrmypdf+Chandra run.
+- ✅ `REARCHIVE_OCR_MODE=auto` added: redo_ocr (text layer present) vs force_ocr.
+- ⬜ archive size investigation (see Risks): old CCITT-bilevel archives can grow up to ~8×
+  when force_ocr rasterises pages (doc 3723: 112 KiB → 900 KiB; redo_ocr did not shrink it —
+  root cause not yet confirmed). Real-scanned doc 3697 stayed at 1.00×. Debug before mass
+  re-OCR of `re-ocr-all`.
+- ⬜ repeat-loop detection: treat documents whose Chandra logs show repeated
+  `Detected repeat token, retrying generation` as failed scans (tag `-failure` / investigate).
+- ⬜ full e2e incl. writes: tag one throwaway `re-ocr-all` document; verify archive replace +
+  `archive_checksum` UPDATE + tag lifecycle (all read-only paths already validated).
 
   document (no archive upload endpoint; document upload creates *new* documents). Hence the
   bind-mount + direct DB update approach.
 - **Content update**: `PATCH /api/documents/{id}/ { "content": "..." }` works (documents
   serializer exposes `content` as writable).
-- **Live probe (2026-09-15, instance with 5352 docs)**: the documents serializer *does* expose
-  `archived_file_name` (confirmed template-derived, e.g.
-  `2026-09-15 Wisconsin ... .pdf`) but does **NOT** expose `archive_checksum` — the checksum for
-  the verify-before-replace step is read directly from Postgres
-  (`archive/db.py: fetch_archive_checksum`).
+- **Live probe (2026-09-15, instance with 5352 docs)**:
+  - the serializer exposes `archived_file_name`, but it is a **flattened download/display name**
+    (spaces instead of template subdirectories) — the real on-disk path lives **only in the DB**
+    (`documents_document.archive_filename`, e.g. `House/1925/…pdf`). The sidecar resolves the
+    archive path via `archive/db.py: fetch_archive_filename`.
+  - the serializer does **not** expose `archive_checksum` — read directly from Postgres
+    (`archive/db.py: fetch_archive_checksum`).
+  - 246 of 5352 documents have no archive file.
+- **Archive directory**: `media/documents/archive/` (singular) on this deployment, with
+  template-derived subdirectories.
+- **Chandra repeat-loop = failed scan**: when the vLLM/Chandra server logs
+  `Detected repeat token, retrying generation (attempt N)` and the GPU spins up, the model is
+  looping on a bad/empty page. Treat documents whose logs show repeated retries as *failed*
+  OCR runs (quality is garbage even if the pipeline completes). Detailed handling (e.g.
+  aborting a document after N retries at the pipeline level) is deferred — see Risks.
+- **Base image**: paperless-ngx now ships `python:3.14-slim` (Debian 13 *trixie*) — this
+  sidecar uses the same base. `jbig2` (bilevel compression for ocrmypdf) is available as an
+  apt package in trixie and is installed directly (~15% size saving measured on a real scan).
 
 
 
@@ -211,6 +231,7 @@ paperless container for provider settings):
 | `PAPERLESS_CHANDRA_CONTENT_FORMAT` | `markdown` | `markdown` or `text` |
 | `PAPERLESS_CHANDRA_MAX_OUTPUT_TOKENS` | `12384` | per-page token budget |
 | `REARCHIVE_OCR_LANGUAGE` | `eng` | passed through to ocrmypdf (labels hOCR) |
+| `REARCHIVE_OCR_MODE` | `auto` | `auto`: `redo_ocr` when the PDF has a text layer (keeps original page images), `force_ocr` otherwise; `force`: always rasterise + re-OCR; `redo`: always redo |
 | `REARCHIVE_OCR_DESKEW` | `true` | deskew pages before OCR |
 | `REARCHIVE_OCR_OUTPUT_TYPE` | `pdfa` | archive PDF/A flavour |
 | `REARCHIVE_OCR_USER_ARGS` | *(unset)* | extra ocrmypdf kwargs (JSON), e.g. paperless `PAPERLESS_OCR_USER_ARGS` |
@@ -240,3 +261,13 @@ Secrets (already defined in `paperless-lxc/docker-compose.yml`): `chandra_api_ke
   guard against concurrent modification — acceptable for a single-operator instance.
 - ⬜ `invalidate_digital_signatures: true` (paperless `PAPERLESS_OCR_USER_ARGS`) must be
   mirrored in sidecar runs for signed PDFs.
+- ⬜ **Archive size regression on old bilevel scans** (`re-ocr-all`): doc 3723 (1925 CCITT-scan)
+  grew 112 KiB → ~900 KiB even with `redo_ocr`; doc 3697 stayed 1.00×. Suspected: force/redo
+  rasterisation transcodes 1-bit images to grey, and/or LLM repeat-loop text bloat. Debug with
+  `pdfimages -list` on old vs new archives before bulk `re-ocr-all`.
+- ⬜ **Failed-scan detection**: Chandra `Detected repeat token, retrying generation` + GPU spin
+  indicates the model looping on a bad/empty page — effectively a failed OCR. Pipeline should
+  detect this (client callback / output repetition heuristic) and mark `-failure` instead of
+  writing garbage content. Deferred until observed on more documents.
+- ⬜ paperless-chandra is installed from git `master` (no release tags published upstream yet);
+  pin a tag once available for reproducible builds.

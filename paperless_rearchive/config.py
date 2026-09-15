@@ -66,6 +66,7 @@ class Settings:
 
     provider_name: str
     ocr_language: str
+    ocr_mode: str  # auto | force | redo
     ocr_deskew: bool
     ocr_output_type: str
     ocr_user_args: dict[str, object]
@@ -104,6 +105,7 @@ class Settings:
             failure_suffix=_env("REARCHIVE_FAILURE_SUFFIX", "-failure"),
             provider_name=_env("REARCHIVE_PROVIDER", "chandra"),
             ocr_language=_env("REARCHIVE_OCR_LANGUAGE", "eng"),
+            ocr_mode=_env("REARCHIVE_OCR_MODE", "auto").strip().lower(),
             ocr_deskew=_env_bool("REARCHIVE_OCR_DESKEW", True),
             ocr_output_type=_env("REARCHIVE_OCR_OUTPUT_TYPE", "pdfa"),
             ocr_user_args=user_args,

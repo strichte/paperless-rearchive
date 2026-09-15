@@ -15,6 +15,43 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+def fetch_archive_filename(db: "DbSettings", document_id: int) -> str | None:
+    """SELECT archive_filename ... (the real on-disk path relative to ARCHIVE_DIR).
+
+    The REST API's ``archived_file_name`` is a flattened display/download name
+    (spaces instead of template subdirectories) and must NOT be used to locate
+    the file on the bind mount.
+    """
+    try:
+        import psycopg
+    except ImportError as e:
+        raise RuntimeError(
+            "psycopg is not installed. Install with: pip install 'paperless-rearchive[db]'"
+        ) from e
+
+    if not db.password:
+        raise RuntimeError(
+            "PAPERLESS_DBPASS_FILE is not set or empty; cannot read archive_filename."
+        )
+    with psycopg.connect(
+        host=db.host,
+        port=db.port,
+        dbname=db.dbname,
+        user=db.user,
+        password=db.password,
+        connect_timeout=10,
+    ) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT archive_filename FROM documents_document WHERE id = %s",
+                (document_id,),
+            )
+            row = cursor.fetchone()
+    if row is None:
+        raise RuntimeError(f"Document {document_id} does not exist in the database.")
+    return row[0]
+
+
 def fetch_archive_checksum(db: "DbSettings", document_id: int) -> str | None:
     """SELECT archive_checksum ... (not exposed by the REST API serializer)."""
     try:

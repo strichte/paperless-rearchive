@@ -19,7 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 chandra = [
-    "paperless-chandra @ git+https://github.com/flobernd/paperless-chandra.git@v0.1.0",
+    "paperless-chandra @ git+https://github.com/flobernd/paperless-chandra.git@master",
 ]
 db = [
     "psycopg[binary]>=3.2",

@@ -9,7 +9,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from paperless_rearchive.archive.db import fetch_archive_checksum, update_archive_checksum
+from paperless_rearchive.archive.db import (
+    fetch_archive_checksum,
+    fetch_archive_filename,
+    update_archive_checksum,
+)
 from paperless_rearchive.archive.replacer import (
     ArchiveReplaceError,
     replace_archive,
@@ -50,41 +54,48 @@ def process_document(
     * retry    -> trigger kept (transient OCR error); nothing else touched
     """
     doc = api.document(ctx.doc_id)
-    archived_file_name = doc.get("archived_file_name") or None
     mime = guess_mime_type(Path(doc.get("original_file_name") or "x.bin"))
 
     with tempfile.TemporaryDirectory(prefix=f"rearch-{ctx.doc_id}-") as tmp:
         tmp_dir = Path(tmp)
         original = api.download_original(ctx.doc_id, tmp_dir)
 
-        # Decide whether the archive can be regenerated in place.
         do_archive = ctx.archive_mode
-        if do_archive and not archived_file_name:
-            log.info(
-                "Document %d has no archive version (born-digital or "
-                "PAPERLESS_ARCHIVE_FILE_GENERATION=never); content-only mode.",
-                ctx.doc_id,
-            )
-            do_archive = False
-        if do_archive and not mime.startswith("application/pdf") and is_image(mime):
-            log.info("Document %d is an image; content-only mode.", ctx.doc_id)
-            do_archive = False
-
         archive_path: Path | None = None
         if do_archive:
-            assert archived_file_name is not None
-            archive_path = settings.archive_dir / archived_file_name
+            # The real on-disk archive path lives only in the database: the
+            # REST API's archived_file_name is a flattened download name
+            # (no template subdirectories).
             try:
-                # archive_checksum is not exposed by the REST API; read it from
-                # Postgres directly.
-                archive_checksum = fetch_archive_checksum(settings.db, ctx.doc_id)
-                verify_current_checksum(archive_path, archive_checksum)
-            except (ArchiveReplaceError, RuntimeError) as e:
+                archive_filename = fetch_archive_filename(settings.db, ctx.doc_id)
+            except RuntimeError as e:
                 if settings.dry_run:
-                    log.error("DRY-RUN document %d: archive check failed: %s", ctx.doc_id, e)
+                    log.error("DRY-RUN document %d: DB lookup failed: %s", ctx.doc_id, e)
                     return
-                _finish(api, ctx, success=False, note=str(e))
-                return
+                raise
+            if not archive_filename:
+                log.info(
+                    "Document %d has no archive version (born-digital or "
+                    "PAPERLESS_ARCHIVE_FILE_GENERATION=never); content-only mode.",
+                    ctx.doc_id,
+                )
+                do_archive = False
+            elif not mime.startswith("application/pdf") and is_image(mime):
+                log.info("Document %d is an image; content-only mode.", ctx.doc_id)
+                do_archive = False
+            else:
+                archive_path = settings.archive_dir / archive_filename
+                try:
+                    archive_checksum = fetch_archive_checksum(settings.db, ctx.doc_id)
+                    verify_current_checksum(archive_path, archive_checksum)
+                except (ArchiveReplaceError, RuntimeError) as e:
+                    if settings.dry_run:
+                        log.error(
+                            "DRY-RUN document %d: archive check failed: %s", ctx.doc_id, e
+                        )
+                        return
+                    _finish(api, ctx, success=False, note=str(e))
+                    return
 
         new_pdf = tmp_dir / "archive.pdf"
         sidecar = tmp_dir / "sidecar.txt"

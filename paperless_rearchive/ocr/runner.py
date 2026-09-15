@@ -82,6 +82,35 @@ def get_dpi(input_file: Path, fallback_dpi: int = 0) -> int:
         return 0
 
 
+def has_text_layer(input_file: Path) -> bool:
+    """True when the PDF already carries an extractable text layer.
+
+    Used to pick the ocrmypdf mode: ``redo_ocr`` replaces just the text
+    layer and keeps the original page images (crucial for size: old CCITT
+    bilevel scans stay tiny), while ``force_ocr`` rasterises every page.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(  # noqa: S603 - fixed argv, no user input
+            ["pdftotext", str(input_file), "-"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return False
+    return len(result.stdout.strip()) >= 25
+
+
+def _env_ocr_mode(settings: "Settings") -> str:
+    mode = settings.ocr_mode
+    if mode not in ("auto", "force", "redo"):
+        log.warning("Invalid REARCHIVE_OCR_MODE=%r; using 'auto'.", mode)
+        return "auto"
+    return mode
+
+
 def build_ocrmypdf_args(
     input_file: Path,
     output_file: Path,
@@ -91,8 +120,20 @@ def build_ocrmypdf_args(
     *,
     jobs: int = 2,
 ) -> dict[str, Any]:
-    """Build the ocrmypdf.ocr() kwargs for one re-OCR run."""
+    """Build the ocrmypdf.ocr() kwargs for one re-OCR run.
+
+    Mode resolution (``REARCHIVE_OCR_MODE``):
+    * ``auto`` (default): ``redo_ocr`` when the PDF already has a text layer
+      (keeps original page images -> archive size stays near the old archive),
+      ``force_ocr`` otherwise.
+    * ``force``: always force_ocr (rasterises all pages).
+    * ``redo``: always redo_ocr.
+    """
     mime_type = guess_mime_type(input_file)
+    ocr_mode = _env_ocr_mode(settings)
+    redo = ocr_mode == "redo" or (
+        ocr_mode == "auto" and mime_type.startswith("application/pdf") and has_text_layer(input_file)
+    )
     args: dict[str, Any] = {
         "input_file_or_options": input_file,
         "output_file": output_file,
@@ -101,7 +142,7 @@ def build_ocrmypdf_args(
         "language": settings.ocr_language or "eng",
         "output_type": settings.ocr_output_type,
         "progress_bar": False,
-        "force_ocr": True,  # re-OCR: replace the old text layer entirely
+        "redo_ocr" if redo else "force_ocr": True,
         "plugins": [provider.ocrmypdf_plugin_module],
         **provider.ocrmypdf_kwargs(),
         **settings.ocr_user_args,  # e.g. invalidate_digital_signatures
@@ -156,7 +197,11 @@ def run_ocr(
     fallback_args = build_ocrmypdf_args(
         input_file, output_file, sidecar_file, provider, settings, jobs=settings.concurrency
     )
-    # Strip options known to break odd inputs (clean, deskew, rotation).
+    # Strip options known to break odd inputs. If redo_ocr was attempted
+    # (e.g. the text layer turned out to be non-editable), fall back to
+    # force_ocr, which handles any input.
+    if fallback_args.pop("redo_ocr", False):
+        fallback_args["force_ocr"] = True
     for key in ("clean", "clean_final", "deskew", "rotate_pages", "rotate_pages_threshold"):
         fallback_args.pop(key, None)
     try:
