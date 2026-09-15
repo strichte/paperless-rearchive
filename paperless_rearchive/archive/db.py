@@ -80,5 +80,7 @@ def update_archive_checksum(db: "DbSettings", document_id: int, checksum: str) -
                 )
         conn.commit()
     log.info(
-        "Updated archive_checksum for document %d in database (md5 %s)", document_id, checksum
+        "Updated archive_checksum for document %d in database (sha256 %s)",
+        document_id,
+        checksum,
     )

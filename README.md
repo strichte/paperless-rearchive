@@ -21,12 +21,12 @@ flowchart LR
         PIPE --> API[paperless_api<br/>REST client]
         PIPE --> RUN[ocr runner<br/>Django-free ocrmypdf call]
         RUN --> PROV[OcrProviderPlugin<br/>e.g. ChandraProvider]
-        PIPE --> REP[archive replacer<br/>atomic replace + MD5]
+        PIPE --> REP[archive replacer<br/>atomic replace + SHA-256]
         REP --> DB[(Postgres<br/>archive_checksum UPDATE)]
     end
     API -- "GET /api/documents<br/>PATCH content<br/>tag mgmt" --> PLX[paperless-ngx API]
     PROV -- "OpenAI-compatible<br/>chat/completions" --> LLM["Chandra inference server<br/>ai:8110/v1"]
-    REP -- "read/write archives/<br/>(bind mount)" --> MED[("/data/paperless/media/<br/>documents/archives")]
+    REP -- "read/write archive/<br/>(bind mount)" --> MED[("/data/paperless/media/<br/>documents/archive")]
     RUN -- "download original<br/>(temp dir, immutable)" --> API
 ```
 
@@ -35,7 +35,7 @@ flowchart LR
 | Tag | Effect |
 | --- | --- |
 | `re-ocr-content` | Re-OCR run; `content` field is replaced with the OCR output (markdown). |
-| `re-ocr-all` | As above, **plus** the archive version of the document is regenerated (same ocrmypdf pipeline as paperless, with the paperless-chandra plugin), atomically replacing the file in `media/documents/archives/` and updating `documents_document.archive_checksum` in the database. |
+| `re-ocr-all` | As above, **plus** the archive version of the document is regenerated (same ocrmypdf pipeline as paperless, with the paperless-chandra plugin), atomically replacing the file in `media/documents/archive/` and updating `documents_document.archive_checksum` in the database. |
 
 After processing, the trigger tag is removed and replaced with:
 
@@ -80,7 +80,7 @@ Build and add the service to `paperless-lxc/docker-compose.yml`
       - chandra_api_key
       - paperless_db_paperless_passwd
     volumes:
-      - /data/paperless/media/documents/archives:/archives
+      - /data/paperless/media/documents/archive:/archives
     environment:
       PAPERLESS_BASE_URL: "http://paperless:8000"
       ARCHIVE_DIR: "/archives"

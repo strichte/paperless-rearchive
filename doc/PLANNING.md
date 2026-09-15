@@ -17,9 +17,13 @@ The original file is immutable; it is only downloaded via the API and used as OC
 ## 2. Research notes (confirmed against paperless-ngx source / docs)
 
 - **Archive checksum**: paperless sets `archive_checksum` with
-  `documents.utils.compute_checksum` (MD5 of file bytes) when the archive is moved into
-  `settings.ARCHIVE_DIR`. Correct update statement:
-  `UPDATE documents_document SET archive_checksum = '<md5>' WHERE id = <id>;`
+  `documents.utils.compute_checksum` — **SHA-256** of the file bytes (verified live: the
+  on-disk file's SHA-256 matches the DB value exactly; earlier paperless releases used MD5)
+  when the archive is moved into `settings.ARCHIVE_DIR`. Correct update statement:
+  `UPDATE documents_document SET archive_checksum = '<sha256>' WHERE id = <id>;`
+- **Archive directory**: `media/documents/archive/` (singular) on this deployment, with
+  template-derived subdirectories (e.g. `Retirement/Steffen Richter/2026/…pdf`);
+  246 of 5352 documents have no archive file.
 - **Archive filename**: *not* always `<id>.pdf`. `file_handling.generate_unique_filename(doc,
   archive_filename=True)` derives it from storage-path / `PAPERLESS_FILENAME_FORMAT` templates
   (or `<pk:07>.pdf` when no template). The sidecar must take the archive path from the API
@@ -45,7 +49,7 @@ flowchart TB
         RUN["ocr/runner.py<br/>build_ocrmypdf_args()"]
         PROV["ocr/base.py: OcrProviderPlugin ABC"]
         CHAN["ocr/chandra.py: ChandraProvider"]
-        REP["archive/replacer.py<br/>backup + os.replace + md5"]
+        REP["archive/replacer.py<br/>backup + os.replace + sha256"]
         DBM["archive/db.py<br/>psycopg UPDATE archive_checksum"]
         CFG["config.py (Settings.from_env)"]
         MAIN --> CFG
@@ -90,7 +94,7 @@ flowchart TD
     START([document with trigger tag]) --> DL["download original via API<br/>(temp dir, never modified)"]
     DL --> ARCH{"re-ocr-all AND archived_file_name present AND original is PDF?"}
     ARCH -- "no" --> CO["content-only mode"]
-    ARCH -- "yes" --> CK{"on-disk archive md5 == DB archive_checksum?"}
+    ARCH -- "yes" --> CK{"on-disk archive sha256 == DB archive_checksum?"}
     CK -- "no" --> FAIL["failure tag<br/>(archive changed underneath us)"]
     CK -- "yes" --> OCR["ocrmypdf: force_ocr, output_type=pdfa,<br/>deskew/clean per config, plugins=provider"]
     CO --> OCR
@@ -100,7 +104,7 @@ flowchart TD
     DRY -- "yes" --> REPORT["log what would be written<br/>+ keep trigger tag"]
     DRY -- "no" --> PATCH["PATCH content (markdown)"]
     PATCH --> MODE{"re-ocr-all?"}
-    MODE -- "yes" --> REPL["backup old archive to .bak<br/>atomic os.replace(new, archive_path)<br/>md5 then UPDATE documents_document"]
+    MODE -- "yes" --> REPL["backup old archive to .bak<br/>atomic os.replace(new, archive_path)<br/>sha256 then UPDATE documents_document"]
     MODE -- "no" --> TAGS
     REPL --> TAGS["remove trigger tag<br/>add ...-success"]
     FAIL --> TAGSF["remove trigger tag<br/>add ...-failure"]
@@ -132,7 +136,7 @@ paperless-rearchive/
 │   └── archive/
 │       ├── __init__.py
 │       ├── db.py              # psycopg checksum update
-│       └── replacer.py        # backup + atomic replace + md5
+│       └── replacer.py        # backup + atomic replace + sha256
 ├── docker/Dockerfile
 ├── pyproject.toml
 └── tests/
@@ -156,7 +160,7 @@ paperless-rearchive/
 
 ### Phase 4 — Archive replacement ✅
 - ✅ `archive/db.py` (psycopg; fetch + update archive_checksum)
-- ✅ `archive/replacer.py` (verify checksum, backup, atomic replace, md5)
+- ✅ `archive/replacer.py` (verify checksum, backup, atomic replace, sha256)
 - ✅ DB password from secret file `paperless_db_paperless_passwd`
 
 ### Phase 5 — Deployment & tests 🔧
@@ -199,7 +203,7 @@ paperless container for provider settings):
 | `REARCHIVE_TRIGGER_TAG_ALL` | `re-ocr-all` | trigger tag, archive + content mode |
 | `REARCHIVE_SUCCESS_SUFFIX` | `-success` | success tag suffix |
 | `REARCHIVE_FAILURE_SUFFIX` | `-failure` | failure tag suffix |
-| `REARCHIVE_ARCHIVE_DIR` | `/archives` | bind-mounted `media/documents/archives` |
+| `REARCHIVE_ARCHIVE_DIR` | `/archives` | bind-mounted `media/documents/archive` |
 | `REARCHIVE_PROVIDER` | `chandra` | OCR provider plugin |
 | `PAPERLESS_CHANDRA_SERVER_URL` | *(required)* | e.g. `http://ai:8110/v1` |
 | `PAPERLESS_CHANDRA_MODEL_NAME` | `chandra` | e.g. `chandra-ocr-2-q8` |

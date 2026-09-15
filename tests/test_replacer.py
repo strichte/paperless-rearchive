@@ -8,7 +8,7 @@ import pytest
 
 from paperless_rearchive.archive.replacer import (
     ArchiveReplaceError,
-    md5_of_file,
+    checksum_of_file,
     replace_archive,
     verify_current_checksum,
 )
@@ -21,12 +21,12 @@ def _write(path: Path, data: bytes) -> Path:
 
 def test_md5_of_file(tmp_path: Path) -> None:
     f = _write(tmp_path / "a.pdf", b"hello world")
-    assert md5_of_file(f) == "5eb63bbbe01eeed093cb22bb8f5acdc3"
+    assert checksum_of_file(f) == "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
 
 
 def test_verify_checksum_ok_and_missing(tmp_path: Path) -> None:
     f = _write(tmp_path / "a.pdf", b"data")
-    verify_current_checksum(f, md5_of_file(f))  # no raise
+    verify_current_checksum(f, checksum_of_file(f))  # no raise
     verify_current_checksum(f, None)  # no checksum known -> allowed
     with pytest.raises(ArchiveReplaceError, match="not found"):
         verify_current_checksum(tmp_path / "missing.pdf", "x")
@@ -45,8 +45,8 @@ def test_replace_archive_atomic_and_backup(tmp_path: Path) -> None:
     checksum = replace_archive(old, new, keep_backup=True)
 
     assert old.read_bytes() == b"new-archive-bytes"
-    assert md5_of_file(old) == checksum
-    assert checksum == md5_of_file(new)
+    assert checksum_of_file(old) == checksum
+    assert checksum == checksum_of_file(new)
     backups = list(tmp_path.glob("0000123.pdf.bak-*"))
     assert len(backups) == 1
     assert backups[0].read_bytes() == b"old-archive-bytes"
