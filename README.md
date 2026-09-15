@@ -131,6 +131,11 @@ Build and add the service to `paperless-lxc/docker-compose.yml`
 
 Configuration is documented in [`doc/PLANNING.md#configuration`](doc/PLANNING.md#configuration).
 
+**Secrets:** every credential can be provided either inline (in `.env.paperless-rearchive`) or
+via a secret file using the paperless-ngx `_FILE` convention — `PAPERLESS_API_TOKEN_FILE`,
+`PAPERLESS_CHANDRA_API_KEY_FILE`, `PAPERLESS_DBPASS_FILE`, `PAPERLESS_DBUSER_FILE`. The `_FILE`
+variant wins when both are set. See `doc/deploy/compose-snippet.yml` for a `_FILE`-based example.
+
 ## Components
 
 ```mermaid

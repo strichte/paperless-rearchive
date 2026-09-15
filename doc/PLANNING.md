@@ -163,6 +163,7 @@ paperless-rearchive/
 │   ├── __init__.py
 │   ├── config.py              # env-driven Settings
 │   ├── logging_setup.py       # shared logging config (poll + containers)
+│   ├── secrets.py             # *_FILE secret resolution (paperless-ngx convention)
 │   ├── paperless_api.py       # REST client (tag lookup, original download, PATCH, tag swap)
 │   ├── pipeline.py            # per-document orchestration
 │   ├── poller.py              # main loop (entry point)
@@ -237,12 +238,17 @@ paperless-rearchive/
 ## 6. Configuration
 
 Environment variables (prefix `REARCHIVE_` where generic; `PAPERLESS_CHANDRA_*` shared with the
-paperless container for provider settings):
+paperless container for provider settings).
+
+**Secret convention:** every credential supports the paperless-ngx `_FILE` mechanism — for a
+variable `NAME`, the environment variable `NAME_FILE` may point at a file (e.g. a Docker secret)
+whose content is used instead of `NAME`. `_FILE` wins when both are set. This applies to the API
+token, the Chandra key, and the database user/password.
 
 | Variable | Default | Description |
 | --- | --- | --- |
 | `PAPERLESS_BASE_URL` | `http://paperless:8000` | paperless-ngx base URL |
-| `PAPERLESS_API_TOKEN` | *(required)* | API token (from `.env.paperless-gpt`) |
+| `PAPERLESS_API_TOKEN` *(or `PAPERLESS_API_TOKEN_FILE`)* | *(required)* | API token (from `.env.paperless-gpt`) |
 | `REARCHIVE_TRIGGER_TAG_CONTENT` | `re-ocr-content` | trigger tag, content-only mode |
 | `REARCHIVE_TRIGGER_TAG_ALL` | `re-ocr-all` | trigger tag, archive + content mode |
 | `REARCHIVE_SUCCESS_SUFFIX` | `-success` | success tag suffix |
@@ -251,7 +257,7 @@ paperless container for provider settings):
 | `REARCHIVE_PROVIDER` | `chandra` | OCR provider plugin |
 | `PAPERLESS_CHANDRA_SERVER_URL` | *(required)* | e.g. `http://ai:8110/v1` |
 | `PAPERLESS_CHANDRA_MODEL_NAME` | `chandra` | e.g. `chandra-ocr-2-q8` |
-| `PAPERLESS_CHANDRA_API_KEY_FILE` | *(optional)* | secret file with API key |
+| `PAPERLESS_CHANDRA_API_KEY` *(or `PAPERLESS_CHANDRA_API_KEY_FILE`)* | *(optional)* | Chandra server API key / secret file |
 | `PAPERLESS_CHANDRA_CONTENT_FORMAT` | `markdown` | `markdown` or `text` |
 | `PAPERLESS_CHANDRA_MAX_OUTPUT_TOKENS` | `12384` | per-page token budget |
 | `REARCHIVE_OCR_LANGUAGE` | `eng` | passed through to ocrmypdf (labels hOCR) |
@@ -267,8 +273,9 @@ paperless container for provider settings):
 | `REARCHIVE_DRY_RUN` | `false` | OCR + report only, no writes |
 | `REARCHIVE_RUN_ONCE` | `false` | single cycle then exit |
 | `REARCHIVE_LOG_LEVEL` | `INFO` | log level |
-| `PAPERLESS_DBHOST` / `PAPERLESS_DBPORT` / `PAPERLESS_DBNAME` / `PAPERLESS_DBUSER` | `postgres` / `5432` / `paperless` / `paperless` | DB connection |
-| `PAPERLESS_DBPASS_FILE` | *(required for re-ocr-all)* | secret file with DB password |
+| `PAPERLESS_DBHOST` / `PAPERLESS_DBPORT` / `PAPERLESS_DBNAME` | `postgres` / `5432` / `paperless` | DB connection |
+| `PAPERLESS_DBUSER` *(or `PAPERLESS_DBUSER_FILE`)* | `paperless` | DB user |
+| `PAPERLESS_DBPASS` *(or `PAPERLESS_DBPASS_FILE`)* | *(required for re-ocr-all)* | DB password / secret file |
 
 Secrets (already defined in `paperless-lxc/docker-compose.yml`): `chandra_api_key`,
 `paperless_db_paperless_passwd`.

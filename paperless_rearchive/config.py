@@ -8,6 +8,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from paperless_rearchive.secrets import secret, secret_or_default
+
 
 def _env(name: str, default: str) -> str:
     value = os.environ.get(name)
@@ -26,12 +28,6 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _read_secret_file(path: str | None) -> str:
-    if not path:
-        return ""
-    return Path(path).read_text(encoding="utf-8").strip()
-
-
 @dataclass(frozen=True)
 class DbSettings:
     """Postgres connection for the archive_checksum UPDATE."""
@@ -48,8 +44,10 @@ class DbSettings:
             host=_env("PAPERLESS_DBHOST", "postgres"),
             port=_env_int("PAPERLESS_DBPORT", 5432),
             dbname=_env("PAPERLESS_DBNAME", "paperless"),
-            user=_env("PAPERLESS_DBUSER", "paperless"),
-            password=_read_secret_file(_env("PAPERLESS_DBPASS_FILE", "")),
+            # Values may be supplied directly or via the *_FILE secret files
+            # (paperless-ngx convention).
+            user=secret_or_default("PAPERLESS_DBUSER", "paperless"),
+            password=secret("PAPERLESS_DBPASS"),
         )
 
 
@@ -97,7 +95,7 @@ class Settings:
             raise ValueError("REARCHIVE_OCR_USER_ARGS must decode to a JSON object")
         return cls(
             paperless_url=_env("PAPERLESS_BASE_URL", "http://paperless:8000").rstrip("/"),
-            api_token=_env("PAPERLESS_API_TOKEN", ""),
+            api_token=secret("PAPERLESS_API_TOKEN"),
             archive_dir=Path(_env("REARCHIVE_ARCHIVE_DIR", "/archives")),
             trigger_tag_content=_env("REARCHIVE_TRIGGER_TAG_CONTENT", "re-ocr-content"),
             trigger_tag_all=_env("REARCHIVE_TRIGGER_TAG_ALL", "re-ocr-all"),

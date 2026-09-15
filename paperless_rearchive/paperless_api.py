@@ -42,7 +42,7 @@ def filename_from_disposition(disposition: str) -> str | None:
 class PaperlessAPI:
     def __init__(self, base_url: str, token: str, timeout: float = 120.0) -> None:
         if not token:
-            raise PaperlessError("PAPERLESS_API_TOKEN is required")
+            raise PaperlessError("PAPERLESS_API_TOKEN (or PAPERLESS_API_TOKEN_FILE) is required")
         self.base = base_url.rstrip("/")
         self.timeout = timeout
         self.session = requests.Session()

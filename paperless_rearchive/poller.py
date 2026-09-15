@@ -61,7 +61,7 @@ def main() -> None:
     settings = Settings.from_env()
     configure_logging(settings.log_level)
     if not settings.api_token:
-        sys.exit("PAPERLESS_API_TOKEN is required")
+        sys.exit("PAPERLESS_API_TOKEN (or PAPERLESS_API_TOKEN_FILE) is required")
 
     api = PaperlessAPI(settings.paperless_url, settings.api_token)
     log.info(

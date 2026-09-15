@@ -3,21 +3,15 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import Any
 
 from paperless_rearchive.ocr.base import OcrProviderPlugin
+from paperless_rearchive.secrets import secret
 
 
 def _env(name: str, default: str = "") -> str:
     value = os.environ.get(name)
     return value if value not in (None, "") else default
-
-
-def _read_secret_file(path: str) -> str:
-    if not path:
-        return ""
-    return Path(path).read_text(encoding="utf-8").strip()
 
 
 class ChandraProvider(OcrProviderPlugin):
@@ -30,10 +24,9 @@ class ChandraProvider(OcrProviderPlugin):
         # Fallbacks mirror the paperless-chandra defaults.
         self.server_url = _env("PAPERLESS_CHANDRA_SERVER_URL")
         self.model_name = _env("PAPERLESS_CHANDRA_MODEL_NAME", "chandra")
-        self.api_key = (
-            _env("PAPERLESS_CHANDRA_API_KEY")
-            or _read_secret_file(_env("PAPERLESS_CHANDRA_API_KEY_FILE"))
-        )
+        # API key may come from PAPERLESS_CHANDRA_API_KEY or the secret file
+        # PAPERLESS_CHANDRA_API_KEY_FILE (paperless-ngx convention).
+        self.api_key = secret("PAPERLESS_CHANDRA_API_KEY")
         self.content_format = _env("PAPERLESS_CHANDRA_CONTENT_FORMAT", "markdown")
         self.max_output_tokens = int(_env("PAPERLESS_CHANDRA_MAX_OUTPUT_TOKENS", "12384"))
 

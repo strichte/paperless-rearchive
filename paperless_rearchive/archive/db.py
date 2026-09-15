@@ -33,7 +33,8 @@ def _connect(db: DbSettings) -> Iterator[Any]:
 
     if not db.password:
         raise RuntimeError(
-            "PAPERLESS_DBPASS_FILE is not set or empty; cannot access the database."
+            "PAPERLESS_DBPASS / PAPERLESS_DBPASS_FILE is not set or empty; cannot access the "
+            "database."
         )
     with psycopg.connect(
         host=db.host,

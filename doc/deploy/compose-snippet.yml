@@ -1,6 +1,13 @@
 # Add to paperless-lxc/docker-compose.yml (services:) and set the secrets
 # shown at the bottom if not already present. Environment lives in
 # .env.paperless-rearchive (see .env.example next to this file).
+#
+# Secret convention: every credential can be set inline (<VAR>) or via a
+# mounted secret file (<VAR>_FILE), paperless-ngx style. The *_FILE variant
+# wins when both are set. This snippet uses *_FILE for all existing Docker
+# secrets; the API token is still passed inline from .env.paperless-rearchive
+# (in your deployment you may instead add PAPERLESS_API_TOKEN_FILE if the token
+# should live in a secret file).
 
   paperless-rearchive:
     build:
