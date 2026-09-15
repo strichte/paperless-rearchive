@@ -48,6 +48,28 @@ After processing, the trigger tag is removed and replaced with:
 A trigger tag is only replaced when the pipeline reached a decision; transient upstream errors
 (OCR server unreachable, network hiccup) leave the trigger tag in place for the next poll cycle.
 
+**No manual tag creation needed.** The sidecar automatically creates both trigger tags
+(`re-ocr-content` and `re-ocr-all`) via the paperless-ngx API on every poll cycle if they
+don't already exist. You can tag documents immediately after starting the container — there's
+no setup step to create the tags first. If the tags are ever accidentally deleted, they'll be
+recreated on the next poll.
+
+## Manual tag poll trigger (SIGHUP)
+
+The tag polling loop runs on a configurable interval (`REARCHIVE_POLL_INTERVAL`, default 300 seconds).
+To trigger an immediate poll without waiting for the next interval, send `SIGHUP` to the container:
+
+```bash
+docker kill -s HUP paperless-rearchive
+```
+
+This causes the poller to wake up and run an immediate tag scan, picking up any newly added trigger
+tags right away. The SIGHUP handler is deliberately lightweight — it interrupts the current sleep and
+triggers a single poll cycle; it does **not** reset the interval timer or disrupt an in-flight OCR run.
+
+This is useful when you've just tagged a batch of documents and don't want to wait for the next poll
+cycle to begin processing.
+
 ## Guarantees
 
 - **The original file is immutable.** It is only ever downloaded via the API into a scratch
