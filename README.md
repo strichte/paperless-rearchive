@@ -1,0 +1,111 @@
+# paperless-rearchive
+
+A tag-driven sidecar for [paperless-ngx](https://github.com/paperless-ngx/paperless-ngx) that
+re-OCRs existing documents with state-of-the-art LLM vision OCR and (optionally) regenerates the
+archive version of a document — something the paperless-ngx API does not allow.
+
+It reuses the OCR/hOCR/pipeline code from
+[paperless-chandra](https://github.com/flobernd/paperless-chandra) and drives `ocrmypdf` with the
+same paperless-chandra ocrmypdf plugin that new documents are ingested with, so re-processed
+documents get *identical* quality and PDF/A output as fresh ingestions.
+
+> **Status: work in progress.** See [`doc/PLANNING.md`](doc/PLANNING.md) for the implementation
+> plan and per-phase checklist. The checklists below are kept up to date as the project evolves.
+
+## How it works
+
+```mermaid
+flowchart LR
+    subgraph sidecar["paperless-rearchive sidecar"]
+        P[poller<br/>tag polling loop] --> PIPE[pipeline<br/>per-document orchestration]
+        PIPE --> API[paperless_api<br/>REST client]
+        PIPE --> RUN[ocr runner<br/>Django-free ocrmypdf call]
+        RUN --> PROV[OcrProviderPlugin<br/>e.g. ChandraProvider]
+        PIPE --> REP[archive replacer<br/>atomic replace + MD5]
+        REP --> DB[(Postgres<br/>archive_checksum UPDATE)]
+    end
+    API -- "GET /api/documents<br/>PATCH content<br/>tag mgmt" --> PLX[paperless-ngx API]
+    PROV -- "OpenAI-compatible<br/>chat/completions" --> LLM["Chandra inference server<br/>ai:8110/v1"]
+    REP -- "read/write archives/<br/>(bind mount)" --> MED[("/data/paperless/media/<br/>documents/archives")]
+    RUN -- "download original<br/>(temp dir, immutable)" --> API
+```
+
+## Trigger tags
+
+| Tag | Effect |
+| --- | --- |
+| `re-ocr-content` | Re-OCR run; `content` field is replaced with the OCR output (markdown). |
+| `re-ocr-all` | As above, **plus** the archive version of the document is regenerated (same ocrmypdf pipeline as paperless, with the paperless-chandra plugin), atomically replacing the file in `media/documents/archives/` and updating `documents_document.archive_checksum` in the database. |
+
+After processing, the trigger tag is removed and replaced with:
+
+| Outcome | `re-ocr-content` documents | `re-ocr-all` documents |
+| --- | --- | --- |
+| Success | `re-ocr-content-success` | `re-ocr-success` |
+| Failure | `re-ocr-content-failure` | `re-ocr-failure` |
+
+A trigger tag is only replaced when the pipeline reached a decision; transient upstream errors
+(OCR server unreachable, network hiccup) leave the trigger tag in place for the next poll cycle.
+
+## Guarantees
+
+- **The original file is immutable.** It is only ever downloaded via the API into a scratch
+  directory and used as the OCR source. Nothing ever writes to `media/documents/originals/`.
+- Archive files are replaced **atomically** (write temp file → `os.replace`) and the previous
+  archive version is kept as a `.bak` file next to it.
+- The archive is only replaced after verifying that the on-disk archive checksum still matches
+  `documents_document.archive_checksum` (no concurrent modification).
+- Born-digital PDFs without an archive version, and non-PDF originals (images), are handled in
+  content-only mode — they have no archive file that could be regenerated in place.
+- `DRY_RUN=true` performs the full OCR run and reports what would be written without touching
+  paperless, the archives directory, or the database (tags must already exist).
+
+## Deployment
+
+Build and add the service to `paperless-lxc/docker-compose.yml`
+(see [`doc/deploy/compose-snippet.yml`](doc/deploy/compose-snippet.yml) for the full snippet):
+
+```yaml
+  paperless-rearchive:
+    build: ../paperless-rearchive
+    image: paperless-rearchive:latest
+    container_name: paperless-rearchive
+    restart: unless-stopped
+    user: "1001:1001"
+    networks:
+      - backend
+    env_file:
+      - .env.paperless-rearchive
+    secrets:
+      - chandra_api_key
+      - paperless_db_paperless_passwd
+    volumes:
+      - /data/paperless/media/documents/archives:/archives
+    environment:
+      PAPERLESS_BASE_URL: "http://paperless:8000"
+      ARCHIVE_DIR: "/archives"
+      PAPERLESS_CHANDRA_SERVER_URL: "http://ai:8110/v1"
+      PAPERLESS_CHANDRA_MODEL_NAME: "chandra-ocr-2-q8"
+      PAPERLESS_CHANDRA_CONTENT_FORMAT: "markdown"
+```
+
+Configuration is documented in [`doc/PLANNING.md#configuration`](doc/PLANNING.md#configuration).
+
+## Components
+
+```mermaid
+flowchart TB
+    subgraph providers["OcrProviderPlugin architecture"]
+        ABC["OcrProviderPlugin (ABC)<br/>ocrmypdf_plugin_module + ocrmypdf_kwargs()"]
+        CHANDRA["ChandraProvider<br/>wraps paperless-chandra:<br/>engine/client, blocks, hocr,<br/>deskew, osd, ocrmypdf_plugin"]
+        FUTURE["Future LLM providers<br/>(own OCR output → hOCR +<br/>content post-processing)"]
+        ABC --- CHANDRA
+        ABC --- FUTURE
+    end
+    CHANDRA --> OMP["ocrmypdf<br/>plugins=[...chandra...], force_ocr,<br/>output_type=pdfa → hOCR → invisible<br/>text layer + markdown sidecar"]
+```
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
+
