@@ -44,7 +44,9 @@ def test_build_args_defaults(tmp_path: Path) -> None:
     pdf.write_bytes(b"%PDF-1.4")
     args = build_ocrmypdf_args(pdf, tmp_path / "out.pdf", tmp_path / "s.txt",
                                _FakeProvider(), _settings(), jobs=2)
-    assert args["force_ocr"] is True
+    # No text layer in the input -> ocrmypdf is allowed to OCR bare pages only.
+    assert args["skip_text"] is True
+    assert "force_ocr" not in args
     assert args["plugins"] == ["fake_plugin"]
     assert args["fake_url"] == "http://x"
     assert args["output_type"] == "pdfa"
@@ -52,6 +54,51 @@ def test_build_args_defaults(tmp_path: Path) -> None:
     assert args["sidecar"] == tmp_path / "s.txt"
     assert args["invalidate_digital_signatures"] is True
     assert "image_dpi" not in args
+
+
+def _with_text_layer():
+    return patch("paperless_rearchive.ocr.runner.has_text_layer", return_value=True)
+
+
+def test_auto_prefers_redo_on_existing_text(tmp_path: Path) -> None:
+    """auto must never rasterise: text-bearing PDFs get redo_ocr, and deskew is
+    dropped because ocrmypdf rejects --redo-ocr together with --deskew."""
+    pdf = tmp_path / "doc.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+    with _with_text_layer():
+        args = build_ocrmypdf_args(pdf, tmp_path / "o.pdf", tmp_path / "s.txt",
+                                   _FakeProvider(), _settings())
+    assert args["redo_ocr"] is True
+    assert "force_ocr" not in args
+    assert "skip_text" not in args
+    assert "deskew" not in args
+
+
+def test_redo_mode_drops_deskew(tmp_path: Path) -> None:
+    pdf = tmp_path / "doc.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+    s = _settings(REARCHIVE_OCR_MODE="redo", REARCHIVE_OCR_DESKEW="true")
+    args = build_ocrmypdf_args(pdf, tmp_path / "o.pdf", tmp_path / "s.txt", _FakeProvider(), s)
+    assert args["redo_ocr"] is True
+    assert "deskew" not in args
+
+
+def test_force_mode_rasterises_and_keeps_deskew(tmp_path: Path) -> None:
+    pdf = tmp_path / "doc.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+    s = _settings(REARCHIVE_OCR_MODE="force")
+    args = build_ocrmypdf_args(pdf, tmp_path / "o.pdf", tmp_path / "s.txt", _FakeProvider(), s)
+    assert args["force_ocr"] is True
+    assert "redo_ocr" not in args
+    assert args["deskew"] is True
+
+
+def test_no_deskew_when_disabled(tmp_path: Path) -> None:
+    pdf = tmp_path / "doc.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+    s = _settings(REARCHIVE_OCR_DESKEW="false")
+    args = build_ocrmypdf_args(pdf, tmp_path / "o.pdf", tmp_path / "s.txt", _FakeProvider(), s)
+    assert "deskew" not in args
 
 
 def test_build_args_image_dpi(tmp_path: Path) -> None:
@@ -99,3 +146,144 @@ def test_settings_defaults() -> None:
 def test_settings_bad_user_args() -> None:
     with pytest.raises(ValueError, match="REARCHIVE_OCR_USER_ARGS"):
         _settings(REARCHIVE_OCR_USER_ARGS="not-json")
+
+
+# --------------------------------------------------------------------------
+# Regression tests for the bugs found during the first real end-to-end run.
+# --------------------------------------------------------------------------
+
+
+class TestFilenameFromDisposition:
+    """The old split-on-'filename=' parser left a trailing quote behind."""
+
+    def test_quoted_filename_has_no_trailing_quote(self) -> None:
+        from paperless_rearchive.paperless_api import filename_from_disposition
+
+        name = filename_from_disposition('attachment; filename="2026-01-07 a b.pdf"')
+        assert name == "2026-01-07 a b.pdf"
+        assert not name.endswith('"')
+
+    def test_unquoted_filename(self) -> None:
+        from paperless_rearchive.paperless_api import filename_from_disposition
+
+        assert filename_from_disposition("attachment; filename=scan.pdf") == "scan.pdf"
+
+    def test_rfc5987_filename(self) -> None:
+        from paperless_rearchive.paperless_api import filename_from_disposition
+
+        name = filename_from_disposition(
+            "attachment; filename*=UTF-8''%C3%9Cbersicht%20Q1.pdf",
+        )
+        assert name == "Übersicht Q1.pdf"
+
+    def test_directory_components_are_stripped(self) -> None:
+        from paperless_rearchive.paperless_api import filename_from_disposition
+
+        assert filename_from_disposition('attachment; filename="../../etc/passwd"') == "passwd"
+
+    def test_empty_disposition(self) -> None:
+        from paperless_rearchive.paperless_api import filename_from_disposition
+
+        assert filename_from_disposition("") is None
+
+
+class TestSniffMimeType:
+    """A PDF must never be typed as octet-stream: it decides the OCR mode."""
+
+    def test_pdf_magic(self, tmp_path: Path) -> None:
+        from paperless_rearchive.ocr.runner import sniff_mime_type
+
+        pdf = tmp_path / "no-extension"
+        pdf.write_bytes(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
+        assert sniff_mime_type(pdf) == "application/pdf"
+
+    def test_guess_falls_back_to_sniffing(self, tmp_path: Path) -> None:
+        from paperless_rearchive.ocr.runner import guess_mime_type
+
+        pdf = tmp_path / 'weird.pdf"'
+        pdf.write_bytes(b"%PDF-1.4\n")
+        assert guess_mime_type(pdf) == "application/pdf"
+
+    def test_unknown_bytes(self, tmp_path: Path) -> None:
+        from paperless_rearchive.ocr.runner import sniff_mime_type
+
+        blob = tmp_path / "x.bin"
+        blob.write_bytes(b"\x00\x01\x02\x03")
+        assert sniff_mime_type(blob) == "application/octet-stream"
+
+
+class TestOcrSkippedAll:
+    """Placeholder-only sidecars must never reach the document content field."""
+
+    def test_placeholder_only(self) -> None:
+        from paperless_rearchive.ocr.runner import ocr_skipped_all
+
+        assert ocr_skipped_all("[OCR skipped on page(s) 1-3]")
+
+    def test_placeholder_among_real_text(self) -> None:
+        from paperless_rearchive.ocr.runner import ocr_skipped_all
+
+        assert not ocr_skipped_all("[OCR skipped on page(s) 1]\n\nReal recognised text.")
+
+    def test_plain_text(self) -> None:
+        from paperless_rearchive.ocr.runner import ocr_skipped_all
+
+        assert not ocr_skipped_all("# Invoice\n\nTotal: 42 EUR")
+
+    def test_empty(self) -> None:
+        from paperless_rearchive.ocr.runner import ocr_skipped_all
+
+        assert ocr_skipped_all("")
+
+
+class TestSelectOcrStrategy:
+    """auto must never rasterise: redo for text PDFs, skip_text otherwise."""
+
+    def test_force_mode(self, tmp_path: Path) -> None:
+        from paperless_rearchive.ocr.runner import select_ocr_strategy
+
+        pdf = tmp_path / "a.pdf"
+        pdf.write_bytes(b"%PDF-1.4\n")
+        assert select_ocr_strategy("force", pdf, "application/pdf") == "force"
+
+    def test_redo_mode(self, tmp_path: Path) -> None:
+        from paperless_rearchive.ocr.runner import select_ocr_strategy
+
+        pdf = tmp_path / "a.pdf"
+        pdf.write_bytes(b"%PDF-1.4\n")
+        assert select_ocr_strategy("redo", pdf, "application/pdf") == "redo"
+
+    def test_auto_without_text_layer_uses_skip_text(self, tmp_path: Path) -> None:
+        from paperless_rearchive.ocr.runner import select_ocr_strategy
+
+        pdf = tmp_path / "a.pdf"
+        pdf.write_bytes(b"%PDF-1.4\n")
+        assert select_ocr_strategy("auto", pdf, "application/pdf") == "skip_text"
+
+    def test_auto_with_text_layer_uses_redo(self, tmp_path: Path) -> None:
+        from paperless_rearchive.ocr.runner import select_ocr_strategy
+
+        pdf = tmp_path / "a.pdf"
+        pdf.write_bytes(b"%PDF-1.4\n")
+        with patch("paperless_rearchive.ocr.runner.has_text_layer", return_value=True):
+            assert select_ocr_strategy("auto", pdf, "application/pdf") == "redo"
+
+    def test_auto_non_pdf_uses_skip_text(self, tmp_path: Path) -> None:
+        from paperless_rearchive.ocr.runner import select_ocr_strategy
+
+        png = tmp_path / "a.png"
+        png.write_bytes(b"\x89PNG\r\n\x1a\n")
+        assert select_ocr_strategy("auto", png, "image/png") == "skip_text"
+
+
+def test_redo_drops_deskew(tmp_path: Path) -> None:
+    """ocrmypdf rejects --redo-ocr together with --deskew."""
+    pdf = tmp_path / "doc.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+    with patch("paperless_rearchive.ocr.runner.has_text_layer", return_value=True):
+        args = build_ocrmypdf_args(
+            pdf, tmp_path / "o.pdf", tmp_path / "s.txt", _FakeProvider(), _settings()
+        )
+    assert args["redo_ocr"] is True
+    assert "deskew" not in args
+    assert "force_ocr" not in args

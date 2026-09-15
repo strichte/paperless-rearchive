@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+from email.message import Message
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import requests
 
@@ -13,6 +15,28 @@ log = logging.getLogger(__name__)
 
 class PaperlessError(RuntimeError):
     """A paperless API call failed."""
+
+
+def filename_from_disposition(disposition: str) -> str | None:
+    """Extract a usable basename from a ``Content-Disposition`` header.
+
+    Splitting on ``filename=`` and stripping quotes (the previous approach) left
+    the trailing quote of ``filename="a b.pdf"`` in place, which produced a
+    ``.pdf"`` suffix: the file was then typed ``application/octet-stream`` and
+    the OCR strategy selection silently degraded to ``skip_text``. ``Message``
+    implements the header parsing rules properly, including RFC 2231/5987
+    (``filename*=UTF-8''...``) and quoted-string unescaping. Any directory
+    component is dropped so a hostile filename cannot escape the temp dir.
+    """
+    if not disposition:
+        return None
+    message = Message()
+    message["Content-Disposition"] = disposition
+    name = message.get_filename()
+    if not name:
+        return None
+    name = unquote(name).strip()
+    return Path(name).name or None
 
 
 class PaperlessAPI:
@@ -37,12 +61,31 @@ class PaperlessAPI:
     # ------------------------------------------------------------------- tags
 
     def tag_id(self, name: str) -> int | None:
+        """Resolve a tag id by exact name (case-insensitive).
+
+        .. warning::
+
+            paperless-ngx silently ignores unknown filter parameters and returns
+            the *unfiltered* list, so the obvious ``?name=`` query yields the
+            first tag in the database rather than nothing. That bug once made
+            :meth:`ensure_tag` report every tag as existing, so trigger tags were
+            never created and documents were never re-tagged. The supported
+            parameter is ``name__iexact``; the returned ``name`` is checked
+            anyway, because a silently ignored filter must never be mistaken for
+            a match.
+        """
         response = self._check(
-            self.session.get(self._url("/api/tags/"), params={"name": name}, timeout=self.timeout),
+            self.session.get(
+                self._url("/api/tags/"),
+                params={"name__iexact": name},
+                timeout=self.timeout,
+            ),
             f"lookup tag {name!r}",
         )
-        results = response.json().get("results", [])
-        return int(results[0]["id"]) if results else None
+        for result in response.json().get("results", []):
+            if result.get("name") == name:
+                return int(result["id"])
+        return None
 
     def ensure_tag(self, name: str) -> int:
         existing = self.tag_id(name)
@@ -85,19 +128,26 @@ class PaperlessAPI:
         return dict(response.json())
 
     def download_original(self, doc_id: int, dest_dir: Path) -> Path:
+        """Download the immutable *original* file of a document.
+
+        ``/api/documents/<id>/download/`` serves the **archive** version when the
+        document has one - ``DocumentViewSet.file_response`` calls
+        ``serve_file(use_archive=not self.original_requested(request) ...)``. The
+        original is only returned when the ``original=true`` query parameter is
+        present, so it must always be sent here: re-OCR must read the untouched
+        source, never the derived archive.
+        """
         response = self._check(
             self.session.get(
                 self._url(f"/api/documents/{doc_id}/download/"),
+                params={"original": "true"},
                 timeout=self.timeout,
                 stream=True,
             ),
             f"download original of document {doc_id}",
         )
-        filename = "original.bin"
-        disposition = response.headers.get("Content-Disposition", "")
-        if "filename=" in disposition:
-            filename = disposition.split("filename=", 1)[1].strip('"').split(";")[0]
-        dest = dest_dir / filename
+        filename = filename_from_disposition(response.headers.get("Content-Disposition", ""))
+        dest = dest_dir / (filename or "original.bin")
         with dest.open("wb") as fh:
             for chunk in response.iter_content(chunk_size=1 << 20):
                 fh.write(chunk)

@@ -43,7 +43,7 @@ class DbSettings:
     password: str = field(repr=False, default="")
 
     @classmethod
-    def from_env(cls) -> "DbSettings":
+    def from_env(cls) -> DbSettings:
         return cls(
             host=_env("PAPERLESS_DBHOST", "postgres"),
             port=_env_int("PAPERLESS_DBPORT", 5432),
@@ -87,7 +87,7 @@ class Settings:
         return bool(self.trigger_tag_all)
 
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(cls) -> Settings:
         raw_user_args = _env("REARCHIVE_OCR_USER_ARGS", "")
         try:
             user_args: dict[str, object] = json.loads(raw_user_args) if raw_user_args else {}

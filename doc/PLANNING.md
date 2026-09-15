@@ -24,10 +24,14 @@ The original file is immutable; it is only downloaded via the API and used as OC
 - **Archive directory**: `media/documents/archive/` (singular) on this deployment, with
   template-derived subdirectories (e.g. `Retirement/Steffen Richter/2026/…pdf`);
   246 of 5352 documents have no archive file.
-- **Archive filename**: *not* always `<id>.pdf`. `file_handling.generate_unique_filename(doc,
-  archive_filename=True)` derives it from storage-path / `PAPERLESS_FILENAME_FORMAT` templates
-  (or `<pk:07>.pdf` when no template). The sidecar must take the archive path from the API
-  serializer field `archived_file_name` (relative to `ARCHIVE_DIR`) — never reconstruct it.
+- **Archive filename / path**: *not* always `<id>.pdf`. `file_handling.generate_unique_filename(
+  doc, archive_filename=True)` derives it from storage-path / `PAPERLESS_FILENAME_FORMAT`
+  templates (or `<pk:07>.pdf` when no template). The API's `archived_file_name` is only a
+  **flattened display name** (e.g. `2026-01-07 Immigration US re-archive-test.pdf`) and does
+  **not** give the on-disk location. The real relative path lives only in the DB column
+  `documents_document.archive_filename` (e.g.
+  `Passports_Visas_IDs/DE/2026/2026-01-07_re-archive-test.pdf`); the sidecar resolves it via
+  `archive/db.py: fetch_archive_filename` and never reconstructs it from the document id.
 - **Born-digital PDFs**: in `auto` mode paperless skips OCR for PDFs with an existing text layer
   (`skip_text`, `pdf_born_digital_text`); `PAPERLESS_ARCHIVE_FILE_GENERATION`
   (`never`/`only`/`always`) decides whether an archive file is produced at all. Documents
@@ -36,7 +40,40 @@ The original file is immutable; it is only downloaded via the API and used as OC
   (`PAPERLESS_OCR_IMAGE_DPI`, A4 DPI fallback). The sidecar runs the same conversion via
   ocrmypdf but cannot regenerate an *existing* archive file (none exists) ⇒ content-only by
   default; `REARCHIVE_ARCHIVE_FOR_IMAGES=true` later opts into creating one (experimental).
-- **API limits**: the paperless REST API cannot upload/replace an archive version of an existing
+- **API limits**: there is no endpoint to upload/replace the archive version of an existing
+  document, and the document upload endpoint only creates *new* documents — hence the
+  bind-mount + direct DB update approach used here.
+- **Downloading the *original***: `/api/documents/{id}/download/` returns the **archive** version
+  by default. The immutable original requires the query parameter `?original=true` (verified
+  live — without it the sidecar re-OCR'd an archive it had itself just written). The sidecar
+  always passes `original=true` and works in a scratch directory; nothing writes to
+  `media/documents/originals/`.
+- **Tag lookup**: `/api/tags/` silently ignores `?name=` and `?name__exact=`; `?name__iexact=`
+  works. `?name__icontains=` is a trap — `re-ocr-all` also matches `re-ocr-all-success`. The
+  sidecar uses `name__iexact` (regression-tested in `tests/test_paperless_api.py`).
+- **Content update**: `PATCH /api/documents/{id}/ {"content": "..."}` works — `content` is
+  writable in the documents serializer.
+- **Live probe (2026-09-15, instance with 5352 docs)**: the serializer does **not** expose
+  `archive_checksum`, so it is read directly from Postgres
+  (`archive/db.py: fetch_archive_checksum`); 246 of 5352 documents have no archive file.
+- **OCR mode vs. text layer**: `redo_ocr` replaces the invisible text layer in place and leaves
+  the page images alone, so the archive keeps its size; `force_ocr` rasterises every page and
+  inflates the file (measured 616 KiB → 4.6 MiB on one scan). `ocrmypdf` **rejects**
+  `--redo-ocr` combined with `--deskew`/`--clean-final`/`--remove-background`, so the runner
+  must drop deskew rather than fall through to `force_ocr` (a silent fallback here would have
+  inflated every archive).
+- **`skip_text` sidecar hazard**: with `skip_text`, ocrmypdf's sidecar contains only
+  `[OCR skipped on page(s) …]`. Writing that to `content` destroys the existing text, so the
+  runner treats an all-placeholder sidecar as a hard failure (`ocr_skipped_all`) instead of a
+  result.
+- **Chandra repeat-loop = failed scan**: when the vLLM/Chandra server logs
+  `Detected repeat token, retrying generation (attempt N)` and the GPU spins up, the model is
+  looping on a bad/empty page. Such runs are effectively failed scans — quality is garbage even
+  though the pipeline completes. Detection/handling is deferred — see Risks.
+- **Base image**: paperless-ngx now ships `python:3.14-slim` (Debian 13 *trixie*) and this
+  sidecar uses the same base. `jbig2` (bilevel compression for ocrmypdf) is available as an apt
+  package in trixie and is installed directly; together with `pngquant` it saved ~15-19% on a
+  real re-OCR run.
 
 ## 3. Architecture
 
@@ -96,7 +133,7 @@ flowchart TD
     ARCH -- "no" --> CO["content-only mode"]
     ARCH -- "yes" --> CK{"on-disk archive sha256 == DB archive_checksum?"}
     CK -- "no" --> FAIL["failure tag<br/>(archive changed underneath us)"]
-    CK -- "yes" --> OCR["ocrmypdf: force_ocr, output_type=pdfa,<br/>deskew/clean per config, plugins=provider"]
+    CK -- "yes" --> OCR["ocrmypdf: output_type=pdfa, plugins=provider<br/>auto → redo_ocr (text layer) / skip_text (none)<br/>force option only via REARCHIVE_OCR_MODE=force"]
     CO --> OCR
     OCR -- "error (transient)" --> KEEP["keep trigger tag<br/>(retry next cycle)"]
     OCR -- "error (permanent)" --> FAIL
@@ -125,7 +162,8 @@ paperless-rearchive/
 ├── paperless_rearchive/
 │   ├── __init__.py
 │   ├── config.py              # env-driven Settings
-│   ├── paperless_api.py       # REST client
+│   ├── logging_setup.py       # shared logging config (poll + containers)
+│   ├── paperless_api.py       # REST client (tag lookup, original download, PATCH, tag swap)
 │   ├── pipeline.py            # per-document orchestration
 │   ├── poller.py              # main loop (entry point)
 │   ├── ocr/
@@ -135,11 +173,13 @@ paperless-rearchive/
 │   │   └── runner.py          # Django-free ocrmypdf argument builder + image helpers
 │   └── archive/
 │       ├── __init__.py
-│       ├── db.py              # psycopg checksum update
+│       ├── db.py              # psycopg checksum/archive reads + UPDATE
 │       └── replacer.py        # backup + atomic replace + sha256
 ├── docker/Dockerfile
 ├── pyproject.toml
 └── tests/
+    ├── test_*.py              # pytest unit tests (39 passing)
+    └── integration/           # live-stack harness (see its README)
 ```
 
 ## 5. Phases
@@ -155,7 +195,8 @@ paperless-rearchive/
 
 ### Phase 3 — OCR pipeline ✅
 - ✅ `ocr/chandra.py` provider (wraps paperless-chandra ocrmypdf plugin)
-- ✅ `ocr/runner.py` (force_ocr, pdfa, deskew/clean, image DPI/alpha handling, fallback retry)
+- ✅ `ocr/runner.py` (mode selection `redo_ocr`/`skip_text`/`force_ocr`, pdfa, deskew/clean with
+  the redo-incompatibility guard, image DPI/alpha handling, `ocr_skipped_all` guard, fallback retry)
 - ✅ `pipeline.py` orchestration incl. dry-run + tag lifecycle
 
 ### Phase 4 — Archive replacement ✅
@@ -167,7 +208,7 @@ paperless-rearchive/
 - ✅ Dockerfile (python:3.14-slim/trixie + ghostscript/tesseract/qpdf/pngquant/jbig2/poppler +
   ocrmypdf + paperless-chandra from git master; image builds and all deps import on 3.14)
 - ✅ compose snippet + `.env.example`
-- ✅ unit tests (12 passing: replacer, runner args, config)
+- ✅ unit tests (39 passing: replacer, runner args/mode selection, API tag lookup, config)
 - ✅ live smoke test (2026-09-15): dry-run cycle against the running instance
   (`http://localhost:8001`) — document 5488 tagged `re-ocr-content` + `re-ocr-all` was OCR'd
   end-to-end via the live Chandra server (~30k chars markdown sidecar produced, nothing
@@ -176,39 +217,22 @@ paperless-rearchive/
   with real DB + API access): DB path resolution via `fetch_archive_filename`, checksum
   verification, full ocrmypdf+Chandra run.
 - ✅ `REARCHIVE_OCR_MODE=auto` added: redo_ocr (text layer present) vs force_ocr.
-- ⬜ archive size investigation (see Risks): old CCITT-bilevel archives can grow up to ~8×
-  when force_ocr rasterises pages (doc 3723: 112 KiB → 900 KiB; redo_ocr did not shrink it —
-  root cause not yet confirmed). Real-scanned doc 3697 stayed at 1.00×. Debug before mass
-  re-OCR of `re-ocr-all`.
+- ✅ **full e2e incl. writes (2026-09-16, doc 5820, both trigger paths)**:
+  - `re-ocr-all`: poller run → archive replaced (624 KiB, PDF/A-2b, sha256 `d9203b60…`) →
+    `archive_checksum` UPDATE verified against `sha256sum` on disk → tag swapped to
+    `re-ocr-all-success` → **original byte-identical** (`31feb5e0…`, mtime unchanged).
+  - `re-ocr-content`: content PATCHed to freshly OCR'd markdown → archive file **untouched**
+    (byte-identical) → tag swapped to `re-ocr-content-success`.
+  - harness: `tests/run_poller_e2e.sh`, `tests/run_content_e2e.sh`, `tests/verify_state.sh`,
+    `tests/reset_baseline.sh` (env-driven, run against the live stack).
+- ✅ API correctness fixes found by e2e: `?original=true` on the download endpoint,
+  `?name__iexact=` for tag lookup.
+- ✅ archive size root cause identified and fixed: the silent `redo_ocr` → `force_ocr` fallback
+  triggered by the (unsupported) `redo_ocr` + `deskew` combination. See Research notes / Risks.
 - ⬜ repeat-loop detection: treat documents whose Chandra logs show repeated
   `Detected repeat token, retrying generation` as failed scans (tag `-failure` / investigate).
-- ⬜ full e2e incl. writes: tag one throwaway `re-ocr-all` document; verify archive replace +
-  `archive_checksum` UPDATE + tag lifecycle (all read-only paths already validated).
-
-  document (no archive upload endpoint; document upload creates *new* documents). Hence the
-  bind-mount + direct DB update approach.
-- **Content update**: `PATCH /api/documents/{id}/ { "content": "..." }` works (documents
-  serializer exposes `content` as writable).
-- **Live probe (2026-09-15, instance with 5352 docs)**:
-  - the serializer exposes `archived_file_name`, but it is a **flattened download/display name**
-    (spaces instead of template subdirectories) — the real on-disk path lives **only in the DB**
-    (`documents_document.archive_filename`, e.g. `House/1925/…pdf`). The sidecar resolves the
-    archive path via `archive/db.py: fetch_archive_filename`.
-  - the serializer does **not** expose `archive_checksum` — read directly from Postgres
-    (`archive/db.py: fetch_archive_checksum`).
-  - 246 of 5352 documents have no archive file.
-- **Archive directory**: `media/documents/archive/` (singular) on this deployment, with
-  template-derived subdirectories.
-- **Chandra repeat-loop = failed scan**: when the vLLM/Chandra server logs
-  `Detected repeat token, retrying generation (attempt N)` and the GPU spins up, the model is
-  looping on a bad/empty page. Treat documents whose logs show repeated retries as *failed*
-  OCR runs (quality is garbage even if the pipeline completes). Detailed handling (e.g.
-  aborting a document after N retries at the pipeline level) is deferred — see Risks.
-- **Base image**: paperless-ngx now ships `python:3.14-slim` (Debian 13 *trixie*) — this
-  sidecar uses the same base. `jbig2` (bilevel compression for ocrmypdf) is available as an
-  apt package in trixie and is installed directly (~15% size saving measured on a real scan).
-
-
+- ⬜ bulk-run procedural safeguards: confirm search index reflects PATCHed content on a real
+  doc, and rehearse a small `re-ocr-all` batch before mass re-OCR.
 
 ## 6. Configuration
 
@@ -231,7 +255,7 @@ paperless container for provider settings):
 | `PAPERLESS_CHANDRA_CONTENT_FORMAT` | `markdown` | `markdown` or `text` |
 | `PAPERLESS_CHANDRA_MAX_OUTPUT_TOKENS` | `12384` | per-page token budget |
 | `REARCHIVE_OCR_LANGUAGE` | `eng` | passed through to ocrmypdf (labels hOCR) |
-| `REARCHIVE_OCR_MODE` | `auto` | `auto`: `redo_ocr` when the PDF has a text layer (keeps original page images), `force_ocr` otherwise; `force`: always rasterise + re-OCR; `redo`: always redo |
+| `REARCHIVE_OCR_MODE` | `auto` | `auto`: `redo_ocr` when the original has a text layer (swaps the invisible text layer, page images untouched), `skip_text` when it has none (OCRs the bare pages); `force`: always rasterise + re-OCR (much larger archive); `redo`: always redo |
 | `REARCHIVE_OCR_DESKEW` | `true` | deskew pages before OCR |
 | `REARCHIVE_OCR_OUTPUT_TYPE` | `pdfa` | archive PDF/A flavour |
 | `REARCHIVE_OCR_USER_ARGS` | *(unset)* | extra ocrmypdf kwargs (JSON), e.g. paperless `PAPERLESS_OCR_USER_ARGS` |
@@ -251,23 +275,27 @@ Secrets (already defined in `paperless-lxc/docker-compose.yml`): `chandra_api_ke
 
 ## 7. Risks / open questions
 
-- ⬜ Verify `archived_file_name` serializer field name against the running instance's API
-  (`/api/documents/{id}/`) during Phase 5 e2e.
+- ✅ **Resolved** — `archived_file_name` is *not* a path; the on-disk archive path is read from
+  the DB column `documents_document.archive_filename` (see Research notes).
 - ⬜ Full-text index / search index is updated by paperless on content PATCH (serializers post
-  save) — confirm search reflects new content after e2e.
-- ⬜ Thumbnails are not regenerated (archive pixel content is unchanged, so the existing
-  thumbnail stays valid).
+  save) — confirm search reflects new content after a real PATCH.
+- ⬜ Thumbnails are not regenerated (archive pixel content is unchanged in `redo_ocr`, so the
+  existing thumbnail stays valid). `force_ocr` re-rasterises pixels, so previews may drift.
 - ⬜ Concurrency with paperless workers: the checksum-verify-before-replace step is the only
   guard against concurrent modification — acceptable for a single-operator instance.
-- ⬜ `invalidate_digital_signatures: true` (paperless `PAPERLESS_OCR_USER_ARGS`) must be
-  mirrored in sidecar runs for signed PDFs.
-- ⬜ **Archive size regression on old bilevel scans** (`re-ocr-all`): doc 3723 (1925 CCITT-scan)
-  grew 112 KiB → ~900 KiB even with `redo_ocr`; doc 3697 stayed 1.00×. Suspected: force/redo
-  rasterisation transcodes 1-bit images to grey, and/or LLM repeat-loop text bloat. Debug with
-  `pdfimages -list` on old vs new archives before bulk `re-ocr-all`.
+- ✅ **Resolved** — `invalidate_digital_signatures: true` (paperless `PAPERLESS_OCR_USER_ARGS`)
+  is mirrored via `REARCHIVE_OCR_USER_ARGS` in the sidecar runs.
+- ✅ **Resolved** — archive size regression: the cause was a *silent fallback*, not
+  `redo_ocr` itself. `ocrmypdf` rejects `--redo-ocr` together with `--deskew`; the runner's
+  generic error-fallback then retried with `force_ocr`, which rasterises every page
+  (measured 616 KiB → 4.6 MiB on a 72 dpi scan; doc 3723 112 KiB → 900 KiB). The runner now
+  drops deskew when it selects `redo_ocr` (mirrors paperless-chandra `parser.py:395`) and logs
+  a warning instead of silently inflating archives. `auto` never rasterises.
 - ⬜ **Failed-scan detection**: Chandra `Detected repeat token, retrying generation` + GPU spin
   indicates the model looping on a bad/empty page — effectively a failed OCR. Pipeline should
   detect this (client callback / output repetition heuristic) and mark `-failure` instead of
   writing garbage content. Deferred until observed on more documents.
 - ⬜ paperless-chandra is installed from git `master` (no release tags published upstream yet);
   pin a tag once available for reproducible builds.
+- ⬜ `REARCHIVE_OCR_MODE=force` should only be used knowingly: it is the only mode that changes
+  archive size dramatically.

@@ -9,8 +9,9 @@ It reuses the OCR/hOCR/pipeline code from
 same paperless-chandra ocrmypdf plugin that new documents are ingested with, so re-processed
 documents get *identical* quality and PDF/A output as fresh ingestions.
 
-> **Status: work in progress.** See [`doc/PLANNING.md`](doc/PLANNING.md) for the implementation
-> plan and per-phase checklist. The checklists below are kept up to date as the project evolves.
+> **Status: functional.** Both trigger paths have been verified end-to-end against a live
+> instance (see [`doc/PLANNING.md`](doc/PLANNING.md) for the phased checklist and remaining
+> open items). The status table below is kept up to date as the project evolves.
 
 ## How it works
 
@@ -41,8 +42,8 @@ After processing, the trigger tag is removed and replaced with:
 
 | Outcome | `re-ocr-content` documents | `re-ocr-all` documents |
 | --- | --- | --- |
-| Success | `re-ocr-content-success` | `re-ocr-success` |
-| Failure | `re-ocr-content-failure` | `re-ocr-failure` |
+| Success | `re-ocr-content-success` | `re-ocr-all-success` |
+| Failure | `re-ocr-content-failure` | `re-ocr-all-failure` |
 
 A trigger tag is only replaced when the pipeline reached a decision; transient upstream errors
 (OCR server unreachable, network hiccup) leave the trigger tag in place for the next poll cycle.
@@ -59,6 +60,45 @@ A trigger tag is only replaced when the pipeline reached a decision; transient u
   content-only mode — they have no archive file that could be regenerated in place.
 - `DRY_RUN=true` performs the full OCR run and reports what would be written without touching
   paperless, the archives directory, or the database (tags must already exist).
+
+## OCR strategy
+
+Re-OCR must **replace** the old text layer without re-rendering the scan, otherwise a 600 KiB
+archive can balloon to several MiB. `REARCHIVE_OCR_MODE` controls how `ocrmypdf` is invoked:
+
+| Mode | Behaviour | Archive size |
+| --- | --- | --- |
+| `auto` (default) | `redo_ocr` when the original already has a text layer (swaps the invisible text layer, page images untouched); `skip_text` when it has none (OCRs only the bare pages). | ≈ unchanged |
+| `redo` | Always `redo_ocr`. | ≈ unchanged |
+| `force` | Always `force_ocr` — rasterises every page at ~400 dpi. | **much larger** |
+
+`force` is a last resort for text baked into the page content instead of a text layer. Note that
+`ocrmypdf` rejects `redo_ocr` together with `deskew`; the runner detects this, logs a warning and
+drops deskew rather than silently switching to the size-destroying `force_ocr` path.
+
+The OCR source is always the **immutable original**, fetched with the API's
+`?original=true` parameter — `/api/documents/{id}/download/` without it returns the *archive*.
+
+## Status
+
+Living checklist — updated as the project progresses. Full detail in
+[`doc/PLANNING.md`](doc/PLANNING.md).
+
+| Component | State |
+| --- | --- |
+| Parser-plugin-free tag poller (SIGHUP wake, batching, error isolation) | ✅ done + verified live |
+| `paperless_api` client (tag lookup via `name__iexact`, original download, content PATCH, tag swap) | ✅ done + verified live |
+| `paperless_rearchive/ocr` runner (Django-free ocrmypdf call, mode selection, guards) | ✅ done + verified live |
+| `OcrProviderPlugin` ABC + provider registry | ✅ done |
+| `ChandraProvider` (wraps paperless-chandra ocrmypdf plugin) | ✅ done + verified live |
+| `archive/replacer` (checksum verify, `.bak`, atomic `os.replace`, SHA-256) | ✅ done + verified live |
+| `archive/db` (psycopg `archive_checksum` read/update) | ✅ done + verified live |
+| `re-ocr-content` end-to-end (content PATCH, archive untouched) | ✅ verified on live instance |
+| `re-ocr-all` end-to-end (archive replace + DB checksum + tag swap) | ✅ verified on live instance |
+| Dockerfile (`python:3.14-slim`/trixie, jbig2/pngquant/ghostscript/tesseract) | ✅ builds |
+| Unit tests | ✅ 39 passing |
+| Repeat-loop / failed-scan detection | ⬜ open (see PLANNING Risks) |
+| Bulk re-OCR rehearsal before mass use | ⬜ open |
 
 ## Deployment
 
@@ -83,7 +123,7 @@ Build and add the service to `paperless-lxc/docker-compose.yml`
       - /data/paperless/media/documents/archive:/archives
     environment:
       PAPERLESS_BASE_URL: "http://paperless:8000"
-      ARCHIVE_DIR: "/archives"
+      REARCHIVE_ARCHIVE_DIR: "/archives"
       PAPERLESS_CHANDRA_SERVER_URL: "http://ai:8110/v1"
       PAPERLESS_CHANDRA_MODEL_NAME: "chandra-ocr-2-q8"
       PAPERLESS_CHANDRA_CONTENT_FORMAT: "markdown"
@@ -102,7 +142,7 @@ flowchart TB
         ABC --- CHANDRA
         ABC --- FUTURE
     end
-    CHANDRA --> OMP["ocrmypdf<br/>plugins=[...chandra...], force_ocr,<br/>output_type=pdfa → hOCR → invisible<br/>text layer + markdown sidecar"]
+    CHANDRA --> OMP["ocrmypdf<br/>plugins=[...chandra...],<br/>redo_ocr / skip_text / force_ocr,<br/>output_type=pdfa → hOCR → invisible<br/>text layer + markdown sidecar"]
 ```
 
 ## License

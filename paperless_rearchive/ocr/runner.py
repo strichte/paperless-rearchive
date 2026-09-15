@@ -29,15 +29,46 @@ _IMAGE_MIME_TYPES = {
 
 
 def guess_mime_type(path: Path) -> str:
+    """MIME type from the filename, falling back to magic-byte sniffing.
+
+    The filename alone is not trustworthy here: the download filename comes from
+    the API's ``Content-Disposition`` header, and a parsing slip (a stray quote
+    in the header) used to type a plain PDF as ``application/octet-stream``.
+    That in turn made :func:`select_ocr_strategy` treat it as a non-PDF and pick
+    ``skip_text``, which OCR'd nothing at all. Sniffing the actual bytes keeps the
+    OCR mode decision independent of the name.
+    """
     mime, _ = mimetypes.guess_type(path.name)
     if mime is None:
         suffix = path.suffix.lower()
         if suffix in (".tif", ".tiff"):
             return "image/tiff"
-        if suffix == ".jpg" or suffix == ".jpeg":
+        if suffix in (".jpg", ".jpeg"):
             return "image/jpeg"
-        return "application/octet-stream"
+        return sniff_mime_type(path)
     return mime
+
+
+def sniff_mime_type(path: Path) -> str:
+    """Identify common document/image formats from their magic bytes."""
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(8)
+    except OSError:
+        return "application/octet-stream"
+    if head.startswith(b"%PDF"):
+        return "application/pdf"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head[:4] in (b"II*\x00", b"MM\x00*"):
+        return "image/tiff"
+    if head.startswith(b"GIF8"):
+        return "image/gif"
+    if head.startswith(b"BM"):
+        return "image/bmp"
+    return "application/octet-stream"
 
 
 def is_image(mime_type: str) -> bool:
@@ -63,11 +94,11 @@ def calculate_a4_dpi(input_file: Path) -> int:
     """DPI that fits the image onto A4, mirroring paperless's fallback."""
     from PIL import Image
 
-    A4_WIDTH_INCH = 8.27
-    A4_HEIGHT_INCH = 11.69
+    a4_width_inch = 8.27
+    a4_height_inch = 11.69
     with Image.open(input_file) as img:
-        width_dpi = img.width / A4_WIDTH_INCH
-        height_dpi = img.height / A4_HEIGHT_INCH
+        width_dpi = img.width / a4_width_inch
+        height_dpi = img.height / a4_height_inch
     return max(1, int(round(max(width_dpi, height_dpi))))
 
 
@@ -103,7 +134,29 @@ def has_text_layer(input_file: Path) -> bool:
     return len(result.stdout.strip()) >= 25
 
 
-def _env_ocr_mode(settings: "Settings") -> str:
+#: ocrmypdf writes one of these into the sidecar for every page it did *not*
+#: OCR (``skip_text`` mode on a page that already had text). A sidecar that
+#: contains nothing else means no recognition happened at all - the run must
+#: not be allowed to overwrite the stored content with the placeholder.
+OCR_SKIP_MARKER = "[OCR skipped on page"
+
+
+def ocr_skipped_all(text: str) -> bool:
+    """True when ``text`` consists only of ocrmypdf's skip placeholders.
+
+    Mirrors paperless's own handling in ``parsers/tesseract.py``: a sidecar
+    containing ``"[OCR skipped on page"`` is treated as incomplete and
+    discarded. Here it is escalated to a hard stop, because the whole point of
+    this tool is to *replace* old OCR - a run that recognised nothing is a
+    configuration error, not a valid result.
+    """
+    stripped = "\n".join(
+        line for line in text.splitlines() if OCR_SKIP_MARKER not in line
+    ).strip()
+    return not stripped
+
+
+def _env_ocr_mode(settings: Settings) -> str:
     mode = settings.ocr_mode
     if mode not in ("auto", "force", "redo"):
         log.warning("Invalid REARCHIVE_OCR_MODE=%r; using 'auto'.", mode)
@@ -111,29 +164,55 @@ def _env_ocr_mode(settings: "Settings") -> str:
     return mode
 
 
+#: ocrmypdf accepts exactly one of these mode flags.
+_MODE_FLAGS = {"force": "force_ocr", "redo": "redo_ocr", "skip_text": "skip_text"}
+
+
+def select_ocr_strategy(ocr_mode: str, input_file: Path, mime_type: str) -> str:
+    """Pick the ocrmypdf mode flag: ``force``, ``redo`` or ``skip_text``.
+
+    ``redo`` swaps the invisible text layer for the new one and leaves the page
+    images untouched, so the archive keeps its original size. ``force``
+    rasterises every page - needed for text baked into the page content, but it
+    re-renders the scan (measured: 616 KiB -> 4.6 MiB on a 72 dpi test scan).
+    ``skip_text`` OCRs only the pages that carry no text layer at all.
+
+    ``auto`` therefore means "replace the OCR text layer in place when the PDF
+    has one, otherwise OCR the bare pages" - it never rasterises. Note that
+    ocrmypdf rejects ``--redo-ocr`` combined with ``--deskew``; the caller
+    drops deskew in that case (see :func:`build_ocrmypdf_args`).
+    """
+    if ocr_mode == "force":
+        return "force"
+    if ocr_mode == "redo":
+        return "redo"
+    if mime_type.startswith("application/pdf") and has_text_layer(input_file):
+        return "redo"
+    return "skip_text"
+
+
 def build_ocrmypdf_args(
     input_file: Path,
     output_file: Path,
     sidecar_file: Path,
-    provider: "OcrProviderPlugin",
-    settings: "Settings",
+    provider: OcrProviderPlugin,
+    settings: Settings,
     *,
     jobs: int = 2,
 ) -> dict[str, Any]:
     """Build the ocrmypdf.ocr() kwargs for one re-OCR run.
 
     Mode resolution (``REARCHIVE_OCR_MODE``):
-    * ``auto`` (default): ``redo_ocr`` when the PDF already has a text layer
-      (keeps original page images -> archive size stays near the old archive),
-      ``force_ocr`` otherwise.
-    * ``force``: always force_ocr (rasterises all pages).
-    * ``redo``: always redo_ocr.
+    * ``auto`` (default): ``redo_ocr`` when the input already has a text layer
+      (replaces it, keeps the page images -> archive size stays put),
+      ``skip_text`` otherwise.
+    * ``force``: always ``force_ocr`` - rasterises every page, so expect a much
+      larger archive. Only worth it when the text cannot be redone.
+    * ``redo``: always ``redo_ocr``.
     """
     mime_type = guess_mime_type(input_file)
     ocr_mode = _env_ocr_mode(settings)
-    redo = ocr_mode == "redo" or (
-        ocr_mode == "auto" and mime_type.startswith("application/pdf") and has_text_layer(input_file)
-    )
+    strategy = select_ocr_strategy(ocr_mode, input_file, mime_type)
     args: dict[str, Any] = {
         "input_file_or_options": input_file,
         "output_file": output_file,
@@ -142,7 +221,7 @@ def build_ocrmypdf_args(
         "language": settings.ocr_language or "eng",
         "output_type": settings.ocr_output_type,
         "progress_bar": False,
-        "redo_ocr" if redo else "force_ocr": True,
+        _MODE_FLAGS[strategy]: True,
         "plugins": [provider.ocrmypdf_plugin_module],
         **provider.ocrmypdf_kwargs(),
         **settings.ocr_user_args,  # e.g. invalidate_digital_signatures
@@ -153,7 +232,22 @@ def build_ocrmypdf_args(
         args.setdefault("color_conversion_strategy", "RGB")
 
     if settings.ocr_deskew:
-        args["deskew"] = True
+        if strategy == "redo":
+            # ocrmypdf rejects ``--redo-ocr`` together with ``--deskew``
+            # ("not currently compatible with --deskew, --clean-final, and
+            # --remove-background"). Redo keeps the original page images, so a
+            # deskew pass would have to rasterise them anyway - dropping deskew
+            # is what paperless itself does (parser.py: ``if deskew and mode !=
+            # REDO``). Warn rather than fail: without this the run raises and the
+            # safe-fallback below re-runs the whole document with force_ocr,
+            # doubling GPU time and inflating the archive.
+            args.pop("deskew", None)
+            log.warning(
+                "REARCHIVE_OCR_DESKEW ignored: ocrmypdf does not support deskew with redo_ocr "
+                "(set REARCHIVE_OCR_MODE=force to deskew at the cost of a larger archive)."
+            )
+        else:
+            args["deskew"] = True
 
     if settings.max_pages > 0:
         args["pages"] = f"1-{settings.max_pages}"
@@ -175,8 +269,8 @@ def run_ocr(
     input_file: Path,
     output_file: Path,
     sidecar_file: Path,
-    provider: "OcrProviderPlugin",
-    settings: "Settings",
+    provider: OcrProviderPlugin,
+    settings: Settings,
 ) -> None:
     """Run ocrmypdf once, with paperless-style safe fallback on failure."""
     import ocrmypdf
@@ -187,6 +281,13 @@ def run_ocr(
     log_args = {
         k: ("***" if "api_key" in k else v) for k, v in args.items() if k != "plugins"
     }
+    strategy = next(flag for flag in _MODE_FLAGS.values() if args.get(flag))
+    log.info(
+        "OCR strategy=%s (deskew=%s, output_type=%s)",
+        strategy,
+        bool(args.get("deskew")),
+        args.get("output_type"),
+    )
     log.debug("Calling OCRmyPDF with args: %s", log_args)
     try:
         ocrmypdf.ocr(**args)
@@ -202,8 +303,13 @@ def run_ocr(
     # force_ocr, which handles any input.
     if fallback_args.pop("redo_ocr", False):
         fallback_args["force_ocr"] = True
+        log.warning(
+            "falling back to force_ocr: every page is re-rasterised, so the new archive can be "
+            "several times larger than the old one."
+        )
     for key in ("clean", "clean_final", "deskew", "rotate_pages", "rotate_pages_threshold"):
         fallback_args.pop(key, None)
+    log.debug("Retrying OCRmyPDF with args: %s", fallback_args)
     try:
         ocrmypdf.ocr(**fallback_args)
     except Exception as exc:  # noqa: BLE001

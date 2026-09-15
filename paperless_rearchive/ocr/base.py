@@ -33,7 +33,7 @@ class OcrProviderPlugin(ABC):
     def ocrmypdf_kwargs(self) -> dict[str, Any]:
         """Kwargs merged into every ocrmypdf.ocr() call."""
 
-    def validate(self) -> None:
+    def validate(self) -> None:  # noqa: B027 - optional factory check
         """Fail fast on misconfiguration. Default: no-op."""
 
 

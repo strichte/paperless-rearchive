@@ -16,10 +16,16 @@ from paperless_rearchive.archive.db import (
 )
 from paperless_rearchive.archive.replacer import (
     ArchiveReplaceError,
+    checksum_of_file,
     replace_archive,
     verify_current_checksum,
 )
-from paperless_rearchive.ocr.runner import guess_mime_type, is_image, run_ocr
+from paperless_rearchive.ocr.runner import (
+    guess_mime_type,
+    is_image,
+    ocr_skipped_all,
+    run_ocr,
+)
 
 if TYPE_CHECKING:
     from paperless_rearchive.config import Settings
@@ -41,9 +47,9 @@ class DocumentContext:
 
 
 def process_document(
-    settings: "Settings",
-    api: "PaperlessAPI",
-    provider: "OcrProviderPlugin",
+    settings: Settings,
+    api: PaperlessAPI,
+    provider: OcrProviderPlugin,
     ctx: DocumentContext,
 ) -> None:
     """Re-OCR one document; never raises for expected failure modes.
@@ -87,7 +93,10 @@ def process_document(
                 archive_path = settings.archive_dir / archive_filename
                 try:
                     archive_checksum = fetch_archive_checksum(settings.db, ctx.doc_id)
-                    verify_current_checksum(archive_path, archive_checksum)
+                    try:
+                        verify_current_checksum(archive_path, archive_checksum)
+                    except ArchiveReplaceError as e:
+                        _repair_checksum_drift(settings, ctx, archive_path, archive_checksum, e)
                 except (ArchiveReplaceError, RuntimeError) as e:
                     if settings.dry_run:
                         log.error(
@@ -107,6 +116,21 @@ def process_document(
 
         content = _read_content(sidecar, new_pdf)
 
+        if ocr_skipped_all(content):
+            # ocrmypdf recognised nothing (every page was skipped). Writing this
+            # through would replace the document's text with the placeholder
+            # "[OCR skipped on page(s) 1-N]" and swap the archive for a
+            # byte-wise re-encode of itself. Stop before touching anything.
+            message = (
+                "OCR skipped every page (ocrmypdf recognised nothing); "
+                "check REARCHIVE_OCR_MODE"
+            )
+            log.error("Document %d: %s. Nothing written.", ctx.doc_id, message)
+            if settings.dry_run:
+                return
+            _finish(api, ctx, success=False, note=message)
+            return
+
         if settings.dry_run:
             would = f"content ({len(content)} chars)"
             if archive_path is not None:
@@ -122,6 +146,41 @@ def process_document(
 
     _finish(api, ctx, success=True)
     log.info("Document %d re-OCR complete.", ctx.doc_id)
+
+
+def _repair_checksum_drift(
+    settings: Settings,
+    ctx: DocumentContext,
+    archive_path: Path,
+    expected: str | None,
+    error: ArchiveReplaceError,
+) -> None:
+    """Adopt an on-disk archive whose checksum no longer matches the DB.
+
+    This is the residue of a run that was interrupted between the atomic file
+    replace and the ``UPDATE documents_document`` (the process was killed, the
+    container stopped, the host rebooted). The archive bytes themselves are
+    always complete because the swap uses ``os.replace``.
+
+    Failing the document instead would strand it: the trigger tag is swapped for
+    ``<trigger>-failure`` and it never retries. Re-OCR is idempotent and the
+    archive is a derived artifact of the immutable original - paperless can
+    always regenerate it - so adopt the on-disk bytes and carry on.
+
+    Raises the original error when no repair is possible (missing file, unknown
+    checksum) or when running dry (dry runs never write to the database).
+    """
+    if settings.dry_run or not expected or not archive_path.is_file():
+        raise error
+    disk_checksum = checksum_of_file(archive_path)
+    log.warning(
+        "Document %d: archive checksum drift (DB %s != disk %s); adopting the on-disk "
+        "archive - the previous run was probably interrupted after replacing it.",
+        ctx.doc_id,
+        expected,
+        disk_checksum,
+    )
+    update_archive_checksum(settings.db, ctx.doc_id, disk_checksum)
 
 
 def _read_content(sidecar: Path, archive_pdf: Path) -> str:
@@ -144,7 +203,7 @@ def _read_content(sidecar: Path, archive_pdf: Path) -> str:
 
 
 def _finish(
-    api: "PaperlessAPI",
+    api: PaperlessAPI,
     ctx: DocumentContext,
     *,
     success: bool,

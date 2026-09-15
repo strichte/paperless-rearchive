@@ -6,9 +6,9 @@ import logging
 import signal
 import sys
 import threading
-import time
 
 from paperless_rearchive.config import Settings
+from paperless_rearchive.logging_setup import configure_logging
 from paperless_rearchive.ocr.base import get_provider
 from paperless_rearchive.paperless_api import PaperlessAPI, PaperlessError
 from paperless_rearchive.pipeline import DocumentContext, process_document
@@ -58,12 +58,8 @@ def cycle(settings: Settings, api: PaperlessAPI, provider_name: str) -> None:
 
 
 def main() -> None:
-    logging.basicConfig(
-        level="INFO",
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-    )
     settings = Settings.from_env()
-    logging.getLogger().setLevel(settings.log_level)
+    configure_logging(settings.log_level)
     if not settings.api_token:
         sys.exit("PAPERLESS_API_TOKEN is required")
 
