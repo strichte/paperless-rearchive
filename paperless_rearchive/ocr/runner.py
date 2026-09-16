@@ -1,8 +1,13 @@
-"""Django-free ocrmypdf argument builder.
+"""Django-free ocrmypdf argument builder (integration-harness only).
 
-Mirrors ``paperless_chandra.parser.construct_ocrmypdf_parameters`` for the
-re-OCR use case: ``force_ocr`` (old OCR results are replaced), PDF/A output,
-optional deskew, image-input DPI/alpha handling, and a safe fallback retry.
+**Superseded for the active pipeline** by :mod:`paperless_rearchive.ocr.ingest_args`,
+which mirrors ``paperless_chandra.parser.construct_ocrmypdf_parameters`` 1:1 and
+drives the single ingest-parity ocrmypdf pass (see doc/OCR_STRATEGY.md).
+
+This module is retained because the integration harness still uses pieces of
+it: ``tests/integration/diag_original.py`` and ``check_download.py`` use
+``guess_mime_type``/``has_text_layer``; ``size_compare.py`` uses ``run_ocr``;
+``tests/test_runner.py`` is its test suite. Do not wire it into the pipeline.
 """
 
 from __future__ import annotations

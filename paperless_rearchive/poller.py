@@ -145,6 +145,25 @@ def _log_cycle_summary(
         )
 
 
+def _sleep_or_immediate(poll_interval: float, wake: threading.Event) -> bool:
+    """Post-cycle wait; returns True when the next cycle must start now.
+
+    A SIGHUP/SIGUSR1 arriving *while a cycle is running* sets ``wake``, but the
+    old code unconditionally cleared it right after the cycle and slept the
+    full interval - silently losing the signal (observed 2026-09-17: a HUP'd
+    poller sat idle through its whole interval). Clear-and-return-True here
+    consumes the signal and forces an immediate cycle instead. A signal that
+    arrives after this check but during ``wait()`` still wakes ``wait()``
+    immediately, as before.
+    """
+    if wake.is_set():
+        wake.clear()
+        return True
+    # Event.wait returns True when the event was set (signal arrived during
+    # the wait -> immediate cycle), False on timeout (normal sleep).
+    return wake.wait(poll_interval)
+
+
 def main() -> None:
     settings = Settings.from_env()
     configure_logging(settings.log_level)
@@ -177,8 +196,8 @@ def main() -> None:
             log.exception("cycle failed; retrying in %.0fs", settings.poll_interval)
         if settings.run_once:
             return
-        _wake.clear()
-        _wake.wait(settings.poll_interval)
+        if _sleep_or_immediate(settings.poll_interval, _wake):
+            continue
 
 
 if __name__ == "__main__":

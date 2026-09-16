@@ -398,6 +398,7 @@ token, the Chandra key, and the database user/password.
 | `REARCHIVE_OCR_DESKEW` | `true` | deskew pages before OCR (ocrmypdf forbids deskew with `redo`; dropped automatically, as paperless does) |
 | `REARCHIVE_OCR_ROTATE_PAGES` | `true` | 90/180/270 orientation fix before OCR (via the Chandra engine's OSD) |
 | `REARCHIVE_OCR_ROTATE_PAGES_THRESHOLD` | `12.0` | confidence threshold for `rotate_pages` |
+| `REARCHIVE_OCR_DPI` | `300` | render DPI for the **content-only** fast path (PyMuPDF render before the Chandra call). `re-ocr-all` runs rasterise inside ocrmypdf, so this does not affect archive production |
 | `REARCHIVE_OCR_OUTPUT_TYPE` | `pdfa` | archive PDF/A flavour |
 | `REARCHIVE_OCR_USER_ARGS` | *(unset)* | extra ocrmypdf kwargs (JSON), e.g. paperless `PAPERLESS_OCR_USER_ARGS` |
 | `REARCHIVE_ARCHIVE_FOR_IMAGES` | `false` | experimental: create archive for non-PDF originals |
@@ -418,6 +419,11 @@ Secrets (already defined in `paperless-lxc/docker-compose.yml`): `chandra_api_ke
 
 ## 7. Risks / open questions
 
+- ✅ **Resolved** — poller lost-wakeup: a SIGHUP arriving while a cycle ran was cleared after the
+  cycle and the poller slept the full interval (observed 2026-09-17). `_sleep_or_immediate()` now
+  consumes the signal and starts the next cycle immediately (regression-tested).
+- ✅ **Resolved** — ocrmypdf `--clean` (re-introduced by ingest parity) requires `unpaper`; it is
+  now installed in the image (`docker/Dockerfile`).
 - ✅ **Resolved** — `archived_file_name` is *not* a path; the on-disk archive path is read from
   the DB column `documents_document.archive_filename` (see Research notes).
 - ⬜ Full-text index / search index is updated by paperless on content PATCH (serializers post

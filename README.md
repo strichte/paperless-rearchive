@@ -20,8 +20,8 @@ flowchart LR
     subgraph sidecar["paperless-rearchive sidecar"]
         P[poller<br/>tag polling loop] --> PIPE[pipeline<br/>per-document orchestration]
         PIPE --> API[paperless_api<br/>REST client]
-        PIPE --> RUN[ocr runner<br/>Django-free ocrmypdf call]
-        RUN --> PROV[OcrProviderPlugin<br/>e.g. ChandraProvider]
+        PIPE --> ENG[ChandraOcrEngine<br/>re-ocr-all: one ingest-parity<br/>ocrmypdf pass via the<br/>paperless_chandra plugin<br/>re-ocr-content: per-page<br/>Chandra fast path]
+        ENG --> PROV[OcrProviderPlugin<br/>e.g. ChandraProvider]
         PIPE --> REP[archive replacer<br/>atomic replace + SHA-256]
         REP --> DB[(Postgres<br/>archive_checksum UPDATE)]
     end
@@ -93,6 +93,8 @@ docker kill -s HUP paperless-rearchive
 This causes the poller to wake up and run an immediate tag scan, picking up any newly added trigger
 tags right away. The SIGHUP handler is deliberately lightweight — it interrupts the current sleep and
 triggers a single poll cycle; it does **not** reset the interval timer or disrupt an in-flight OCR run.
+A signal that arrives *while a cycle is already running* is honoured immediately after that cycle
+finishes (it is no longer silently swallowed).
 
 This is useful when you've just tagged a batch of documents and don't want to wait for the next poll
 cycle to begin processing.

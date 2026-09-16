@@ -85,6 +85,9 @@ class Settings:
     ocr_deskew: bool
     ocr_rotate: bool
     ocr_rotate_threshold: float
+    #: Render DPI for the content-only fast path (PyMuPDF page render before
+    #: the Chandra call). Archive-mode runs rasterise inside ocrmypdf instead.
+    ocr_dpi: int
     ocr_output_type: str
     ocr_user_args: dict[str, object]
     archive_for_images: bool
@@ -222,6 +225,7 @@ class Settings:
             ocr_deskew=_env_bool("REARCHIVE_OCR_DESKEW", True),
             ocr_rotate=_env_bool("REARCHIVE_OCR_ROTATE_PAGES", True),
             ocr_rotate_threshold=float(_env("REARCHIVE_OCR_ROTATE_PAGES_THRESHOLD", "12.0")),
+            ocr_dpi=_env_int("REARCHIVE_OCR_DPI", 300),
             ocr_output_type=_env("REARCHIVE_OCR_OUTPUT_TYPE", "pdfa"),
             ocr_user_args=user_args,
             archive_for_images=_env_bool("REARCHIVE_ARCHIVE_FOR_IMAGES", False),

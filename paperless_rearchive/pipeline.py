@@ -160,7 +160,7 @@ def process_document(
             content_format=provider.content_format,
             max_output_tokens=provider.max_output_tokens,
             language=settings.ocr_language,
-            dpi=getattr(settings, 'ocr_dpi', 300),
+            dpi=settings.ocr_dpi,
             concurrency=settings.concurrency,
             max_pages=settings.max_pages,
         )
