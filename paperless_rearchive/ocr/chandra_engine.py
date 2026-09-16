@@ -12,17 +12,120 @@ but PDF/A assembly only happens for re-ocr-all to avoid wasting CPU.
 
 from __future__ import annotations
 
+import builtins
 import logging
+import re
 import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 from paperless_chandra.engine import client as chandra_client
+
+try:
+    from chandra.model.util import detect_repeat_token as _detect_repeat_token
+except Exception:  # chandra extra not installed; post-hoc repeat check is skipped
+    _detect_repeat_token = None
+
+try:
+    from chandra.settings import settings as _chandra_settings
+except Exception:
+    _chandra_settings = None
 from paperless_chandra.engine.blocks import page_from_chunks, markdown_sidecar
 from paperless_chandra.engine.hocr import render_hocr, sidecar_text
 
 log = logging.getLogger(__name__)
+
+
+# Mirror of the upstream retry policy in chandra/model/vllm.py::generate_vllm.
+# generate_vllm defaults: temperature=0.0, top_p=0.1, max_retries from
+# chandra.settings.MAX_VLLM_RETRIES (default 6). Each retry N (1-based) uses
+# temperature=min(base + 0.2*N, 0.8) and top_p=0.95, i.e. with base 0.0:
+# attempt 1 -> 0.2, attempt 2 -> 0.4, attempt 3 -> 0.6, attempts 4-6 -> 0.8.
+# Our engine does not override these, so the upstream defaults apply.
+_BASE_TEMPERATURE = 0.0
+_BASE_TOP_P = 0.1
+_RETRY_TOP_P = 0.95
+_RETRY_TEMP_STEP = 0.2
+_RETRY_TEMP_CAP = 0.8
+_FALLBACK_MAX_RETRIES = 6
+
+# Upstream retry notices go to stdout via print(), not logging. Match them so
+# we can re-log with the sampling params used for that attempt.
+_RETRY_PRINT_RE = re.compile(
+    r"Detected (repeat token|vllm error), retrying generation \(attempt (\d+)\)"
+)
+_interceptor_installed = False
+_policy_logged = False
+
+
+def _upstream_max_retries() -> int:
+    """Effective max_retries used by generate_vllm when not passed explicitly."""
+    try:
+        if _chandra_settings is not None:
+            return int(_chandra_settings.MAX_VLLM_RETRIES)
+    except Exception:
+        pass
+    return _FALLBACK_MAX_RETRIES
+
+
+def _retry_temperature(base: float, attempt: int) -> float:
+    """Temperature upstream uses for 1-based retry attempt N."""
+    return min(base + _RETRY_TEMP_STEP * attempt, _RETRY_TEMP_CAP)
+
+
+def _install_retry_log_interceptor() -> None:
+    """Route upstream's print() retry notices through logging with params.
+
+    Idempotent; preserves the original stdout output. The attempt number in
+    the message maps to retry_temperature(N) / top_p=0.95, since upstream
+    computes retry_temperature the same way for both repeat-token and error
+    retries.
+    """
+    global _interceptor_installed
+    if _interceptor_installed:
+        return
+    _orig_print = builtins.print
+
+    def _print(*args: Any, sep: str = " ", end: str = "\n", **kwargs: Any) -> None:
+        try:
+            msg = sep.join(str(a) for a in args)
+        except Exception:
+            _orig_print(*args, sep=sep, end=end, **kwargs)
+            return
+        m = _RETRY_PRINT_RE.search(msg)
+        if m:
+            kind, attempt = m.group(1), int(m.group(2))
+            temp = _retry_temperature(_BASE_TEMPERATURE, attempt)
+            log.warning(
+                "Chandra detected %s - retry attempt %d/%d "
+                "(temperature=%.1f, top_p=%.2f; base was temperature=%.1f, top_p=%.2f)",
+                kind,
+                attempt,
+                _upstream_max_retries(),
+                temp,
+                _RETRY_TOP_P,
+                _BASE_TEMPERATURE,
+                _BASE_TOP_P,
+            )
+        _orig_print(*args, sep=sep, end=end, **kwargs)
+
+    builtins.print = _print  # type: ignore[assignment]
+    _interceptor_installed = True
+
+
+def _final_output_has_repeat(raw: str) -> bool:
+    """Same repeat test upstream uses to decide on a retry (vllm.py::_should_retry)."""
+    if not raw or _detect_repeat_token is None:
+        return False
+    try:
+        return bool(
+            _detect_repeat_token(raw)
+            or (len(raw) > 50 and _detect_repeat_token(raw, cut_from_end=50))
+        )
+    except Exception:
+        return False
 
 
 class OcrResult:
@@ -104,6 +207,28 @@ class ChandraOcrEngine:
         self.max_output_tokens = max_output_tokens
         self.language = language
         self.dpi = dpi
+        self._max_retries = _upstream_max_retries()
+        _install_retry_log_interceptor()
+        global _policy_logged
+        if not _policy_logged:
+            log.info(
+                "Chandra retry policy: max_retries=%d "
+                "(chandra.settings.MAX_VLLM_RETRIES; override via MAX_VLLM_RETRIES env), "
+                "base temperature=%.1f top_p=%.2f; retry attempt N uses "
+                "temperature=min(base+0.2*N, 0.8) top_p=%.2f",
+                self._max_retries,
+                _BASE_TEMPERATURE,
+                _BASE_TOP_P,
+                _RETRY_TOP_P,
+            )
+            _policy_logged = True
+        else:
+            log.debug(
+                "Chandra retry policy: max_retries=%d, base temperature=%.1f top_p=%.2f",
+                self._max_retries,
+                _BASE_TEMPERATURE,
+                _BASE_TOP_P,
+            )
 
     def ocr_document(
         self,
@@ -237,8 +362,33 @@ class ChandraOcrEngine:
             languages=[self.language],
         )
 
+        log.debug(
+            "Page %d: Chandra request (temperature=%.1f, top_p=%.2f, "
+            "max_tokens=%d, max_retries=%d)",
+            page_num,
+            _BASE_TEMPERATURE,
+            _BASE_TOP_P,
+            self.max_output_tokens,
+            self._max_retries,
+        )
+        started = time.monotonic()
         # Call Chandra for raw OCR output
         raw = chandra_client.ocr_image(image, options)
+        elapsed = time.monotonic() - started
+        log.debug(
+            "Page %d: Chandra returned %d chars in %.1fs",
+            page_num,
+            len(raw or ""),
+            elapsed,
+        )
+        if raw and _final_output_has_repeat(raw):
+            log.warning(
+                "Page %d: final OCR output (%d chars) still contains a "
+                "repeat loop after all %d retries - likely failed scan",
+                page_num,
+                len(raw),
+                self._max_retries,
+            )
         if not raw:
             log.warning("Chandra returned empty result for page %d", page_num)
             return "", None
