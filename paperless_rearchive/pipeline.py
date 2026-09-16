@@ -186,6 +186,7 @@ def process_document(
             original,
             produce_pdf=produce_pdf,
             output_pdf_path=output_pdf_path,
+            settings=settings,
         )
 
         log.info(

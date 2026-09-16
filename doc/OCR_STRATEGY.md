@@ -1,5 +1,13 @@
 # What paperless-ngx actually does on ingest (verified on this deployment)
 
+> **Status update (2026-09-17): P1–P3 are implemented.**
+>
+> * **P1** — `_assemble_pdf()` drives the same call ingest drives (`plugins=["paperless_chandra.ocrmypdf_plugin"]` + `chandra_*` kwargs); the dead `hocr=` kwarg and the unused per-page hOCR plumbing are gone. Verified: archives 4221/5822/5823 re-run, `Creator: OCRmyPDF 17.11.0 / Chandra 0.2.0`, no Tesseract anywhere.
+> * **P2/P3** — new `ocr/ingest_args.py` mirrors `construct_ocrmypdf_parameters` 1:1 (mode flags, clean/clean-final + redo remap, deskew suppression under redo, `pages` XOR `sidecar`, `user_args` merged last) plus the paperless text semantics (`post_process_text`, born-digital rule `tagged or normalised > 50`, sidecar placeholder → `pdftotext` fallback). Archive-mode runs now do **one** ocrmypdf pass producing both the PDF/A and the markdown sidecar content — the two-pass flow (per-page Chandra + assembly) is retired.
+> * **D-decisions taken**: D1 = option 1 (full parity, single pass). D2 = `REARCHIVE_OCR_MODE` default **`redo`**; `auto` upgrades to `redo` on text-bearing PDFs (a re-OCR tool must re-OCR; `off` is available for PDF/A-conversion-only). D3 = `re-ocr-content` keeps the no-ocrmypdf per-page fast path (content-only runs never produce an archive). D4 = `re-ocr-page-errors` now applies to **content-only runs only**: with ocrmypdf driving archive runs, a page failure aborts the document → ingest-style safe fallback (`force_ocr` retry, clean/deskew per settings) → document failure tag.
+> * New knobs: `REARCHIVE_OCR_CLEAN`, `REARCHIVE_OCR_ROTATE_PAGES`, `REARCHIVE_OCR_ROTATE_PAGES_THRESHOLD` (defaults mirror paperless); `REARCHIVE_OCR_MODE` default changed `auto` → `redo`.
+
+
 **1. Ingest uses the Chandra parser, via a parser-plugin entry point**
 
 ```
@@ -197,3 +205,14 @@ Consequences for the D1 decision:
 * Fine-skew correction under `redo` would require either `force` mode (accepting the
   archive-size growth) or deskewing the pages in our own render path before the
   Chandra call.
+
+### Recommendations from glm-5.3-flash
+
+1. __Adopt D1 option 1 (full parity)__ — confirmed as the right call by my independent reading; one ingest-identical pass, plugin + chandra kwargs, remove the dead `hocr` plumbing (and `_combine_hocr_pages` becomes obsolete — the whole per-page hOCR assembly can go).
+2. __D2: default `redo`, not `auto`__ — a re-OCR tool's purpose is to re-OCR; `auto` would silently no-op on text-bearing docs. Keep `auto` available as an explicit mode.
+3. __D3: keep the no-ocrmypdf fast path for `re-ocr-content`__ as a documented deviation (option 4). Full parity buys the PDF/A as a by-product, which is pure waste when `produce_archive=False`; note Chandra markdown *is* the content paperless-chandra produces anyway (content_format=markdown), so parity of content is preserved without the PDF/A cost.
+4. __D4__: define `re-ocr-page-errors` against ocrmypdf's actual failure model (document-level exit → safe fallback → `force_ocr`), and drop the per-page partial tag unless you keep the render-before-OCR path.
+5. __P1 first__ (small, fixes real data corruption risk), then __P2__ with unit tests mirroring paperless's mode-combo cases. Add an explicit remediation step: re-run docs 4221/5822/5823 after P1 and assert `Creator` contains Chandra + `pdftotext(archive)` ≈ content.
+6. Also remove the `getattr(settings, 'ocr_dpi', 300)` in favour of a real `REARCHIVE_OCR_DPI`-style knob (or drop it entirely under ocrmypdf parity, where rasterisation is ocrmypdf's job).
+
+This was all read-only (plan mode) — no files changed. If you're happy, toggle to __Act mode__ and I can start with P1 (the archive-text-layer fix) plus the remediation re-run of the three affected documents.

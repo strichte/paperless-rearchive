@@ -268,6 +268,7 @@ class ChandraOcrEngine:
         *,
         produce_pdf: bool = False,
         output_pdf_path: Path | None = None,
+        settings: Any = None,
     ) -> OcrResult:
         """OCR a document using Chandra.
 
@@ -275,12 +276,21 @@ class ChandraOcrEngine:
             pdf_path: Path to the input PDF.
             produce_pdf: If True, also produce a searchable PDF/A.
             output_pdf_path: Where to write the PDF/A. Required if produce_pdf=True.
+            settings: Optional rearchive Settings. When given (and
+                produce_pdf=True), a single ingest-identical ocrmypdf pass
+                produces both the PDF/A and the markdown sidecar content
+                (paperless parity; see doc/OCR_STRATEGY.md P2/P3). Without
+                it, the legacy two-pass flow (per-page Chandra for content,
+                plugin assembly for the archive) is used.
 
         Returns:
             OcrResult containing markdown, optionally PDF/A path, and error info.
         """
         if produce_pdf and output_pdf_path is None:
             raise ValueError("output_pdf_path is required when produce_pdf=True")
+
+        if produce_pdf and settings is not None:
+            return self._ocr_document_ingest_pass(pdf_path, output_pdf_path, settings)
 
         # Render PDF pages to images
         images = self._render_pdf_pages(pdf_path)
@@ -390,6 +400,147 @@ class ChandraOcrEngine:
             page_count=total_pages,
             error_pages=error_pages,
             errors=errors,
+        )
+
+    def _ocr_document_ingest_pass(
+        self,
+        pdf_path: Path,
+        output_pdf_path: Path,
+        settings: Any,
+    ) -> OcrResult:
+        """Single ingest-identical ocrmypdf pass: PDF/A + markdown sidecar.
+
+        Replaces the previous two-pass flow (per-page Chandra for content,
+        then ocrmypdf for the archive). One ocrmypdf pass with the
+        paperless_chandra plugin produces the PDF/A (Chandra text layer)
+        *and* the markdown sidecar the content field is taken from -
+        exactly what ingest produces, so archive and content can no longer
+        disagree.
+
+        Consequence (D4 redefinition, doc/OCR_STRATEGY.md): page-level
+        partial-failure tracking does not apply to archive-mode runs. A
+        Chandra page failure aborts the pass; the document-level safe
+        fallback (force_ocr retry, clean/deskew kept per settings) mirrors
+        ingest. ``re-ocr-page-errors`` remains meaningful only for
+        content-only runs.
+        """
+        import fitz  # PyMuPDF
+        import ocrmypdf
+
+        from paperless_rearchive.ocr.ingest_args import (
+            build_ocrmypdf_args,
+            pdf_born_digital_text,
+            post_process_text,
+            extract_pdf_text,
+            resolve_mode,
+            sidecar_content,
+        )
+
+        started = time.monotonic()
+        doc = fitz.open(pdf_path)
+        try:
+            total_pages = len(doc)
+        finally:
+            doc.close()
+
+        effective_pages = self.max_pages
+        if effective_pages > 0 and effective_pages > total_pages:
+            effective_pages = total_pages
+
+        resolved_mode = resolve_mode(
+            settings.ocr_mode,
+            pdf_has_text=pdf_born_digital_text(pdf_path),
+        )
+        sidecar = output_pdf_path.parent / "archive-sidecar.txt"
+
+        def _build(*, safe_fallback: bool) -> dict[str, Any]:
+            return build_ocrmypdf_args(
+                input_file=pdf_path,
+                output_file=output_pdf_path,
+                sidecar_file=sidecar,
+                language=self.language,
+                mode=resolved_mode,
+                clean=settings.ocr_clean,
+                deskew=settings.ocr_deskew,
+                rotate=settings.ocr_rotate,
+                rotate_threshold=settings.ocr_rotate_threshold,
+                output_type=settings.ocr_output_type,
+                jobs=self.concurrency,
+                max_pages=effective_pages,
+                user_args=settings.ocr_user_args,
+                chandra_server_url=self.server_url,
+                chandra_model_name=self.model_name,
+                chandra_api_key=self.api_key,
+                chandra_max_output_tokens=self.max_output_tokens,
+                chandra_content_format=self.content_format,
+                safe_fallback=safe_fallback,
+            )
+
+        args = _build(safe_fallback=False)
+        flag = next(
+            (f for f in ("force_ocr", "redo_ocr", "skip_text") if args.get(f)),
+            "default",
+        )
+        log.info(
+            "Ingest-parity OCR pass: %d page(s), mode=%s (%s), clean=%s, deskew=%s, "
+            "rotate=%s, output_type=%s, jobs=%d",
+            total_pages,
+            resolved_mode,
+            flag,
+            settings.ocr_clean,
+            bool(args.get("deskew")),
+            bool(args.get("rotate_pages")),
+            args.get("output_type"),
+            args.get("jobs"),
+        )
+        log.debug(
+            "ocrmypdf args: %s",
+            {k: ("***" if "api_key" in k else v) for k, v in args.items() if k != "plugins"},
+        )
+        try:
+            ocrmypdf.ocr(**args)
+        except Exception as exc:  # noqa: BLE001 - mirror paperless's safe fallback
+            log.warning(
+                "OCR failed (%s: %s); retrying with safe fallback (force_ocr, "
+                "clean/deskew per settings)",
+                type(exc).__name__,
+                exc,
+            )
+            args = _build(safe_fallback=True)
+            log.debug("Retrying OCRmyPDF with args: %s", args)
+            try:
+                ocrmypdf.ocr(**args)
+            except Exception as exc2:  # noqa: BLE001
+                raise RuntimeError(
+                    f"OCRmyPDF failed: {type(exc2).__name__}: {exc2}"
+                ) from exc2
+
+        if sidecar.exists():
+            content = sidecar_content(sidecar, output_pdf_path)
+        else:
+            # pages cap set: ocrmypdf got ``pages=1-N`` instead of a sidecar
+            # (they are mutually exclusive, as at ingest). Content comes from
+            # the produced PDF's text layer instead of markdown.
+            log.warning(
+                "pages cap active (%d); no sidecar - content taken from pdftotext "
+                "of the produced PDF (plain text, not markdown)",
+                effective_pages,
+            )
+            content = post_process_text(extract_pdf_text(output_pdf_path)) or ""
+
+        elapsed = time.monotonic() - started
+        log.info(
+            "Ingest-parity OCR done: %d page(s) in %.1fs (%.1f pages/min), "
+            "content %d chars",
+            total_pages,
+            elapsed,
+            (total_pages / elapsed * 60) if elapsed > 0 else 0.0,
+            len(content),
+        )
+        return OcrResult(
+            markdown=content,
+            pdf_path=output_pdf_path,
+            page_count=total_pages,
         )
 
     def _render_pdf_pages(self, pdf_path: Path) -> list[Any]:

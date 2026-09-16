@@ -43,8 +43,8 @@ def test_build_args_defaults(tmp_path: Path) -> None:
     pdf = tmp_path / "doc.pdf"
     pdf.write_bytes(b"%PDF-1.4")
     args = build_ocrmypdf_args(pdf, tmp_path / "out.pdf", tmp_path / "s.txt",
-                               _FakeProvider(), _settings(), jobs=2)
-    # No text layer in the input -> ocrmypdf is allowed to OCR bare pages only.
+                               _FakeProvider(), _settings(REARCHIVE_OCR_MODE="auto"), jobs=2)
+    # auto + no text layer in the input -> ocrmypdf may OCR bare pages only.
     assert args["skip_text"] is True
     assert "force_ocr" not in args
     assert args["plugins"] == ["fake_plugin"]

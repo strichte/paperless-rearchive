@@ -393,8 +393,11 @@ token, the Chandra key, and the database user/password.
 | `PAPERLESS_CHANDRA_CONTENT_FORMAT` | `markdown` | `markdown` or `text` |
 | `PAPERLESS_CHANDRA_MAX_OUTPUT_TOKENS` | `12384` | per-page token budget |
 | `REARCHIVE_OCR_LANGUAGE` | `eng` | passed through to ocrmypdf (labels hOCR) |
-| `REARCHIVE_OCR_MODE` | `auto` | `auto`: `redo_ocr` when the original has a text layer (swaps the invisible text layer, page images untouched), `skip_text` when it has none (OCRs the bare pages); `force`: always rasterise + re-OCR (much larger archive); `redo`: always redo |
-| `REARCHIVE_OCR_DESKEW` | `true` | deskew pages before OCR |
+| `REARCHIVE_OCR_MODE` | `redo` | `redo` (default): strip the existing invisible text layer and re-OCR, page images untouched; `auto`: like ingest — `skip_text` on textless PDFs, but **upgrades to `redo` when a text layer is present** (deviation from ingest, where `auto` would just do a PDF/A conversion); `force`: always rasterise + re-OCR (much larger archive); `off`: PDF/A conversion only, no OCR |
+| `REARCHIVE_OCR_CLEAN` | `clean` | image cleaning before OCR (`final` maps to `clean` under `redo`, as at ingest); `none` disables |
+| `REARCHIVE_OCR_DESKEW` | `true` | deskew pages before OCR (ocrmypdf forbids deskew with `redo`; dropped automatically, as paperless does) |
+| `REARCHIVE_OCR_ROTATE_PAGES` | `true` | 90/180/270 orientation fix before OCR (via the Chandra engine's OSD) |
+| `REARCHIVE_OCR_ROTATE_PAGES_THRESHOLD` | `12.0` | confidence threshold for `rotate_pages` |
 | `REARCHIVE_OCR_OUTPUT_TYPE` | `pdfa` | archive PDF/A flavour |
 | `REARCHIVE_OCR_USER_ARGS` | *(unset)* | extra ocrmypdf kwargs (JSON), e.g. paperless `PAPERLESS_OCR_USER_ARGS` |
 | `REARCHIVE_ARCHIVE_FOR_IMAGES` | `false` | experimental: create archive for non-PDF originals |

@@ -25,6 +25,7 @@ RUN apt-get update \
         pngquant \
         tesseract-ocr \
         poppler-utils \
+        unpaper \
         curl \
         git \
         jbig2 \
