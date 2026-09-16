@@ -59,3 +59,60 @@ def test_replace_archive_no_backup(tmp_path: Path) -> None:
     new = _write(tmp_path / "new.pdf", b"new")
     replace_archive(old, new, keep_backup=False)
     assert not list(tmp_path.glob("*.bak-*"))
+
+
+def test_replace_archive_backup_dir_mirrors_relative_path(tmp_path: Path) -> None:
+    """A configured backup dir gets the archive's template sub-dirs."""
+    archive_dir = tmp_path / "archive"
+    target_dir = archive_dir / "Passports" / "DE" / "1971"
+    target_dir.mkdir(parents=True)
+    old = _write(target_dir / "foo.pdf", b"old-bytes")
+    new = _write(tmp_path / "new.pdf", b"new-bytes")
+    backup_dir = tmp_path / "backups"
+
+    checksum = replace_archive(old, new, backup_dir=backup_dir, archive_dir=archive_dir)
+
+    assert old.read_bytes() == b"new-bytes"
+    assert checksum_of_file(old) == checksum
+    backups = list((backup_dir / "Passports" / "DE" / "1971").glob("foo.pdf.bak-*"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == b"old-bytes"
+    # nothing left next to the archive (no orphaned file in the media dir)
+    assert not list(target_dir.glob("*.bak-*"))
+
+
+def test_replace_archive_backup_dir_flattens_outside_archive_dir(tmp_path: Path) -> None:
+    """An archive not below archive_dir is stored flat, not lost."""
+    archive_dir = tmp_path / "archive"
+    archive_dir.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    old = _write(elsewhere / "foo.pdf", b"old")
+    new = _write(tmp_path / "new.pdf", b"new")
+    backup_dir = tmp_path / "backups"
+
+    replace_archive(old, new, backup_dir=backup_dir, archive_dir=archive_dir)
+
+    assert len(list(backup_dir.glob("foo.pdf.bak-*"))) == 1
+    assert not list(elsewhere.glob("*.bak-*"))
+
+
+def test_replace_archive_backup_dir_created_on_demand(tmp_path: Path) -> None:
+    """Nested backup dirs are created; a different disk is just a copy."""
+    old = _write(tmp_path / "a.pdf", b"old")
+    new = _write(tmp_path / "new.pdf", b"new")
+    backup_dir = tmp_path / "deep" / "backups"
+
+    replace_archive(old, new, backup_dir=backup_dir, archive_dir=tmp_path)
+
+    assert old.read_bytes() == b"new"
+    assert len(list(backup_dir.glob("a.pdf.bak-*"))) == 1
+
+
+def test_backup_destination_legacy_keeps_backup_next_to_archive(tmp_path: Path) -> None:
+    from paperless_rearchive.archive.replacer import backup_destination
+
+    archive = _write(tmp_path / "a.pdf", b"x")
+    dest = backup_destination(archive)
+    assert dest.parent == tmp_path
+    assert dest.name.startswith("a.pdf.bak-")

@@ -148,6 +148,11 @@ def _log_cycle_summary(
 def main() -> None:
     settings = Settings.from_env()
     configure_logging(settings.log_level)
+    try:
+        settings.validate()
+        settings.prepare_backup_dir()
+    except ValueError as e:
+        sys.exit(f"configuration error: {e}")
     if not settings.api_token:
         sys.exit("PAPERLESS_API_TOKEN (or PAPERLESS_API_TOKEN_FILE) is required")
 

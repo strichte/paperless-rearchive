@@ -10,6 +10,8 @@ from pathlib import Path
 
 from paperless_rearchive.secrets import secret, secret_or_default
 
+log = logging.getLogger(__name__)
+
 
 def _env(name: str, default: str) -> str:
     value = os.environ.get(name)
@@ -26,6 +28,17 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         logging.getLogger(__name__).warning("Invalid integer for %s; using %d", name, default)
         return default
+
+
+def _is_within(path: Path, parent: Path) -> bool:
+    """True when ``path`` is ``parent`` itself or lives underneath it.
+
+    Both sides are resolved first so symlinks, ``..`` and trailing slashes
+    cannot disguise e.g. ``/archives/link-to-self`` as a distinct directory.
+    """
+    resolved = path.resolve()
+    root = parent.resolve()
+    return resolved == root or root in resolved.parents
 
 
 @dataclass(frozen=True)
@@ -56,6 +69,9 @@ class Settings:
     paperless_url: str
     api_token: str
     archive_dir: Path
+    #: Where replaced archives are backed up. ``None`` keeps the legacy
+    #: behaviour (``<archive>.bak-<ts>`` next to the archive itself).
+    backup_dir: Path | None
 
     trigger_tag_content: str
     trigger_tag_all: str
@@ -86,6 +102,97 @@ class Settings:
     def needs_db(self) -> bool:
         return bool(self.trigger_tag_all)
 
+    def validate(self) -> None:
+        """Refuse obviously unsafe configurations (called once at startup).
+
+        Only ``REARCHIVE_BACKUP_DIRECTORY`` is checked today. paperless-ngx's
+        health check (``sanity_checker``) walks ``PAPERLESS_MEDIA_ROOT`` and
+        cannot tell sidecar backups apart from orphaned files, so backups
+        written into the archive tree produce warnings like::
+
+            Orphaned file in media dir: .../documents/archive/....pdf.bak-...
+
+        Anything at or below the archive directory is therefore rejected.
+        """
+        if self.backup_dir is None:
+            return
+        if _is_within(self.backup_dir, self.archive_dir):
+            raise ValueError(
+                "REARCHIVE_BACKUP_DIRECTORY resolves to the archive directory "
+                f"{self.archive_dir} itself or a directory inside it "
+                f"({self.backup_dir}). paperless-ngx's health check then "
+                "reports every backup as an orphaned file in the media "
+                "directory. Point REARCHIVE_BACKUP_DIRECTORY at a directory "
+                "outside the archive tree - typically a separate bind mount, "
+                "possibly another disk. If you really want the backups next "
+                "to the archives, omit REARCHIVE_BACKUP_DIRECTORY (the legacy "
+                "behaviour) - but note that it still triggers the "
+                "orphaned-file warning; we do not recommend it."
+            )
+        if self.backup_dir.exists() and not self.backup_dir.is_dir():
+            raise ValueError(
+                f"REARCHIVE_BACKUP_DIRECTORY {self.backup_dir} exists but is "
+                "not a directory."
+            )
+
+    def prepare_backup_dir(self) -> None:
+        """Create/verify the backup directory (idempotent, startup-time).
+
+        Called after :meth:`validate` so a bad mount surfaces before hours of
+        OCR work rather than at the first archive replacement. Dry runs never
+        write, so in dry-run mode a missing directory is only reported.
+        """
+        if self.backup_dir is None:
+            return
+        if not self.backup_dir.exists():
+            if self.dry_run:
+                log.warning(
+                    "DRY-RUN: REARCHIVE_BACKUP_DIRECTORY %s does not exist; "
+                    "it would be created on the first archive replacement.",
+                    self.backup_dir,
+                )
+                return
+            try:
+                self.backup_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                raise ValueError(
+                    f"REARCHIVE_BACKUP_DIRECTORY {self.backup_dir} could not "
+                    f"be created: {e}"
+                ) from e
+            log.info("created backup directory %s", self.backup_dir)
+        if not os.access(self.backup_dir, os.W_OK | os.X_OK):
+            raise ValueError(
+                f"REARCHIVE_BACKUP_DIRECTORY {self.backup_dir} is not writable "
+                "by this process."
+            )
+        self._log_backup_filesystem()
+
+    def _log_backup_filesystem(self) -> None:
+        """Report whether backups cross a filesystem boundary (different disk)."""
+        if self.backup_dir is None:
+            return
+        try:
+            backup_dev = os.stat(self.backup_dir).st_dev
+            archive_dev = os.stat(self.archive_dir).st_dev
+        except OSError as e:
+            log.warning(
+                "could not stat archive (%s) / backup (%s) directory: %s",
+                self.archive_dir,
+                self.backup_dir,
+                e,
+            )
+            return
+        if backup_dev != archive_dev:
+            log.info(
+                "backup directory %s is on a different filesystem (device %d) "
+                "than the archive directory %s (device %d); backups are copied "
+                "across, at the cost of a full file copy per replaced archive",
+                self.backup_dir,
+                backup_dev,
+                self.archive_dir,
+                archive_dev,
+            )
+
     @classmethod
     def from_env(cls) -> Settings:
         raw_user_args = _env("REARCHIVE_OCR_USER_ARGS", "")
@@ -95,10 +202,12 @@ class Settings:
             raise ValueError(f"REARCHIVE_OCR_USER_ARGS is not valid JSON: {e}") from e
         if not isinstance(user_args, dict):
             raise ValueError("REARCHIVE_OCR_USER_ARGS must decode to a JSON object")
+        backup_raw = _env("REARCHIVE_BACKUP_DIRECTORY", "")
         return cls(
             paperless_url=_env("PAPERLESS_BASE_URL", "http://paperless:8000").rstrip("/"),
             api_token=secret("PAPERLESS_API_TOKEN"),
             archive_dir=Path(_env("REARCHIVE_ARCHIVE_DIR", "/archives")),
+            backup_dir=Path(backup_raw) if backup_raw else None,
             trigger_tag_content=_env("REARCHIVE_TRIGGER_TAG_CONTENT", "re-ocr-content"),
             trigger_tag_all=_env("REARCHIVE_TRIGGER_TAG_ALL", "re-ocr-all"),
             success_suffix=_env("REARCHIVE_SUCCESS_SUFFIX", "-success"),

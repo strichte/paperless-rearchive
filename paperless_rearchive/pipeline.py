@@ -265,7 +265,12 @@ def process_document(
             # Get original archive size before replacement
             old_size = archive_path.stat().st_size if archive_path.exists() else 0
             
-            checksum = replace_archive(archive_path, result.pdf_path)
+            checksum = replace_archive(
+                archive_path,
+                result.pdf_path,
+                backup_dir=settings.backup_dir,
+                archive_dir=settings.archive_dir,
+            )
             log.info(
                 "Document %d: archive replaced, new SHA-256=%s",
                 ctx.doc_id,

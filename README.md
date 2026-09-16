@@ -102,7 +102,9 @@ cycle to begin processing.
 - **The original file is immutable.** It is only ever downloaded via the API into a scratch
   directory and used as the OCR source. Nothing ever writes to `media/documents/originals/`.
 - Archive files are replaced **atomically** (write temp file → `os.replace`) and the previous
-  archive version is kept as a `.bak` file next to it.
+  archive version is kept as a `.bak-<timestamp>` file. By default that backup sits next to the
+  archive; set `REARCHIVE_BACKUP_DIRECTORY` to keep it outside the media directory instead — see
+  [Backup directory](#backup-directory).
 - The archive is only replaced after verifying that the on-disk archive checksum still matches
   `documents_document.archive_checksum` (no concurrent modification).
 - Born-digital PDFs without an archive version, and non-PDF originals (images), are handled in
@@ -167,7 +169,7 @@ Living checklist — updated as the project progresses. Full detail in
 | `re-ocr-content` end-to-end (content PATCH, archive untouched) | ✅ verified on live instance |
 | `re-ocr-all` end-to-end (archive replace + DB checksum + tag swap) | ✅ verified on live instance |
 | Dockerfile (`python:3.14-slim`/trixie, jbig2/pngquant/ghostscript/tesseract) | ✅ builds |
-| Unit tests | ✅ 39 passing |
+| Unit tests | ✅ 70 passing |
 | Repeat-loop / failed-scan detection | ⬜ open (see PLANNING Risks) |
 | Bulk re-OCR rehearsal before mass use | ⬜ open |
 
@@ -199,6 +201,37 @@ Build and add the service to `paperless-lxc/docker-compose.yml`
       PAPERLESS_CHANDRA_MODEL_NAME: "chandra-ocr-2-q8"
       PAPERLESS_CHANDRA_CONTENT_FORMAT: "markdown"
 ```
+
+### Backup directory
+
+By default the previous archive version is kept next to the archive as `<name>.bak-<timestamp>`.
+paperless-ngx's **health check** walks `PAPERLESS_MEDIA_ROOT` and cannot tell those sidecar
+backups apart from orphaned files, so it logs warnings such as:
+
+> `[WARNING] [paperless.sanity_checker] Orphaned file in media dir: …/documents/archive/….pdf.bak-20260916-051453`
+
+Set `REARCHIVE_BACKUP_DIRECTORY` to move the backups out of the media directory. It must be a
+**different directory than `REARCHIVE_ARCHIVE_DIR`** — ideally a **separate bind mount**, which may
+even be a different disk (backups are *copied*, not moved):
+
+```yaml
+    volumes:
+      - /data/paperless/media/documents/archive:/archives
+      - /data/paperless/archive-backups:/archive-backups   # different directory / disk
+    environment:
+      REARCHIVE_ARCHIVE_DIR: "/archives"
+      REARCHIVE_BACKUP_DIRECTORY: "/archive-backups"
+```
+
+The archive's sub-directory layout is mirrored below the backup directory, e.g.
+`/archive-backups/Passports_Visas_IDs/DE/1971/<name>.pdf.bak-20260916-051453`. At startup the
+sidecar creates the directory if needed, verifies it is writable, and **refuses to run** when
+`REARCHIVE_BACKUP_DIRECTORY` resolves to the archive directory or a sub-directory of it (symlinks
+included). If backups next to the archives are really what you want, omit
+`REARCHIVE_BACKUP_DIRECTORY` — that is the legacy behaviour — but note that it still triggers the
+orphaned-file warning; keeping the backups outside the media directory is what we recommend.
+Existing `.bak-*` files already in the archive directory can be moved to the backup directory (or
+deleted) to clear those warnings.
 
 Configuration is documented in [`doc/PLANNING.md#configuration`](doc/PLANNING.md#configuration).
 

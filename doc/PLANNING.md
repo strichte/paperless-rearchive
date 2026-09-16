@@ -33,6 +33,13 @@ The original file is immutable; it is only downloaded via the API and used as OC
 - **Archive directory**: `media/documents/archive/` (singular) on this deployment, with
   template-derived subdirectories (e.g. `Retirement/Steffen Richter/2026/…pdf`);
   246 of 5352 documents have no archive file.
+- **Orphaned-file health check vs. backups**: paperless-ngx's sanity checker walks
+  `PAPERLESS_MEDIA_ROOT` and flags every file it cannot account for, so the sidecar's
+  `.bak-<timestamp>` copies sitting in `media/documents/archive/` surface as
+  `Orphaned file in media dir: …/documents/archive/….pdf.bak-…` warnings. Hence
+  `REARCHIVE_BACKUP_DIRECTORY`: backups go outside the media dir (typically a separate bind
+  mount, possibly another disk - they are *copied*, so cross-device is fine), and startup
+  refuses to run when the setting resolves into the archive tree.
 - **Archive filename / path**: *not* always `<id>.pdf`. `file_handling.generate_unique_filename(
   doc, archive_filename=True)` derives it from storage-path / `PAPERLESS_FILENAME_FORMAT`
   templates (or `<pk:07>.pdf` when no template). The API's `archived_file_name` is only a
@@ -102,7 +109,7 @@ flowchart TB
         PDF["ocr/runner.py<br/>ocrmypdf sandwich pipeline<br/>(for PDF/A assembly only)"]
         PROV["ocr/base.py: OcrProviderPlugin ABC"]
         CHAN["ocr/chandra.py: ChandraProvider"]
-        REP["archive/replacer.py<br/>backup + os.replace + sha256"]
+        REP["archive/replacer.py<br/>backup (REARCHIVE_BACKUP_DIRECTORY) + os.replace + sha256"]
         DBM["archive/db.py<br/>psycopg UPDATE archive_checksum"]
         CFG["config.py (Settings.from_env)"]
         MAIN --> CFG
@@ -267,7 +274,7 @@ paperless-rearchive/
 ├── docker/Dockerfile
 ├── pyproject.toml
 └── tests/
-    ├── test_*.py              # pytest unit tests (39 passing)
+    ├── test_*.py              # pytest unit tests (70 passing)
     └── integration/           # live-stack harness (see its README)
 ```
 
@@ -324,14 +331,16 @@ paperless-rearchive/
 
 ### Phase 4 — Archive replacement ✅
 - ✅ `archive/db.py` (psycopg; fetch + update archive_checksum)
-- ✅ `archive/replacer.py` (verify checksum, backup, atomic replace, sha256)
+- ✅ `archive/replacer.py` (verify checksum, backup, atomic replace, sha256; backup destination
+  configurable via `REARCHIVE_BACKUP_DIRECTORY` — legacy next-to-archive when unset)
 - ✅ DB password from secret file `paperless_db_paperless_passwd`
 
 ### Phase 5 — Deployment & tests 🔧
 - ✅ Dockerfile (python:3.14-slim/trixie + ghostscript/tesseract/qpdf/pngquant/jbig2/poppler +
   ocrmypdf + paperless-chandra from git master; image builds and all deps import on 3.14)
 - ✅ compose snippet + `.env.example`
-- ✅ unit tests (39 passing: replacer, runner args/mode selection, API tag lookup, config)
+- ✅ unit tests (70 passing: replacer, runner args/mode selection, API tag lookup, custom
+  fields/notes, config + backup-directory validation)
 - ✅ live smoke test (2026-09-15): dry-run cycle against the running instance
   (`http://localhost:8001`) — document 5488 tagged `re-ocr-content` + `re-ocr-all` was OCR'd
   end-to-end via the live Chandra server (~30k chars markdown sidecar produced, nothing
@@ -376,6 +385,7 @@ token, the Chandra key, and the database user/password.
 | `REARCHIVE_SUCCESS_SUFFIX` | `-success` | success tag suffix |
 | `REARCHIVE_FAILURE_SUFFIX` | `-failure` | failure tag suffix |
 | `REARCHIVE_ARCHIVE_DIR` | `/archives` | bind-mounted `media/documents/archive` |
+| `REARCHIVE_BACKUP_DIRECTORY` | *(unset)* | directory for the `.bak-<timestamp>` archive backups. Unset = next to the archive (legacy behaviour; paperless-ngx's health check then reports each backup as an orphaned file in the media dir). Set it to a directory **outside** the archive tree - typically a separate bind mount, possibly another disk (the backup is *copied*). Created/verified at startup; startup **refuses to run** when it resolves to the archive dir or a subdirectory of it (symlinks included). |
 | `REARCHIVE_PROVIDER` | `chandra` | OCR provider plugin |
 | `PAPERLESS_CHANDRA_SERVER_URL` | *(required)* | e.g. `http://ai:8110/v1` |
 | `PAPERLESS_CHANDRA_MODEL_NAME` | `chandra` | e.g. `chandra-ocr-2-q8` |
@@ -429,3 +439,7 @@ Secrets (already defined in `paperless-lxc/docker-compose.yml`): `chandra_api_ke
   pin a tag once available for reproducible builds.
 - ⬜ `REARCHIVE_OCR_MODE=force` should only be used knowingly: it is the only mode that changes
   archive size dramatically.
+- ✅ **Resolved** — `.bak` files inside `media/documents/archive/` tripped paperless-ngx's
+  orphaned-file health check. `REARCHIVE_BACKUP_DIRECTORY` now relocates the backups outside the
+  media dir (cross-disk safe: they are copied), mirrors the archive's sub-directory layout, is
+  created/verified at startup, and is refused at/below the archive directory.

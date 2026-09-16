@@ -56,22 +56,63 @@ def verify_current_checksum(archive_path: Path, expected: str | None) -> None:
         )
 
 
+def backup_destination(
+    archive_path: Path,
+    *,
+    backup_dir: Path | None = None,
+    archive_dir: Path | None = None,
+) -> Path:
+    """Return the ``<name>.bak-<timestamp>`` path for ``archive_path``.
+
+    * ``backup_dir`` unset — the backup stays next to the archive (legacy
+      behaviour).
+    * ``backup_dir`` set — the archive's path relative to ``archive_dir`` is
+      recreated below it, so template sub-directories are preserved. An
+      archive that cannot be related to ``archive_dir`` is stored flat.
+    """
+    name = f"{archive_path.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+    if backup_dir is None:
+        return archive_path.with_name(name)
+    rel: Path | None = None
+    if archive_dir is not None:
+        try:
+            rel = archive_path.resolve().relative_to(Path(archive_dir).resolve())
+        except ValueError:
+            log.warning(
+                "archive %s is not inside %s; storing its backup flat",
+                archive_path,
+                archive_dir,
+            )
+    if rel is None:
+        return Path(backup_dir) / name
+    return (Path(backup_dir) / rel).with_name(name)
+
+
 def replace_archive(
     archive_path: Path,
     new_pdf: Path,
     *,
     keep_backup: bool = True,
+    backup_dir: Path | None = None,
+    archive_dir: Path | None = None,
 ) -> str:
     """Atomically replace ``archive_path`` with ``new_pdf``.
 
     Returns the SHA-256 checksum of the newly written file. The previous
-    archive version is preserved as ``<name>.bak-<timestamp>`` next to it.
+    archive version is preserved as ``<name>.bak-<timestamp>`` — next to the
+    archive, or below ``backup_dir`` when that is set (see
+    :func:`backup_destination`). The backup is *copied*, so ``backup_dir`` may
+    live on a different filesystem/disk; keeping it outside the media
+    directory is what stops paperless-ngx's health check from reporting the
+    backups as orphaned files.
     """
-    backup_path: Path | None = None
     if keep_backup:
-        backup_path = archive_path.with_name(
-            f"{archive_path.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+        backup_path = backup_destination(
+            archive_path, backup_dir=backup_dir, archive_dir=archive_dir
         )
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        # copy (never move): the target may be another disk, and the source
+        # must stay readable for verification until os.replace() runs.
         shutil.copy2(archive_path, backup_path)
         log.info("Backed up old archive to %s", backup_path)
 
