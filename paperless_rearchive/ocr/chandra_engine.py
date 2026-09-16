@@ -302,7 +302,7 @@ class ChandraOcrEngine:
             # Use ocrmypdf to do the sandwich
             # ocrmypdf.ocr() with redo_ocr=True will use the hOCR sidecar
             ocrmypdf.ocr(
-                input_file=str(original_pdf),
+                str(original_pdf),  # input_file as positional arg
                 output_file=str(output_pdf),
                 output_type="pdfa",
                 language=self.language,
