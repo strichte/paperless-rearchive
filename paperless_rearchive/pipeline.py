@@ -1,4 +1,14 @@
-"""Per-document re-OCR pipeline."""
+"""Per-document re-OCR pipeline using unified Chandra OCR engine.
+
+This pipeline uses the unified ChandraOcrEngine which:
+1. Renders PDF pages to images using PyMuPDF
+2. Calls Chandra for OCR on each page
+3. Optionally assembles a searchable PDF/A using ocrmypdf's sandwich pipeline
+4. Tracks page-level errors for partial failure reporting
+
+The OCR work is unified (same Chandra calls regardless of mode),
+but PDF/A assembly only happens for re-ocr-all to avoid wasting CPU.
+"""
 
 from __future__ import annotations
 
@@ -20,16 +30,11 @@ from paperless_rearchive.archive.replacer import (
     replace_archive,
     verify_current_checksum,
 )
-from paperless_rearchive.ocr.runner import (
-    guess_mime_type,
-    is_image,
-    ocr_skipped_all,
-    run_ocr,
-)
+from paperless_rearchive.ocr.base import OcrProviderPlugin
+from paperless_rearchive.ocr.chandra_engine import ChandraOcrEngine
 
 if TYPE_CHECKING:
     from paperless_rearchive.config import Settings
-    from paperless_rearchive.ocr.base import OcrProviderPlugin
     from paperless_rearchive.paperless_api import PaperlessAPI
 
 log = logging.getLogger(__name__)
@@ -52,7 +57,7 @@ def process_document(
     provider: OcrProviderPlugin,
     ctx: DocumentContext,
 ) -> None:
-    """Re-OCR one document; never raises for expected failure modes.
+    """Re-OCR one document using unified Chandra OCR engine.
 
     Tag outcomes:
     * success  -> trigger removed, ``<trigger>-success`` added
@@ -60,7 +65,6 @@ def process_document(
     * retry    -> trigger kept (transient OCR error); nothing else touched
     """
     doc = api.document(ctx.doc_id)
-    mime = guess_mime_type(Path(doc.get("original_file_name") or "x.bin"))
 
     with tempfile.TemporaryDirectory(prefix=f"rearch-{ctx.doc_id}-") as tmp:
         tmp_dir = Path(tmp)
@@ -86,8 +90,8 @@ def process_document(
                     ctx.doc_id,
                 )
                 do_archive = False
-            elif not mime.startswith("application/pdf") and is_image(mime):
-                log.info("Document %d is an image; content-only mode.", ctx.doc_id)
+            elif original.suffix.lower() != ".pdf":
+                log.info("Document %d is not a PDF; content-only mode.", ctx.doc_id)
                 do_archive = False
             else:
                 archive_path = settings.archive_dir / archive_filename
@@ -106,25 +110,49 @@ def process_document(
                     _finish(api, ctx, success=False, note=str(e))
                     return
 
-        new_pdf = tmp_dir / "archive.pdf"
-        sidecar = tmp_dir / "sidecar.txt"
-        try:
-            run_ocr(original, new_pdf, sidecar, provider, settings)
-        except RuntimeError as e:
-            log.warning("Document %d: OCR failed transiently: %s", ctx.doc_id, e)
-            return  # keep trigger tag for retry
+        # Use unified Chandra OCR engine
+        engine = ChandraOcrEngine(
+            server_url=provider.server_url,
+            model_name=provider.model_name,
+            api_key=provider.api_key,
+            content_format=provider.content_format,
+            max_output_tokens=provider.max_output_tokens,
+            language=settings.ocr_language,
+            dpi=getattr(settings, 'ocr_dpi', 300),
+        )
 
-        content = _read_content(sidecar, new_pdf)
+        # Branch: produce PDF/A only for re-ocr-all
+        produce_pdf = do_archive and archive_path is not None
+        output_pdf_path = tmp_dir / "archive.pdf" if produce_pdf else None
 
-        if ocr_skipped_all(content):
-            # ocrmypdf recognised nothing (every page was skipped). Writing this
-            # through would replace the document's text with the placeholder
-            # "[OCR skipped on page(s) 1-N]" and swap the archive for a
-            # byte-wise re-encode of itself. Stop before touching anything.
-            message = (
-                "OCR skipped every page (ocrmypdf recognised nothing); "
-                "check REARCHIVE_OCR_MODE"
+        log.info(
+            "Unified OCR engine: document %d, produce_pdf=%s, archive_mode=%s",
+            ctx.doc_id,
+            produce_pdf,
+            ctx.archive_mode,
+        )
+
+        result = engine.ocr_document(
+            original,
+            produce_pdf=produce_pdf,
+            output_pdf_path=output_pdf_path,
+        )
+
+        # Handle page-level errors
+        if result.has_errors:
+            log.warning(
+                "Document %d: %d of %d pages failed OCR: %s",
+                ctx.doc_id,
+                len(result.error_pages),
+                result.page_count,
+                result.errors,
             )
+
+        content = result.markdown
+
+        if not content.strip():
+            # No OCR content produced
+            message = "OCR produced no content (all pages failed or empty)"
             log.error("Document %d: %s. Nothing written.", ctx.doc_id, message)
             if settings.dry_run:
                 return
@@ -133,19 +161,48 @@ def process_document(
 
         if settings.dry_run:
             would = f"content ({len(content)} chars)"
-            if archive_path is not None:
-                would += f" and archive {archive_path}"
+            if result.pdf_path is not None:
+                would += f" and archive {result.pdf_path}"
             log.info("DRY-RUN document %d: would write %s. Trigger tag kept.", ctx.doc_id, would)
             return
 
         api.patch_content(ctx.doc_id, content)
 
-        if archive_path is not None:
-            checksum = replace_archive(archive_path, new_pdf)
+        # Add page-errors tag if there were partial failures
+        extra_tags = []
+        if result.has_errors:
+            try:
+                page_errors_tag_id = api.ensure_tag("re-ocr-page-errors")
+                extra_tags.append(page_errors_tag_id)
+                log.info(
+                    "Document %d: added re-ocr-page-errors tag (%d pages failed)",
+                    ctx.doc_id,
+                    len(result.error_pages),
+                )
+            except Exception:
+                log.exception("Could not add re-ocr-page-errors tag for document %d", ctx.doc_id)
+
+        if result.pdf_path is not None and archive_path is not None:
+            checksum = replace_archive(archive_path, result.pdf_path)
             update_archive_checksum(settings.db, ctx.doc_id, checksum)
 
-    _finish(api, ctx, success=True)
-    log.info("Document %d re-OCR complete.", ctx.doc_id)
+        # Finish: swap trigger tag for outcome tag
+        outcome_tag_name = f"{ctx.trigger_tag_name}{'-success' if result.page_count > 0 else '-failure'}"
+        try:
+            outcome_tag_id = api.ensure_tag(outcome_tag_name)
+            all_tags_to_add = [outcome_tag_id] + extra_tags
+            api.set_tags(
+                ctx.doc_id,
+                remove=[ctx.trigger_tag_id],
+                add=all_tags_to_add,
+                current_tags=ctx.current_tags,
+            )
+        except Exception:
+            log.exception("Could not update tags on document %d; keeping trigger.", ctx.doc_id)
+            return
+
+    log.info("Document %d re-OCR complete: %d pages, %d succeeded, %d failed",
+             ctx.doc_id, result.page_count, result.success_count, len(result.error_pages))
 
 
 def _repair_checksum_drift(
@@ -181,25 +238,6 @@ def _repair_checksum_drift(
         disk_checksum,
     )
     update_archive_checksum(settings.db, ctx.doc_id, disk_checksum)
-
-
-def _read_content(sidecar: Path, archive_pdf: Path) -> str:
-    """Markdown sidecar text; fall back to pdftotext on the new PDF."""
-    if sidecar.is_file():
-        content = sidecar.read_text(encoding="utf-8").strip()
-        if content:
-            return content
-    try:
-        result = subprocess.run(  # noqa: S603 - fixed argv, no user input
-            ["pdftotext", str(archive_pdf), "-"],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=120,
-        )
-        return result.stdout.strip()
-    except (subprocess.SubprocessError, FileNotFoundError):
-        return ""
 
 
 def _finish(

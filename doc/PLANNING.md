@@ -12,11 +12,20 @@ Re-process the OCR of thousands of existing paperless-ngx documents using LLM vi
 - `re-ocr-all` — as above, plus regenerate the archive version of the document and update the
   database checksum.
 
+- `re-ocr-page-errors` — added alongside `-success` or `-failure` when a document has partial OCR
+  results (some pages succeeded, some failed). This tag signals that the document has OCR content
+  but with gaps that may need manual review or re-processing.
 The original file is immutable; it is only downloaded via the API and used as OCR source.
 
 ## 2. Research notes (confirmed against paperless-ngx source / docs)
 
-- **Archive checksum**: paperless sets `archive_checksum` with
+- **Unified OCR architecture** (Phase 3b, in progress): The OCR engine now uses a single Chandra pass
+  that produces both markdown content and hOCR structures. For `re-ocr-content`, only the markdown is
+  used (no PDF/A generated). For `re-ocr-all`, the hOCR is passed to ocrmypdf's sandwich pipeline
+  to produce the searchable PDF/A from the original scan images. This avoids wasting CPU on PDF/A
+  generation for content-only mode. The branching decision is made after OCR completion based on the
+  trigger tag. Implemented in `paperless_rearchive/ocr/chandra_engine.py` (ChandraOcrEngine class).
+  PDF/A assembly always uses ocrmypdf's sandwich pipeline for maximum compatibility and PDF/A compliance.
   `documents.utils.compute_checksum` — **SHA-256** of the file bytes (verified live: the
   on-disk file's SHA-256 matches the DB value exactly; earlier paperless releases used MD5)
   when the archive is moved into `settings.ARCHIVE_DIR`. Correct update statement:
@@ -47,6 +56,12 @@ The original file is immutable; it is only downloaded via the API and used as OC
   by default. The immutable original requires the query parameter `?original=true` (verified
   live — without it the sidecar re-OCR'd an archive it had itself just written). The sidecar
   always passes `original=true` and works in a scratch directory; nothing writes to
+- **Unified OCR architecture** (Phase 3 refactor): The OCR engine now uses a single Chandra pass
+  that produces both markdown content and hOCR structures. For `re-ocr-content`, only the markdown
+  is used (no PDF/A generated). For `re-ocr-all`, the hOCR is passed to ocrmypdf's sandwich pipeline
+  to produce the searchable PDF/A from the original scan images. This avoids wasting CPU on PDF/A
+  generation for content-only mode. The branching decision is made after OCR completion based on the
+  trigger tag. See `paperless_rearchive/ocr/chandra_engine.py` for the unified implementation.
   `media/documents/originals/`.
 - **Tag lookup**: `/api/tags/` silently ignores `?name=` and `?name__exact=`; `?name__iexact=`
   works. `?name__icontains=` is a trap — `re-ocr-all` also matches `re-ocr-all-success`. The
@@ -83,7 +98,8 @@ flowchart TB
         MAIN["poller.py (main loop)<br/>POLL_INTERVAL / SIGHUP / RUN_ONCE"]
         PIPE["pipeline.py<br/>process_document()"]
         API["paperless_api.py<br/>(requests.Session, Token auth)"]
-        RUN["ocr/runner.py<br/>build_ocrmypdf_args()"]
+        ENGINE["ocr/chandra_engine.py<br/>Unified Chandra OCR engine<br/>(ChandraOcrEngine)"]
+        PDF["ocr/runner.py<br/>ocrmypdf sandwich pipeline<br/>(for PDF/A assembly only)"]
         PROV["ocr/base.py: OcrProviderPlugin ABC"]
         CHAN["ocr/chandra.py: ChandraProvider"]
         REP["archive/replacer.py<br/>backup + os.replace + sha256"]
@@ -92,64 +108,136 @@ flowchart TB
         MAIN --> CFG
         MAIN --> PIPE
         PIPE --> API
-        PIPE --> RUN
-        RUN --> PROV
-        PROV -.implements.-> CHAN
+        PIPE --> ENGINE
+        ENGINE --> CHAN
+        CHAN -- "chat/completions" --> LLM["Chandra server ai:8110/v1"]
         PIPE --> REP
         REP --> DBM
         PIPE --> CFG
+        PIPE --> PDF
+        PDF -- "hOCR + original<br/>images" --> REP
     end
     API -- "HTTP :8000" --> PLX["paperless-ngx"]
-    CHAN -- "chat/completions" --> LLM["Chandra server ai:8110/v1"]
     REP -- "bind mount rw" --> ARC["archives/*.pdf"]
     DBM -- "5432" --> PG[("postgres")]
 ```
 
-### Plugin architecture
+### Unified OCR engine architecture
 
-An `OcrProviderPlugin` encapsulates everything LLM-specific:
+The `ChandraOcrEngine` class in `ocr/chandra_engine.py` provides a unified OCR pipeline:
 
-- `name` — provider id (`REARCHIVE_PROVIDER=chandra`).
-- `ocrmypdf_plugin_module` — module passed as `plugins=[...]` to `ocrmypdf.ocr()`
-  (paperless-chandra ships `paperless_chandra.ocrmypdf_plugin`, which registers `--chandra-*`
-  kwargs and returns the Chandra `OcrEngine`).
-- `ocrmypdf_kwargs()` — provider settings forwarded as ocrmypdf kwargs
-  (server URL, model name, API key, max tokens, content format).
-- `validate()` — fail-fast configuration probe (paperless-chandra already probes the server in
-  its `check_options` hookimpl).
+```python
+class ChandraOcrEngine:
+    def ocr_document(self, pdf_path, *, produce_pdf=False, output_pdf_path=None):
+        # 1. Render PDF pages to images (PyMuPDF)
+        # 2. For each page: call Chandra → markdown + hOCR
+        # 3. Combine all page markdown
+        # 4. IF produce_pdf: assemble PDF/A via ocrmypdf sandwich
+        # RETURN: OcrResult(markdown, pdf_path, page_count, errors)
+```
 
-Because ocrmypdf renders the invisible text layer from the engine's hOCR and writes the
-sidecar text (markdown when `content_format=markdown`), a future provider only needs its own
-ocrmypdf `OcrEngine` + plugin module. Reusable paperless-chandra pieces for new providers:
-`engine/hocr.py` (typed page model + hOCR serialisation), `engine/pdf.py` (text-only PDF
-rendering), `engine/geometry.py`, `engine/blocks.py`.
+**Branching logic:**
+- `re-ocr-content`: `produce_pdf=False` → markdown only, no PDF/A assembly
+- `re-ocr-all`: `produce_pdf=True` → markdown + hOCR → ocrmypdf sandwich → PDF/A
+
+**Page-level error handling:**
+- OCR errors on individual pages are collected in `result.errors`
+- If some pages succeed and some fail, add `re-ocr-page-errors` tag alongside outcome tag
+- This allows operators to identify documents with partial OCR for future fine-tuning
 
 ### Per-document flow
 
 ```mermaid
 flowchart TD
     START([document with trigger tag]) --> DL["download original via API<br/>(temp dir, never modified)"]
-    DL --> ARCH{"re-ocr-all AND archived_file_name present AND original is PDF?"}
-    ARCH -- "no" --> CO["content-only mode"]
-    ARCH -- "yes" --> CK{"on-disk archive sha256 == DB archive_checksum?"}
-    CK -- "no" --> FAIL["failure tag<br/>(archive changed underneath us)"]
-    CK -- "yes" --> OCR["ocrmypdf: output_type=pdfa, plugins=provider<br/>auto → redo_ocr (text layer) / skip_text (none)<br/>force option only via REARCHIVE_OCR_MODE=force"]
-    CO --> OCR
+    DL --> OCR["Unified Chandra OCR engine<br/>render pages → LLM OCR per page<br/>→ markdown + hOCR structures"]
     OCR -- "error (transient)" --> KEEP["keep trigger tag<br/>(retry next cycle)"]
     OCR -- "error (permanent)" --> FAIL
+    OCR -- "ok" --> PAGECHECK{"any pages failed?"}
+    PAGECHECK -- "yes" --> TAGERR["add re-ocr-page-errors tag"]
+    PAGECHECK -- "no" --> NODDR
     OCR -- "ok" --> DRY{"DRY_RUN?"}
     DRY -- "yes" --> REPORT["log what would be written<br/>+ keep trigger tag"]
     DRY -- "no" --> PATCH["PATCH content (markdown)"]
     PATCH --> MODE{"re-ocr-all?"}
-    MODE -- "yes" --> REPL["backup old archive to .bak<br/>atomic os.replace(new, archive_path)<br/>sha256 then UPDATE documents_document"]
-    MODE -- "no" --> TAGS
-    REPL --> TAGS["remove trigger tag<br/>add ...-success"]
-    FAIL --> TAGSF["remove trigger tag<br/>add ...-failure"]
+    MODE -- "no" --> TAGS["remove trigger tag<br/>add ...-success"]
+    MODE -- "yes" --> ASSEMBLE["ocrmypdf sandwich pipeline:<br/>hOCR + original images → PDF/A"]
+    ASSEMBLE --> REPL["backup old archive to .bak<br/>atomic os.replace(new, archive_path)<br/>sha256 then UPDATE documents_document"]
+    REPL --> TAGS
+    TAGERR --> TAGS
     TAGS --> DONE([done])
+    FAIL --> TAGSF["remove trigger tag<br/>add ...-failure"]
     TAGSF --> DONE
     REPORT --> DONE
     KEEP --> DONE
+    NODDR --> TAGS
 ```
+
+### Unified OCR engine architecture
+
+The `ChandraOcrEngine` class in `ocr/chandra_engine.py` provides a unified OCR pipeline:
+
+```python
+class ChandraOcrEngine:
+    def ocr_document(self, pdf_path, *, produce_pdf=False, output_pdf_path=None, dpi=300):
+        # 1. Render PDF pages to images (PyMuPDF)
+        # 2. For each page: call Chandra → markdown + hOCR
+        # 3. Combine all page markdown
+        # 4. IF produce_pdf: assemble PDF/A via ocrmypdf sandwich
+        # RETURN: OcrResult(markdown, pdf_path, page_count, error_pages, errors)
+```
+
+**Branching logic:**
+- `re-ocr-content`: `produce_pdf=False` → markdown only, no PDF/A assembly
+- `re-ocr-all`: `produce_pdf=True` → markdown + hOCR → ocrmypdf sandwich → PDF/A
+
+**Page-level error handling:**
+- OCR errors on individual pages are collected in `result.error_pages` and `result.errors`
+- If some pages succeed and some fail, add `re-ocr-page-errors` tag alongside outcome tag
+- This allows operators to identify documents with partial OCR for future fine-tuning
+- Error information includes page numbers and error messages for debugging
+
+### Per-document flow (unified OCR engine)
+
+```mermaid
+flowchart TD
+    START([document with trigger tag]) --> DL["download original via API<br/>(temp dir, never modified)"]
+    DL --> CHK{\" archive mode? \"}
+    CHK -- \"re-ocr-all\" --> CHKARCH{"has archive file AND is PDF?"}
+    CHKARCH -- \"no\" --> CHKIMG{"is image?"}
+    CHKIMG -- \"yes\" --> COIMG[\"content-only for image<br/>(no archive to replace)\"]
+    CHKIMG -- \"no\" --> COBD[\"content-only for born-digital<br/>(archive replaced in place)\"]
+    CHKARCH -- \"yes\" --> CK{\"on-disk archive sha256 == DB archive_checksum?\"}
+    CK -- \"no\" --> FAIL[\"failure tag<br/>(archive changed underneath us)\"]
+    CK -- \"yes\" --> OCR
+    CHK -- \"re-ocr-content\" --> OCR
+    OCR[\"Unified Chandra OCR engine<br/>render pages → LLM OCR per page<br/>→ markdown + hOCR structures\"]
+    OCR -- \"error (transient)\" --> KEEP[\"keep trigger tag<br/>(retry next cycle)\"]
+    OCR -- \"error (permanent)\" --> FAIL
+    OCR -- \"ok\" --> DRY{\"DRY_RUN?\"}
+    DRY -- \"yes\" --> REPORT[\"log what would be written<br/>+ keep trigger tag\"]
+    DRY -- \"no\" --> PATCH[\"PATCH content (markdown)\"]
+    PATCH --> MODE{\"re-ocr-all?\"}
+    MODE -- \"no\" --> PAGECHK{\"any pages failed?\"}
+    PAGECHK -- \"yes\" --> TAGERR[\"add re-ocr-page-errors tag<br/>+ success/failure tag\"]
+    PAGECHK -- \"no\" --> TAGS[\"remove trigger tag<br/>add ...-success\"]
+    MODE -- \"yes\" --> ASSEMBLE[\"ocrmypdf sandwich pipeline:<br/>hOCR + original images → PDF/A\"]
+    ASSEMBLE --> REPL[\"backup old archive to .bak<br/>atomic os.replace(new, archive_path)<br/>sha256 then UPDATE documents_document\"]
+    REPL --> PAGECHK
+    TAGS --> DONE([done])
+    TAGERR --> DONE
+    FAIL --> TAGSF[\"remove trigger tag<br/>add ...-failure\"]
+    TAGSF --> DONE
+    REPORT --> DONE
+    KEEP --> DONE
+    COIMG --> OCR
+    COBD --> OCR
+```
+
+Key changes from previous architecture:
+- **Unified OCR engine** (`ocr/chandra_engine.py`): single Chandra pass produces markdown + hOCR
+- **Branching after OCR**: PDF/A assembly only for `re-ocr-all` via ocrmypdf's sandwich pipeline
+- **Page-level error tracking**: partial failures add `re-ocr-page-errors` tag for future analysis
 
 ## 4. Repository layout
 
@@ -199,6 +287,40 @@ paperless-rearchive/
 - ✅ `ocr/runner.py` (mode selection `redo_ocr`/`skip_text`/`force_ocr`, pdfa, deskew/clean with
   the redo-incompatibility guard, image DPI/alpha handling, `ocr_skipped_all` guard, fallback retry)
 - ✅ `pipeline.py` orchestration incl. dry-run + tag lifecycle
+### Phase 3b — Unified OCR engine ✅
+
+> **Status: ⬜ todo** — Refactor to unified Chandra OCR engine that produces markdown + hOCR
+> in a single pass, with PDF/A assembly only for `re-ocr-all`.
+
+### Phase 3b — Unified OCR engine 🔧
+
+> **Status: ✅ done** — Implemented unified Chandra OCR engine (ChandraOcrEngine) in ocr/chandra_engine.py
+> in a single pass, with PDF/A assembly only for `re-ocr-all` via ocrmypdf's sandwich pipeline.
+
+- ✅ Created `ocr/chandra_engine.py`: unified engine that renders PDF pages (PyMuPDF), calls Chandra
+  once per page, produces both markdown and hOCR structures
+- ✅ Branch after OCR: `re-ocr-content` uses markdown only; `re-ocr-all` uses hOCR + ocrmypdf
+  sandwich pipeline for PDF/A assembly (via `ocr/runner.py`)
+- ✅ Add page-level error tracking: collect per-page failures (Chandra errors, empty results, etc.),
+  add `re-ocr-page-errors` tag when some pages succeed and some fail
+- ✅ Updated `pipeline.py` to use unified engine and branch based on archive_mode
+- ✅ Added `PyMuPDF` (fitz) to dependencies for PDF page rendering
+- ✅ Updated `pyproject.toml` with PyMuPDF dependency
+- ⬜ Verify markdown output matches between old and new paths for same document (TODO: test)
+- ✅ Updated README.md to reflect unified architecture
+
+### Phase 4 — Archive replacement ✅
+- ⬜ Create `ocr/chandra_engine.py`: unified engine that renders PDF pages, calls Chandra once per
+  page, produces both markdown and hOCR structures
+- ⬜ Branch after OCR: `re-ocr-content` uses markdown only; `re-ocr-all` uses hOCR + ocrmypdf
+  sandwich pipeline for PDF/A assembly
+- ⬜ Add page-level error tracking: collect per-page failures, add `re-ocr-page-errors` tag when
+  some pages succeed and some fail
+- ⬜ Update `pipeline.py` to use unified engine and branch based on archive_mode
+- ⬜ Add `PyMuPDF` (fitz) to dependencies for PDF page rendering
+- ✅ Updated `pyproject.toml` with PyMuPDF dependency
+- ⬜ Verify markdown output matches between old and new paths for same document (TODO: test)
+- ✅ Updated README.md to reflect unified architecture
 
 ### Phase 4 — Archive replacement ✅
 - ✅ `archive/db.py` (psycopg; fetch + update archive_checksum)

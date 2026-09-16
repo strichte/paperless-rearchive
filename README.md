@@ -98,6 +98,28 @@ archive can balloon to several MiB. `REARCHIVE_OCR_MODE` controls how `ocrmypdf`
 `ocrmypdf` rejects `redo_ocr` together with `deskew`; the runner detects this, logs a warning and
 drops deskew rather than silently switching to the size-destroying `force_ocr` path.
 
+### Unified OCR architecture
+
+The sidecar uses a **unified Chandra OCR engine** (`ocr/chandra_engine.py`) that produces both
+markdown content and hOCR structures in a single pass:
+
+1. **Render PDF pages** to images using PyMuPDF
+2. **Call Chandra** for OCR on each page (produces both markdown and hOCR)
+3. **Combine** all page markdown into final content
+
+The PDF/A assembly is **optional** and only performed for `re-ocr-all`:
+
+- **`re-ocr-content`**: Only markdown is used (no PDF/A generated) - saves CPU cycles
+- **`re-ocr-all`**: Markdown + hOCR → ocrmypdf sandwich pipeline → searchable PDF/A
+
+This avoids wasting CPU cycles on PDF/A generation for content-only mode, where only the markdown
+is needed for the content field. The branching decision is made after OCR completion based on the
+trigger tag.
+
+**Page-level error handling:** If some pages fail OCR while others succeed, a `re-ocr-page-errors`
+tag is added alongside the outcome tag. This allows operators to identify documents with partial OCR
+for future fine-tuning.
+
 The OCR source is always the **immutable original**, fetched with the API's
 `?original=true` parameter — `/api/documents/{id}/download/` without it returns the *archive*.
 
