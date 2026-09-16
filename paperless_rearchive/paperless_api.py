@@ -101,6 +101,91 @@ class PaperlessAPI:
         )
         return int(response.json()["id"])
 
+    # -------------------------------------------------------- custom fields
+
+    #: Provenance fields the sidecar manages: (field name, data_type).
+    #: ``string`` caps at 128 chars; ``date`` needs ISO YYYY-MM-DD; ``float``
+    #: is used for the archive size ratio so it stays sortable/filterable.
+    PROVENANCE_FIELDS: tuple[tuple[str, str], ...] = (
+        ("OCR engine", "string"),
+        ("OCR date", "date"),
+        ("OCR pages", "string"),
+        ("OCR archive ratio", "float"),
+    )
+
+    def custom_field_id(self, name: str) -> int | None:
+        """Resolve a custom-field id by exact name.
+
+        Same caution as :meth:`tag_id`: unknown filter params are silently
+        ignored server-side, so the returned ``name`` is always verified.
+        """
+        response = self._check(
+            self.session.get(
+                self._url("/api/custom_fields/"),
+                params={"name__iexact": name},
+                timeout=self.timeout,
+            ),
+            f"lookup custom field {name!r}",
+        )
+        for result in response.json().get("results", []):
+            if result.get("name") == name:
+                return int(result["id"])
+        return None
+
+    def ensure_custom_field(self, name: str, data_type: str) -> int:
+        """Return the custom-field id, creating the definition if missing.
+
+        ``data_type`` is immutable server-side, so a name clash with a
+        different type is a hard error rather than a silent reuse.
+        """
+        existing = self.custom_field_id(name)
+        if existing is not None:
+            return existing
+        try:
+            response = self._check(
+                self.session.post(
+                    self._url("/api/custom_fields/"),
+                    json={"name": name, "data_type": data_type},
+                    timeout=self.timeout,
+                ),
+                f"create custom field {name!r}",
+            )
+        except PaperlessError as e:
+            # A 400 here is usually a duplicate name with a different type
+            # (names are unique); surface that plainly.
+            raise PaperlessError(
+                f"could not create custom field {name!r} ({data_type}): {e}"
+            ) from e
+        return int(response.json()["id"])
+
+    def ensure_provenance_fields(self) -> dict[str, int]:
+        """Ensure all sidecar-managed custom-field definitions exist."""
+        return {
+            name: self.ensure_custom_field(name, data_type)
+            for name, data_type in self.PROVENANCE_FIELDS
+        }
+
+    def set_custom_fields(
+        self, doc_id: int, values: list[dict[str, Any]]
+    ) -> None:
+        """Upsert custom-field values on a document (one PATCH).
+
+        ``values`` is a list of ``{"field": <id>, "value": ...}``; the
+        server's ``update_or_create(document, field)`` semantics mean only
+        the listed fields are touched - other fields' instances are left
+        alone. ``value: None`` clears that field's instance.
+        """
+        if not values:
+            return
+        self._check(
+            self.session.patch(
+                self._url(f"/api/documents/{doc_id}/"),
+                json={"custom_fields": values},
+                timeout=self.timeout,
+            ),
+            f"update custom fields of document {doc_id}",
+        )
+
     # -------------------------------------------------------------- documents
 
     def doc_ids_with_tag(self, tag_id: int, limit: int) -> list[int]:

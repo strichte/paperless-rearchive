@@ -48,6 +48,27 @@ After processing, the trigger tag is removed and replaced with:
 A trigger tag is only replaced when the pipeline reached a decision; transient upstream errors
 (OCR server unreachable, network hiccup) leave the trigger tag in place for the next poll cycle.
 
+## OCR provenance (custom fields)
+
+On every successful run the sidecar records machine-readable provenance in
+[paperless-ngx custom fields](https://docs.paperless-ngx.com/usage/#custom-fields),
+visible on the document and filterable in saved views:
+
+| Field | Type | Example | Written when |
+| --- | --- | --- | --- |
+| `OCR engine` | string | `chandra-ocr-2-q8` | every success |
+| `OCR date` | date | `2026-09-16` | every success |
+| `OCR pages` | string | `4/4 ok` or `3/4 ok (errors: 3)` | every success |
+| `OCR archive ratio` | float | `1.001` | `re-ocr-all` only |
+
+Field definitions are auto-created once via `POST /api/custom_fields/` (same
+pattern as trigger tags — no manual setup). Values are upserted with a single
+`PATCH /api/documents/{id}/ {"custom_fields": [{"field": id, "value": …}]}`,
+so re-running just overwrites ("latest run wins" — no history; the outcome
+tags carry the verdict). Writes are skipped in dry-run mode and when
+`REARCHIVE_WRITE_PROVENANCE=false`, and a provenance failure never fails the
+document.
+
 **No manual tag creation needed.** The sidecar automatically creates both trigger tags
 (`re-ocr-content` and `re-ocr-all`) via the paperless-ngx API on every poll cycle if they
 don't already exist. You can tag documents immediately after starting the container — there's

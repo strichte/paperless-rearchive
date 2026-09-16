@@ -15,7 +15,9 @@ from __future__ import annotations
 import logging
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -31,7 +33,7 @@ from paperless_rearchive.archive.replacer import (
     verify_current_checksum,
 )
 from paperless_rearchive.ocr.base import OcrProviderPlugin
-from paperless_rearchive.ocr.chandra_engine import ChandraOcrEngine
+from paperless_rearchive.ocr.chandra_engine import ChandraOcrEngine, OcrResult
 
 
 def _format_size(size_bytes: int) -> str:
@@ -150,6 +152,7 @@ def process_document(
             settings.concurrency,
             settings.max_pages,
         )
+        ocr_started = time.monotonic()
         engine = ChandraOcrEngine(
             server_url=provider.server_url,
             model_name=provider.model_name,
@@ -245,6 +248,7 @@ def process_document(
             except Exception:
                 log.exception("Could not add re-ocr-page-errors tag for document %d", ctx.doc_id)
 
+        size_ratio: float | None = None
         if result.pdf_path is not None and archive_path is not None:
             log.info(
                 "Document %d: replacing archive %s with new PDF/A %s",
@@ -277,7 +281,7 @@ def process_document(
                 size_ratio = new_size / old_size
                 size_change_pct = (size_diff / old_size) * 100
             else:
-                size_ratio = float("inf")
+                size_ratio = None
                 size_change_pct = 0.0
 
             log.debug(
@@ -285,7 +289,7 @@ def process_document(
                 ctx.doc_id,
                 _format_size(old_size),
                 _format_size(new_size),
-                size_ratio,
+                size_ratio if size_ratio is not None else float("inf"),
                 size_change_pct,
             )
 
@@ -298,7 +302,7 @@ def process_document(
                         ctx.doc_id,
                         direction,
                         abs(size_change_pct),
-                        size_ratio,
+                        size_ratio if size_ratio is not None else float("inf"),
                         _format_size(old_size),
                         _format_size(new_size),
                     )
@@ -316,6 +320,17 @@ def process_document(
             )
             log.debug("Document %d: archive replacement complete, new checksum=%s",
                       ctx.doc_id, checksum)
+
+        ocr_seconds = time.monotonic() - ocr_started
+        _write_provenance(
+            settings,
+            api,
+            ctx,
+            provider,
+            result,
+            size_ratio=size_ratio,
+            ocr_seconds=ocr_seconds,
+        )
 
         # Finish: swap trigger tag for outcome tag
         outcome_tag_name = f"{ctx.trigger_tag_name}{'-success' if result.page_count > 0 else '-failure'}"
@@ -378,6 +393,69 @@ def _repair_checksum_drift(
         expected,
         disk_checksum,
     )
+
+
+def _write_provenance(
+    settings: Settings,
+    api: PaperlessAPI,
+    ctx: DocumentContext,
+    provider: OcrProviderPlugin,
+    result: OcrResult,
+    *,
+    size_ratio: float | None,
+    ocr_seconds: float,
+) -> None:
+    """Record OCR run provenance in custom fields (latest state wins).
+
+    Writes ``OCR engine`` / ``OCR date`` / ``OCR pages`` on every success,
+    plus ``OCR archive ratio`` for ``re-ocr-all``. Definitions are ensured
+    once per document (idempotent); values ride a single PATCH. Skipped in
+    dry-run mode and when ``REARCHIVE_WRITE_PROVENANCE=false``. Failures
+    here must never fail the document - the tags already carry the verdict.
+    """
+    if settings.dry_run or not settings.write_provenance:
+        return
+    ok_pages = result.page_count - len(result.error_pages)
+    pages_value = f"{ok_pages}/{result.page_count} ok"
+    if len(result.error_pages) > 1 or (
+        len(result.error_pages) == 1 and result.error_pages != [0]
+    ):
+        shown = ",".join(str(n) for n in result.error_pages[:8])
+        if len(result.error_pages) > 8:
+            shown += "\u2026"
+        pages_value += f" (errors: {shown})"
+    if result.page_count and ok_pages == 0:
+        pages_value = "0 ok - failed scan?"
+    values_spec: list[tuple[str, str, object]] = [
+        ("OCR engine", "string", provider.model_name[:128]),
+        ("OCR date", "date", date.today().isoformat()),
+        ("OCR pages", "string", pages_value[:128]),
+    ]
+    if ctx.archive_mode and size_ratio is not None:
+        values_spec.append(("OCR archive ratio", "float", round(size_ratio, 3)))
+    try:
+        field_ids = api.ensure_provenance_fields()
+        values = [
+            {"field": field_ids[name], "value": value} for name, _, value in values_spec
+        ]
+        api.set_custom_fields(ctx.doc_id, values)
+        log.info(
+            "Document %d: provenance written (%s, %s, %s) in %.1fs of OCR",
+            ctx.doc_id,
+            provider.model_name,
+            pages_value,
+            (
+                f"ratio {size_ratio:.3f}"
+                if size_ratio is not None
+                else "content-only"
+            ),
+            ocr_seconds,
+        )
+    except Exception:  # noqa: BLE001 - provenance is informational only
+        log.exception(
+            "Document %d: could not write provenance custom fields; tags already updated.",
+            ctx.doc_id,
+        )
 
 
 def _finish(

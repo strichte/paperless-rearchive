@@ -57,6 +57,81 @@ def test_ensure_tag_reuses_existing() -> None:
     api.session.post.assert_not_called()  # type: ignore[union-attr]
 
 
+def test_custom_field_id_uses_supported_filter_param() -> None:
+    api = _api_with({"results": [{"id": 7, "name": "OCR engine"}]})
+    assert api.custom_field_id("OCR engine") == 7
+    params = api.session.get.call_args.kwargs["params"]  # type: ignore[union-attr]
+    assert params == {"name__iexact": "OCR engine"}
+
+
+def test_custom_field_id_ignores_unrelated_results() -> None:
+    api = _api_with({"results": [{"id": 3, "name": "Invoice #"}, {"id": 4, "name": "Total"}]})
+    assert api.custom_field_id("OCR engine") is None
+
+
+def test_ensure_custom_field_creates_when_absent() -> None:
+    api = _api_with({"results": []})
+    newly_created = MagicMock()
+    newly_created.ok = True
+    newly_created.status_code = 201
+    newly_created.text = ""
+    newly_created.json.return_value = {"id": 9, "name": "OCR engine", "data_type": "string"}
+    api.session.post = MagicMock(return_value=newly_created)  # type: ignore[method-assign]
+    assert api.ensure_custom_field("OCR engine", "string") == 9
+    assert api.session.post.call_args.kwargs["json"] == {
+        "name": "OCR engine",
+        "data_type": "string",
+    }
+
+
+def test_ensure_custom_field_reuses_existing() -> None:
+    api = _api_with({"results": [{"id": 7, "name": "OCR engine"}]})
+    assert api.ensure_custom_field("OCR engine", "string") == 7
+    api.session.post.assert_not_called()  # type: ignore[union-attr]
+
+
+def test_ensure_provenance_fields_covers_all_definitions() -> None:
+    api = _api_with({"results": []})
+    created: list[dict] = []
+
+    def _post(url: str, json: dict, timeout: float) -> MagicMock:
+        resp = MagicMock(ok=True, status_code=201, text="")
+        resp.json.return_value = {"id": 100 + len(created), **json}
+        created.append(json)
+        return resp
+
+    api.session.post = MagicMock(side_effect=_post)  # type: ignore[method-assign]
+    ids = api.ensure_provenance_fields()
+    assert set(ids) == {"OCR engine", "OCR date", "OCR pages", "OCR archive ratio"}
+    by_name = {c["name"]: c["data_type"] for c in created}
+    assert by_name == {
+        "OCR engine": "string",
+        "OCR date": "date",
+        "OCR pages": "string",
+        "OCR archive ratio": "float",
+    }
+
+
+def test_set_custom_fields_patch_shape() -> None:
+    api = _api_with({"results": []})
+    values = [
+        {"field": 7, "value": "chandra-ocr-2-q8"},
+        {"field": 8, "value": "2026-09-16"},
+        {"field": 9, "value": "4/4 ok"},
+        {"field": 10, "value": 1.001},
+    ]
+    api.set_custom_fields(5822, values)
+    call = api.session.patch.call_args  # type: ignore[union-attr]
+    assert call.args[0].endswith("/api/documents/5822/")
+    assert call.kwargs["json"] == {"custom_fields": values}
+
+
+def test_set_custom_fields_empty_is_noop() -> None:
+    api = _api_with({"results": []})
+    api.set_custom_fields(5822, [])
+    api.session.patch.assert_not_called()  # type: ignore[union-attr]
+
+
 def test_doc_ids_with_tag_paginates() -> None:
     api = PaperlessAPI("http://paperless:8000", "t")
     page1 = MagicMock(ok=True, status_code=200, text="")

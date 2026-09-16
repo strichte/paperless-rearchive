@@ -390,6 +390,7 @@ token, the Chandra key, and the database user/password.
 | `REARCHIVE_ARCHIVE_FOR_IMAGES` | `false` | experimental: create archive for non-PDF originals |
 | `REARCHIVE_POLL_INTERVAL` | `300` | seconds between polls; each cycle logs docs/min + backlog ETA and recommends batch/poll values so the sidecar doesn't idle while docs wait |
 | `REARCHIVE_BATCH_LIMIT` | `5` | max documents per cycle |
+| `REARCHIVE_WRITE_PROVENANCE` | `true` | write OCR run provenance to custom fields (`OCR engine`, `OCR date`, `OCR pages`, `OCR archive ratio` for re-ocr-all); definitions auto-created once via API, skipped in dry-run |
 | `REARCHIVE_OCR_CONCURRENCY` | `1` | pages OCR'd concurrently per document (ThreadPoolExecutor around the blocking Chandra call). Default 1 = sequential. WARNING: local vision LLM = GPU bottleneck; >1 only piles competing requests onto the same GPU (higher per-page latency, timeout/OOM risk). Raise gradually, watch GPU. |
 | `REARCHIVE_MAX_PAGES` | `0` | max pages OCR'd per document; 0 = all pages, otherwise only the first N pages are processed (page_count still reports the total; skipped pages recorded in error_pages) |
 | `REARCHIVE_DRY_RUN` | `false` | OCR + report only, no writes |

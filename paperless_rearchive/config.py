@@ -70,6 +70,8 @@ class Settings:
     ocr_user_args: dict[str, object]
     archive_for_images: bool
 
+    write_provenance: bool
+
     poll_interval: float
     batch_limit: int
     concurrency: int
@@ -108,6 +110,7 @@ class Settings:
             ocr_output_type=_env("REARCHIVE_OCR_OUTPUT_TYPE", "pdfa"),
             ocr_user_args=user_args,
             archive_for_images=_env_bool("REARCHIVE_ARCHIVE_FOR_IMAGES", False),
+            write_provenance=_env_bool("REARCHIVE_WRITE_PROVENANCE", True),
             poll_interval=float(_env("REARCHIVE_POLL_INTERVAL", "300")),
             batch_limit=_env_int("REARCHIVE_BATCH_LIMIT", 5),
             concurrency=_env_int("REARCHIVE_OCR_CONCURRENCY", 1),
