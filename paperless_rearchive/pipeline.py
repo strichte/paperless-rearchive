@@ -142,7 +142,7 @@ def process_document(
                             "DRY-RUN document %d: archive check failed: %s", ctx.doc_id, e
                         )
                         return
-                    _finish(api, ctx, success=False, note=str(e))
+                    _finish(api, ctx, success=False, note=str(e), settings=settings)
                     return
 
         # Use unified Chandra OCR engine
@@ -216,7 +216,7 @@ def process_document(
             log.error("Document %d: %s. Nothing written.", ctx.doc_id, message)
             if settings.dry_run:
                 return
-            _finish(api, ctx, success=False, note=message)
+            _finish(api, ctx, success=False, note=message, settings=settings)
             return
 
         if settings.dry_run:
@@ -405,13 +405,16 @@ def _write_provenance(
     size_ratio: float | None,
     ocr_seconds: float,
 ) -> None:
-    """Record OCR run provenance in custom fields (latest state wins).
+    """Record OCR run provenance: custom fields (latest state wins) + audit note.
 
     Writes ``OCR engine`` / ``OCR date`` / ``OCR pages`` on every success,
     plus ``OCR archive ratio`` for ``re-ocr-all``. Definitions are ensured
-    once per document (idempotent); values ride a single PATCH. Skipped in
-    dry-run mode and when ``REARCHIVE_WRITE_PROVENANCE=false``. Failures
-    here must never fail the document - the tags already carry the verdict.
+    once per document (idempotent); values ride a single PATCH. Custom
+    fields only keep the latest run, so a human-readable audit note is also
+    appended to the document's paperless note history (append-only) for the
+    full per-run trail. Skipped in dry-run mode and when
+    ``REARCHIVE_WRITE_PROVENANCE=false``. Failures here must never fail the
+    document - the tags already carry the verdict.
     """
     if settings.dry_run or not settings.write_provenance:
         return
@@ -426,6 +429,14 @@ def _write_provenance(
         pages_value += f" (errors: {shown})"
     if result.page_count and ok_pages == 0:
         pages_value = "0 ok - failed scan?"
+    note_lines = [
+        f"Re-OCR {'complete' if ok_pages > 0 else 'finished without usable pages'} ({ctx.trigger_tag_name})",
+        f"Engine: {provider.model_name}",
+        f"Pages: {pages_value}",
+    ]
+    if ctx.archive_mode and size_ratio is not None:
+        note_lines.append(f"Archive size ratio: {size_ratio:.3f}")
+    note_lines.append(f"OCR duration: {ocr_seconds:.1f}s")
     values_spec: list[tuple[str, str, object]] = [
         ("OCR engine", "string", provider.model_name[:128]),
         ("OCR date", "date", date.today().isoformat()),
@@ -439,6 +450,7 @@ def _write_provenance(
             {"field": field_ids[name], "value": value} for name, _, value in values_spec
         ]
         api.set_custom_fields(ctx.doc_id, values)
+        _write_audit_note(api, ctx, "\n".join(note_lines))
         log.info(
             "Document %d: provenance written (%s, %s, %s) in %.1fs of OCR",
             ctx.doc_id,
@@ -458,14 +470,37 @@ def _write_provenance(
         )
 
 
+def _write_audit_note(api: PaperlessAPI, ctx: DocumentContext, note: str) -> None:
+    """Best-effort append to the document's paperless note history.
+
+    The caller gates on ``REARCHIVE_WRITE_PROVENANCE``; a failure here must
+    never fail the document - the tags already carry the verdict.
+    """
+    try:
+        api.add_note(ctx.doc_id, note)
+        log.info(
+            "Document %d: audit note appended (%d line(s))",
+            ctx.doc_id,
+            note.count("\n") + 1,
+        )
+    except Exception:  # noqa: BLE001 - informational only
+        log.exception("Document %d: could not append audit note.", ctx.doc_id)
+
+
 def _finish(
     api: PaperlessAPI,
     ctx: DocumentContext,
     *,
     success: bool,
     note: str = "",
+    settings: Settings | None = None,
+    extra_tags: list[int] | None = None,
 ) -> None:
-    """Swap the trigger tag for the outcome tag; keep trigger on API errors."""
+    """Swap the trigger tag for the outcome tag; keep trigger on API errors.
+
+    On failure an audit note is appended (same gate as custom-field
+    provenance) so the run outcome survives in paperless history.
+    """
     outcome_tag_name = f"{ctx.trigger_tag_name}{'-success' if success else '-failure'}"
     log.info(
         "Document %d: swapping trigger tag %r for outcome tag %r (success=%s)",
@@ -496,15 +531,23 @@ def _finish(
             outcome_tag_id,
             outcome_tag_name,
         )
-        if extra_tags:
+        extra = extra_tags or []
+        if extra:
             log.info(
                 "Document %d: also added %d extra tag(s): %s",
                 ctx.doc_id,
-                len(extra_tags),
-                extra_tags,
+                len(extra),
+                extra,
             )
     except Exception:  # noqa: BLE001 - tag API hiccup must not lose the trigger
         log.exception("Could not update tags on document %d; keeping trigger.", ctx.doc_id)
         return
     if not success and note:
         log.error("Document %d failed: %s", ctx.doc_id, note)
+        if settings is not None and not settings.dry_run and settings.write_provenance:
+            _write_audit_note(
+                api,
+                ctx,
+                f"Re-OCR failed ({ctx.trigger_tag_name}) for document "
+                f"{ctx.doc_id}\n{note}",
+            )

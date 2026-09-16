@@ -41,6 +41,8 @@
       REARCHIVE_OCR_CONCURRENCY: "1"
       # 0 = OCR all pages, otherwise only the first N pages per document.
       REARCHIVE_MAX_PAGES: "0"
+      # Provenance: custom fields (latest state) + append-only audit note per run.
+      REARCHIVE_WRITE_PROVENANCE: "true"
       REARCHIVE_DRY_RUN: "false"
     volumes:
       # Read-write: archive files are replaced here (originals are NEVER touched).

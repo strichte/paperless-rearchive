@@ -64,8 +64,14 @@ visible on the document and filterable in saved views:
 Field definitions are auto-created once via `POST /api/custom_fields/` (same
 pattern as trigger tags — no manual setup). Values are upserted with a single
 `PATCH /api/documents/{id}/ {"custom_fields": [{"field": id, "value": …}]}`,
-so re-running just overwrites ("latest run wins" — no history; the outcome
-tags carry the verdict). Writes are skipped in dry-run mode and when
+so re-running just overwrites ("latest state wins").
+
+**Audit note (run history).** Because custom fields only keep the latest
+state, every run also appends an audit note via
+`POST /api/documents/{id}/notes/` — the append-only history — containing the
+engine, page outcome, archive size ratio and OCR duration, plus a
+`Re-OCR failed (<trigger>) …` note when a run ends in failure. Notes and
+custom fields share the same gate: both are skipped in dry-run mode and when
 `REARCHIVE_WRITE_PROVENANCE=false`, and a provenance failure never fails the
 document.
 

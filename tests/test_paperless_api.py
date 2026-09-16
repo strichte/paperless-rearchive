@@ -10,7 +10,9 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from paperless_rearchive.paperless_api import PaperlessAPI
+import pytest
+
+from paperless_rearchive.paperless_api import PaperlessAPI, PaperlessError
 
 
 def _api_with(payload: dict, status: int = 200) -> PaperlessAPI:
@@ -130,6 +132,36 @@ def test_set_custom_fields_empty_is_noop() -> None:
     api = _api_with({"results": []})
     api.set_custom_fields(5822, [])
     api.session.patch.assert_not_called()  # type: ignore[union-attr]
+
+
+def test_add_note_posts_to_notes_endpoint() -> None:
+    api = _api_with([])
+    text = "Re-OCR complete (re-ocr-all)\nEngine: chandra-ocr-2-q8\nPages: 8/8 ok"
+    api.add_note(4221, text)
+    call = api.session.post.call_args  # type: ignore[union-attr]
+    assert call.args[0].endswith("/api/documents/4221/notes/")
+    assert call.kwargs["json"] == {"note": text}
+
+
+def test_add_note_accepts_notes_list_response() -> None:
+    # paperless returns the full notes list (HTTP 200, not 201).
+    api = _api_with(
+        [{"id": 1, "note": "old", "created": "2026-09-16T00:00:00Z", "user": {"id": 1}}]
+    )
+    api.add_note(4221, "new")  # must not raise
+
+
+def test_add_note_rejects_error_payload() -> None:
+    # paperless may return 200 carrying {"error": ...} on internal failures.
+    api = _api_with({"error": "Error saving note, check logs for more detail."})
+    with pytest.raises(PaperlessError):
+        api.add_note(4221, "boom")
+
+
+def test_add_note_raises_on_http_error() -> None:
+    api = _api_with({}, status=403)
+    with pytest.raises(PaperlessError):
+        api.add_note(4221, "boom")
 
 
 def test_doc_ids_with_tag_paginates() -> None:

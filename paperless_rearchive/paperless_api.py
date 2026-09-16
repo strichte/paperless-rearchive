@@ -186,6 +186,32 @@ class PaperlessAPI:
             f"update custom fields of document {doc_id}",
         )
 
+    # ------------------------------------------------------------ audit notes
+
+    def add_note(self, doc_id: int, note: str) -> None:
+        """Append an audit note to the document's note history.
+
+        paperless-ngx exposes ``GET/POST/DELETE /api/documents/<id>/notes/``.
+        POST takes ``{"note": ...}`` and returns HTTP 200 (not 201) with the
+        full notes list; on internal errors it may also return 200 carrying an
+        ``{"error": ...}`` body, so that shape is rejected too. Requires the
+        same ``change_document`` permission as the content/tags PATCHes.
+        """
+        response = self._check(
+            self.session.post(
+                self._url(f"/api/documents/{doc_id}/notes/"),
+                json={"note": note},
+                timeout=self.timeout,
+            ),
+            f"add note to document {doc_id}",
+        )
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise PaperlessError(
+                f"add note to document {doc_id}: HTTP {response.status_code} "
+                f"returned unexpected payload {str(payload)[:200]!r}"
+            )
+
     # -------------------------------------------------------------- documents
 
     def doc_ids_with_tag(self, tag_id: int, limit: int) -> list[int]:
