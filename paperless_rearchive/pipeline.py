@@ -144,7 +144,12 @@ def process_document(
                     return
 
         # Use unified Chandra OCR engine
-        log.debug("Document %d: initializing ChandraOcrEngine", ctx.doc_id)
+        log.info(
+            "Document %d: initializing ChandraOcrEngine (concurrency=%d, max_pages=%d)",
+            ctx.doc_id,
+            settings.concurrency,
+            settings.max_pages,
+        )
         engine = ChandraOcrEngine(
             server_url=provider.server_url,
             model_name=provider.model_name,
@@ -153,6 +158,8 @@ def process_document(
             max_output_tokens=provider.max_output_tokens,
             language=settings.ocr_language,
             dpi=getattr(settings, 'ocr_dpi', 300),
+            concurrency=settings.concurrency,
+            max_pages=settings.max_pages,
         )
 
         # Branch: produce PDF/A only for re-ocr-all
@@ -219,7 +226,7 @@ def process_document(
 
         api.patch_content(ctx.doc_id, content)
         log.info(
-            "Document %d: PATCHed content field with %d chars of OCR markdown",
+            "Document %d: Updated content field with %d chars of OCR markdown",
             ctx.doc_id,
             len(content),
         )

@@ -17,6 +17,7 @@ import logging
 import re
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -32,7 +33,7 @@ try:
     from chandra.settings import settings as _chandra_settings
 except Exception:
     _chandra_settings = None
-from paperless_chandra.engine.blocks import page_from_chunks, markdown_sidecar
+from paperless_chandra.engine.blocks import markdown_sidecar, page_from_chunks
 from paperless_chandra.engine.hocr import render_hocr, sidecar_text
 
 log = logging.getLogger(__name__)
@@ -188,6 +189,8 @@ class ChandraOcrEngine:
         max_output_tokens: int = 12384,
         language: str = "eng",
         dpi: int = 300,
+        concurrency: int = 1,
+        max_pages: int = 0,
     ) -> None:
         """Initialize the Chandra OCR engine.
 
@@ -199,6 +202,18 @@ class ChandraOcrEngine:
             max_output_tokens: Maximum tokens for OCR output.
             language: Language code for OCR.
             dpi: Resolution for rendering PDF pages to images.
+            concurrency: Max pages OCR'd concurrently (ThreadPoolExecutor
+                workers around the blocking Chandra HTTP call). Default 1
+                (sequential). WARNING: this is designed for a local vision
+                LLM where the GPU is the bottleneck - raising concurrency
+                does not create more GPU, it only piles competing requests
+                onto the same inference server. Expect higher latency per
+                page, more VRAM pressure, and risk of timeouts/OOM under
+                load. Raise gradually (2, then 4) and watch GPU
+                utilisation, queue depth and error rate.
+            max_pages: Cap on pages OCR'd per document. 0 (default) means
+                all pages; otherwise only the first N pages are processed
+                (page_count still reports the document's total pages).
         """
         self.server_url = server_url
         self.model_name = model_name
@@ -207,6 +222,17 @@ class ChandraOcrEngine:
         self.max_output_tokens = max_output_tokens
         self.language = language
         self.dpi = dpi
+        self.concurrency = max(1, int(concurrency or 1))
+        self.max_pages = max(0, int(max_pages or 0))
+        if self.concurrency > 1:
+            log.warning(
+                "Chandra concurrency=%d: pages are OCR'd in parallel against "
+                "the same inference server. This is designed for a local "
+                "vision LLM where the GPU is the bottleneck - it only piles "
+                "competing requests onto the same GPU, so per-page latency "
+                "may rise and timeouts/OOM become more likely under load.",
+                self.concurrency,
+            )
         self._max_retries = _upstream_max_retries()
         _install_retry_log_interceptor()
         global _policy_logged
@@ -260,46 +286,110 @@ class ChandraOcrEngine:
                 errors=["No pages could be rendered from PDF"],
             )
 
+        total_pages = len(images)
+        if self.max_pages > 0 and total_pages > self.max_pages:
+            log.warning(
+                "Document has %d pages, capping OCR at first %d "
+                "(REARCHIVE_MAX_PAGES=%d); remaining %d page(s) skipped",
+                total_pages,
+                self.max_pages,
+                self.max_pages,
+                total_pages - self.max_pages,
+            )
+            images = images[: self.max_pages]
+
         log.info(
-            "Unified Chandra OCR engine: %d pages at %d DPI",
+            "Unified Chandra OCR engine: %d page(s) at %d DPI%s",
             len(images),
             self.dpi,
+            f" (concurrency={self.concurrency})" if self.concurrency > 1 else "",
         )
 
-        # OCR each page with Chandra
-        all_markdown_parts: list[str] = []
-        all_hocr_pages: list[tuple[int, int, Any]] = []  # (width, height, hocr_data)
+        # OCR each page with Chandra (sequential by default; workers are only
+        # the HTTP wait around the blocking generate_vllm call - the GPU on
+        # the inference server still processes them one at a time)
+        all_markdown_parts: list[str] = [""] * len(images)
+        all_hocr_pages: list[tuple[int, int, Any] | None] = [None] * len(images)
         error_pages: list[int] = []
         errors: list[str] = []
+        doc_started = time.monotonic()
 
-        for page_num, image in enumerate(images, start=1):
-            try:
-                markdown, hocr_data = self._ocr_page(image, page_num)
-                if markdown.strip():
-                    all_markdown_parts.append(markdown)
-                if hocr_data:
-                    all_hocr_pages.append((image.width, image.height, hocr_data))
-            except Exception as e:
-                log.warning("OCR failed on page %d: %s", page_num, e)
+        def _run(page_num: int, image: Any) -> tuple[str, Any]:
+            return self._ocr_page(image, page_num, len(images))
+
+        indexed = list(enumerate(images, start=1))
+        if self.concurrency > 1 and len(indexed) > 1:
+            with ThreadPoolExecutor(
+                max_workers=min(self.concurrency, len(indexed)),
+                thread_name_prefix="chandra-page",
+            ) as pool:
+                futures = {pool.submit(_run, n, img): n for n, img in indexed}
+                ordered: dict[int, tuple[str, Any]] = {}
+                for future in as_completed(futures):
+                    n = futures[future]
+                    try:
+                        ordered[n] = future.result()
+                    except Exception as e:
+                        log.warning("OCR failed on page %d: %s", n, e)
+                        ordered[n] = ("", None)
+            results = [ordered[n] for n, _ in indexed]
+        else:
+            results = []
+            for n, img in indexed:
+                try:
+                    results.append(self._ocr_page(img, n, len(indexed)))
+                except Exception as e:
+                    log.warning("OCR failed on page %d: %s", n, e)
+                    results.append(("", None))
+
+        for page_num, (markdown, hocr_data) in enumerate(results, start=1):
+            all_markdown_parts[page_num - 1] = markdown
+            if hocr_data:
+                all_hocr_pages[page_num - 1] = (
+                    images[page_num - 1].width,
+                    images[page_num - 1].height,
+                    hocr_data,
+                )
+            if not (markdown or "").strip():
                 error_pages.append(page_num)
-                errors.append(f"Page {page_num}: {e}")
+                errors.append(f"Page {page_num}: no OCR result")
+
+        elapsed = time.monotonic() - doc_started
+        ok = len(images) - len(error_pages)
+        log.info(
+            "Unified Chandra OCR done: %d/%d pages in %.1fs (%.1f pages/min)%s",
+            ok,
+            len(images),
+            elapsed,
+            (len(images) / elapsed * 60) if elapsed > 0 else 0.0,
+            f" ({len(error_pages)} error(s))" if error_pages else "",
+        )
 
         # Combine all page markdown
         markdown = "\n\n".join(all_markdown_parts)
 
         # Optionally assemble PDF/A
         pdf_path_result: Path | None = None
-        if produce_pdf and all_hocr_pages:
+        real_hocr = [h for h in all_hocr_pages if h is not None]
+        if produce_pdf and real_hocr:
             pdf_path_result = self._assemble_pdf(
                 pdf_path,
                 output_pdf_path,
-                all_hocr_pages,
+                real_hocr,
+            )
+
+        skipped = total_pages - len(images)
+        skipped_pages = list(range(len(images) + 1, total_pages + 1))
+        if skipped_pages:
+            error_pages = sorted(set(error_pages) | set(skipped_pages))
+            errors.append(
+                f"Skipped {skipped} page(s) beyond REARCHIVE_MAX_PAGES={self.max_pages}"
             )
 
         return OcrResult(
             markdown=markdown,
             pdf_path=pdf_path_result,
-            page_count=len(images),
+            page_count=total_pages,
             error_pages=error_pages,
             errors=errors,
         )
@@ -340,12 +430,13 @@ class ChandraOcrEngine:
 
         return images
 
-    def _ocr_page(self, image: Any, page_num: int) -> tuple[str, Any]:
+    def _ocr_page(self, image: Any, page_num: int, page_count: int = 0) -> tuple[str, Any]:
         """OCR a single page image with Chandra.
 
         Args:
             image: PIL Image of the page.
             page_num: 1-based page number (for logging).
+            page_count: Total pages in this document (for logging context).
 
         Returns:
             Tuple of (markdown, hocr_data).

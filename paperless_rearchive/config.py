@@ -110,7 +110,7 @@ class Settings:
             archive_for_images=_env_bool("REARCHIVE_ARCHIVE_FOR_IMAGES", False),
             poll_interval=float(_env("REARCHIVE_POLL_INTERVAL", "300")),
             batch_limit=_env_int("REARCHIVE_BATCH_LIMIT", 5),
-            concurrency=_env_int("REARCHIVE_OCR_CONCURRENCY", 2),
+            concurrency=_env_int("REARCHIVE_OCR_CONCURRENCY", 1),
             max_pages=_env_int("REARCHIVE_MAX_PAGES", 0),
             dry_run=_env_bool("REARCHIVE_DRY_RUN", False),
             run_once=_env_bool("REARCHIVE_RUN_ONCE", False),

@@ -34,7 +34,13 @@
       PAPERLESS_DBPASS_FILE: /run/secrets/paperless_db_paperless_passwd
       REARCHIVE_POLL_INTERVAL: "300"
       REARCHIVE_BATCH_LIMIT: "5"
-      REARCHIVE_OCR_CONCURRENCY: "2"
+      # Page-level threads against the same local GPU server. 1 = sequential
+      # (default). >1 only piles competing requests onto the same GPU - it
+      # does not create more GPU. Raise gradually (2, then 4) and watch GPU
+      # utilisation, latency and error rate.
+      REARCHIVE_OCR_CONCURRENCY: "1"
+      # 0 = OCR all pages, otherwise only the first N pages per document.
+      REARCHIVE_MAX_PAGES: "0"
       REARCHIVE_DRY_RUN: "false"
     volumes:
       # Read-write: archive files are replaced here (originals are NEVER touched).
