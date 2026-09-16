@@ -65,10 +65,20 @@ def process_document(
     * retry    -> trigger kept (transient OCR error); nothing else touched
     """
     doc = api.document(ctx.doc_id)
+    log.debug("Document %d: retrieved from API, title=%r", ctx.doc_id, doc.get("title"))
 
     with tempfile.TemporaryDirectory(prefix=f"rearch-{ctx.doc_id}-") as tmp:
         tmp_dir = Path(tmp)
         original = api.download_original(ctx.doc_id, tmp_dir)
+        log.info(
+            "Document %d: downloaded original to %s (%s)",
+            ctx.doc_id,
+            original,
+            original.stat().st_size,
+        )
+        log.debug("Document %d: original file size=%d bytes, mime=%s",
+                  ctx.doc_id, original.stat().st_size,
+                  original.suffix.lower())
 
         do_archive = ctx.archive_mode
         archive_path: Path | None = None
@@ -97,9 +107,23 @@ def process_document(
                 archive_path = settings.archive_dir / archive_filename
                 try:
                     archive_checksum = fetch_archive_checksum(settings.db, ctx.doc_id)
+                    log.debug(
+                        "Document %d: archive checksum from DB=%s",
+                        ctx.doc_id,
+                        archive_checksum,
+                    )
                     try:
                         verify_current_checksum(archive_path, archive_checksum)
+                        log.debug(
+                            "Document %d: archive checksum verified (DB %s == disk)",
+                            ctx.doc_id,
+                            archive_checksum,
+                        )
                     except ArchiveReplaceError as e:
+                        log.warning(
+                            "Document %d: archive checksum mismatch, attempting repair",
+                            ctx.doc_id,
+                        )
                         _repair_checksum_drift(settings, ctx, archive_path, archive_checksum, e)
                 except (ArchiveReplaceError, RuntimeError) as e:
                     if settings.dry_run:
@@ -111,6 +135,7 @@ def process_document(
                     return
 
         # Use unified Chandra OCR engine
+        log.debug("Document %d: initializing ChandraOcrEngine", ctx.doc_id)
         engine = ChandraOcrEngine(
             server_url=provider.server_url,
             model_name=provider.model_name,
@@ -132,11 +157,27 @@ def process_document(
             ctx.archive_mode,
         )
 
+        log.info(
+            "Document %d: starting unified OCR (produce_pdf=%s, archive_mode=%s)",
+            ctx.doc_id,
+            produce_pdf,
+            ctx.archive_mode,
+        )
         result = engine.ocr_document(
             original,
             produce_pdf=produce_pdf,
             output_pdf_path=output_pdf_path,
         )
+
+        log.info(
+            "Document %d: OCR complete - %d pages, %d succeeded, %d failed",
+            ctx.doc_id,
+            result.page_count,
+            result.success_count,
+            len(result.error_pages),
+        )
+        if result.pdf_path:
+            log.debug("Document %d: PDF/A produced at %s", ctx.doc_id, result.pdf_path)
 
         # Handle page-level errors
         if result.has_errors:
@@ -164,9 +205,15 @@ def process_document(
             if result.pdf_path is not None:
                 would += f" and archive {result.pdf_path}"
             log.info("DRY-RUN document %d: would write %s. Trigger tag kept.", ctx.doc_id, would)
+            log.debug("Document %d: DRY-RUN - no actual writes performed", ctx.doc_id)
             return
 
         api.patch_content(ctx.doc_id, content)
+        log.info(
+            "Document %d: PATCHed content field with %d chars of OCR markdown",
+            ctx.doc_id,
+            len(content),
+        )
 
         # Add page-errors tag if there were partial failures
         extra_tags = []
@@ -183,8 +230,32 @@ def process_document(
                 log.exception("Could not add re-ocr-page-errors tag for document %d", ctx.doc_id)
 
         if result.pdf_path is not None and archive_path is not None:
+            log.info(
+                "Document %d: replacing archive %s with new PDF/A %s",
+                ctx.doc_id,
+                archive_path,
+                result.pdf_path,
+            )
+            old_checksum = fetch_archive_checksum(settings.db, ctx.doc_id)
+            log.debug(
+                "Document %d: current DB archive_checksum=%s",
+                ctx.doc_id,
+                old_checksum,
+            )
             checksum = replace_archive(archive_path, result.pdf_path)
+            log.info(
+                "Document %d: archive replaced, new SHA-256=%s",
+                ctx.doc_id,
+                checksum,
+            )
             update_archive_checksum(settings.db, ctx.doc_id, checksum)
+            log.info(
+                "Document %d: updated documents_document.archive_checksum to %s",
+                ctx.doc_id,
+                checksum,
+            )
+            log.debug("Document %d: archive replacement complete, new checksum=%s",
+                      ctx.doc_id, checksum)
 
         # Finish: swap trigger tag for outcome tag
         outcome_tag_name = f"{ctx.trigger_tag_name}{'-success' if result.page_count > 0 else '-failure'}"
@@ -231,13 +302,22 @@ def _repair_checksum_drift(
         raise error
     disk_checksum = checksum_of_file(archive_path)
     log.warning(
-        "Document %d: archive checksum drift (DB %s != disk %s); adopting the on-disk "
-        "archive - the previous run was probably interrupted after replacing it.",
+        "Document %d: archive checksum drift detected (DB %s != disk %s)",
         ctx.doc_id,
         expected,
         disk_checksum,
     )
+    log.info(
+        "Document %d: adopting on-disk archive bytes (previous run likely interrupted)",
+        ctx.doc_id,
+    )
     update_archive_checksum(settings.db, ctx.doc_id, disk_checksum)
+    log.info(
+        "Document %d: updated archive_checksum from %s to %s",
+        ctx.doc_id,
+        expected,
+        disk_checksum,
+    )
 
 
 def _finish(
@@ -249,14 +329,42 @@ def _finish(
 ) -> None:
     """Swap the trigger tag for the outcome tag; keep trigger on API errors."""
     outcome_tag_name = f"{ctx.trigger_tag_name}{'-success' if success else '-failure'}"
+    log.info(
+        "Document %d: swapping trigger tag %r for outcome tag %r (success=%s)",
+        ctx.doc_id,
+        ctx.trigger_tag_name,
+        outcome_tag_name,
+        success,
+    )
     try:
         outcome_tag_id = api.ensure_tag(outcome_tag_name)
+        log.debug(
+            "Document %d: outcome tag %r has id %d",
+            ctx.doc_id,
+            outcome_tag_name,
+            outcome_tag_id,
+        )
         api.set_tags(
             ctx.doc_id,
             remove=[ctx.trigger_tag_id],
             add=[outcome_tag_id],
             current_tags=ctx.current_tags,
         )
+        log.info(
+            "Document %d: tag swap complete - removed trigger %d (%s), added outcome %d (%s)",
+            ctx.doc_id,
+            ctx.trigger_tag_id,
+            ctx.trigger_tag_name,
+            outcome_tag_id,
+            outcome_tag_name,
+        )
+        if extra_tags:
+            log.info(
+                "Document %d: also added %d extra tag(s): %s",
+                ctx.doc_id,
+                len(extra_tags),
+                extra_tags,
+            )
     except Exception:  # noqa: BLE001 - tag API hiccup must not lose the trigger
         log.exception("Could not update tags on document %d; keeping trigger.", ctx.doc_id)
         return
