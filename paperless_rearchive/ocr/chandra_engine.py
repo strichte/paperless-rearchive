@@ -3,7 +3,10 @@
 This module provides a unified OCR pipeline that:
 1. Renders PDF pages to images using PyMuPDF
 2. Calls Chandra for OCR on each page
-3. Optionally assembles a searchable PDF/A using ocrmypdf's sandwich pipeline
+3. Optionally produces a searchable PDF/A via a single ocrmypdf pass driven by
+   the paperless_chandra.ocrmypdf_plugin - the same engine paperless ingest
+   uses - so the archive's text layer (and Creator metadata) is Chandra's,
+   not Tesseract's
 4. Tracks page-level errors for partial failure reporting
 
 The key insight: OCR work is unified (same Chandra calls regardless of mode),
@@ -15,7 +18,6 @@ from __future__ import annotations
 import builtins
 import logging
 import re
-import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -34,9 +36,15 @@ try:
 except Exception:
     _chandra_settings = None
 from paperless_chandra.engine.blocks import markdown_sidecar, page_from_chunks
-from paperless_chandra.engine.hocr import render_hocr, sidecar_text
+from paperless_chandra.engine.hocr import sidecar_text
 
 log = logging.getLogger(__name__)
+
+# The ocrmypdf plugin that replaces ocrmypdf's default Tesseract engine with
+# Chandra. Passing this (plus the chandra_* kwargs it registers via its
+# add_options hook) is what makes the archive's text layer Chandra's.
+# Mirrors paperless_chandra.parser._OCRMYPDF_PLUGIN_MODULE.
+_OCRMYPDF_PLUGIN_MODULE = "paperless_chandra.ocrmypdf_plugin"
 
 
 # Mirror of the upstream retry policy in chandra/model/vllm.py::generate_vllm.
@@ -170,11 +178,9 @@ class ChandraOcrEngine:
 
     Renders PDF pages to images, calls Chandra for OCR, and produces:
     - Markdown content (always)
-    - hOCR structures (always, for potential PDF/A assembly)
-    - Optional searchable PDF/A (when produce_pdf=True)
-
-    The OCR work is the same regardless of produce_pdf; only the
-    final PDF assembly step differs.
+    - Optional searchable PDF/A with a Chandra text layer (when
+      produce_pdf=True), via one ocrmypdf pass with the
+      paperless_chandra.ocrmypdf_plugin
 
     This avoids wasting CPU cycles on PDF/A generation for content-only
     mode, where only the markdown is needed for the content field.
@@ -309,12 +315,11 @@ class ChandraOcrEngine:
         # the HTTP wait around the blocking generate_vllm call - the GPU on
         # the inference server still processes them one at a time)
         all_markdown_parts: list[str] = [""] * len(images)
-        all_hocr_pages: list[tuple[int, int, Any] | None] = [None] * len(images)
         error_pages: list[int] = []
         errors: list[str] = []
         doc_started = time.monotonic()
 
-        def _run(page_num: int, image: Any) -> tuple[str, Any]:
+        def _run(page_num: int, image: Any) -> str:
             return self._ocr_page(image, page_num, len(images))
 
         indexed = list(enumerate(images, start=1))
@@ -324,7 +329,7 @@ class ChandraOcrEngine:
                 thread_name_prefix="chandra-page",
             ) as pool:
                 futures = {pool.submit(_run, n, img): n for n, img in indexed}
-                ordered: dict[int, tuple[str, Any]] = {}
+                ordered: dict[int, str] = {}
                 for future in as_completed(futures):
                     n = futures[future]
                     try:
@@ -342,14 +347,8 @@ class ChandraOcrEngine:
                     log.warning("OCR failed on page %d: %s", n, e)
                     results.append(("", None))
 
-        for page_num, (markdown, hocr_data) in enumerate(results, start=1):
+        for page_num, markdown in enumerate(results, start=1):
             all_markdown_parts[page_num - 1] = markdown
-            if hocr_data:
-                all_hocr_pages[page_num - 1] = (
-                    images[page_num - 1].width,
-                    images[page_num - 1].height,
-                    hocr_data,
-                )
             if not (markdown or "").strip():
                 error_pages.append(page_num)
                 errors.append(f"Page {page_num}: no OCR result")
@@ -368,15 +367,14 @@ class ChandraOcrEngine:
         # Combine all page markdown
         markdown = "\n\n".join(all_markdown_parts)
 
-        # Optionally assemble PDF/A
+        # Optionally produce the PDF/A: one ingest-identical ocrmypdf pass
+        # with the paperless_chandra plugin gives the archive its Chandra
+        # text layer. Skipped when every page failed (the pipeline refuses
+        # to write a result whose pages all errored, so don't pay for a
+        # second Chandra pass we would throw away).
         pdf_path_result: Path | None = None
-        real_hocr = [h for h in all_hocr_pages if h is not None]
-        if produce_pdf and real_hocr:
-            pdf_path_result = self._assemble_pdf(
-                pdf_path,
-                output_pdf_path,
-                real_hocr,
-            )
+        if produce_pdf and len(images) > len(error_pages):
+            pdf_path_result = self._assemble_pdf(pdf_path, output_pdf_path)
 
         skipped = total_pages - len(images)
         skipped_pages = list(range(len(images) + 1, total_pages + 1))
@@ -430,7 +428,7 @@ class ChandraOcrEngine:
 
         return images
 
-    def _ocr_page(self, image: Any, page_num: int, page_count: int = 0) -> tuple[str, Any]:
+    def _ocr_page(self, image: Any, page_num: int, page_count: int = 0) -> str:
         """OCR a single page image with Chandra.
 
         Args:
@@ -439,7 +437,7 @@ class ChandraOcrEngine:
             page_count: Total pages in this document (for logging context).
 
         Returns:
-            Tuple of (markdown, hocr_data).
+            The markdown sidecar text for the page.
         """
         from chandra.output import parse_chunks
 
@@ -482,7 +480,7 @@ class ChandraOcrEngine:
             )
         if not raw:
             log.warning("Chandra returned empty result for page %d", page_num)
-            return "", None
+            return ""
 
         # Parse chunks and build page structure
         chunks = parse_chunks(raw, image)
@@ -499,26 +497,32 @@ class ChandraOcrEngine:
         else:
             markdown = sidecar_text(page)
 
-        # Get hOCR for potential PDF assembly
-        hocr_data = render_hocr(page)
+        return markdown
 
-        return markdown, hocr_data
+    def _assemble_pdf(self, original_pdf: Path, output_pdf: Path) -> Path:
+        """Produce a searchable PDF/A with a Chandra text layer.
 
-    def _assemble_pdf(
-        self,
-        original_pdf: Path,
-        output_pdf: Path,
-        hocr_pages: list[tuple[int, int, Any]],
-    ) -> Path:
-        """Assemble a searchable PDF/A using ocrmypdf's sandwich pipeline.
+        Drives the same ocrmypdf invocation paperless ingest drives
+        (paperless_chandra.parser.construct_ocrmypdf_parameters): the
+        paperless_chandra.ocrmypdf_plugin replaces ocrmypdf's default
+        Tesseract engine, so the PDF's invisible text layer - and the
+        ``Creator`` metadata ocrmypdf records - are Chandra's.
 
-        Uses ocrmypdf to combine the original scan images with the
-        hOCR text layers to produce a searchable PDF/A.
+        ocrmypdf 17.x has no hOCR renderer: an ``hocr=`` kwarg would be
+        silently swallowed by **kwargs and the text layer would fall back
+        to Tesseract (the pre-P1 bug; see doc/OCR_STRATEGY.md). The Chandra
+        pass therefore happens *inside* ocrmypdf, via the plugin - the
+        per-page hOCR this module used to render is gone entirely.
+
+        ``redo_ocr`` keeps the original page images (no re-rasterising, so
+        the archive does not balloon) and strips any existing text layer -
+        the natural mode for a re-OCR tool. ``use_threads=True`` mirrors
+        paperless (required for daemonised callers) and keeps everything
+        in-process.
 
         Args:
             original_pdf: The original PDF (for page images).
             output_pdf: Where to write the output PDF/A.
-            hocr_pages: List of (width, height, hocr_data) per page.
 
         Returns:
             Path to the generated PDF/A.
@@ -526,64 +530,27 @@ class ChandraOcrEngine:
         import ocrmypdf
 
         log.info(
-            "Assembling searchable PDF/A via ocrmypdf sandwich: %s",
+            "Assembling searchable PDF/A via ocrmypdf + Chandra plugin: %s",
             output_pdf,
         )
-
-        # We need to create a combined hOCR document
-        # ocrmypdf expects a single hOCR file with all pages
-        combined_hocr = self._combine_hocr_pages(hocr_pages)
-
-        # Write combined hOCR to temp file
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".hocr", delete=False) as f:
-            f.write(combined_hocr)
-            hocr_path = Path(f.name)
-
-        try:
-            # Use ocrmypdf to do the sandwich
-            # ocrmypdf.ocr() with redo_ocr=True will use the hOCR sidecar
-            ocrmypdf.ocr(
-                str(original_pdf),  # input_file as positional arg
-                output_file=str(output_pdf),
-                output_type="pdfa",
-                language=self.language,
-                redo_ocr=True,
-                hocr=str(hocr_path),
-                jobs=1,
-            )
-        finally:
-            hocr_path.unlink()
-
+        ocrmypdf.ocr(
+            str(original_pdf),  # input_file as positional arg
+            output_file=str(output_pdf),
+            output_type="pdfa",
+            # Mirror paperless's default colour strategy for PDF/A.
+            color_conversion_strategy="RGB",
+            language=self.language,
+            redo_ocr=True,
+            use_threads=True,
+            jobs=1,
+            progress_bar=False,
+            plugins=[_OCRMYPDF_PLUGIN_MODULE],
+            # Custom kwargs registered by the plugin's add_options hookimpl.
+            chandra_server_url=self.server_url,
+            chandra_model_name=self.model_name,
+            chandra_api_key=self.api_key,
+            chandra_max_output_tokens=self.max_output_tokens,
+            chandra_content_format=self.content_format,
+        )
         log.info("PDF/A assembled: %s", output_pdf)
         return output_pdf
-
-    def _combine_hocr_pages(
-        self, hocr_pages: list[tuple[int, int, Any]]
-    ) -> str:
-        """Combine per-page hOCR into a single multi-page hOCR document.
-
-        Args:
-            hocr_pages: List of (width, height, hocr_data) per page.
-
-        Returns:
-            Combined hOCR XML string.
-        """
-        # Start the combined hOCR document
-        combined = (
-            "<?xml version='1.0' encoding='UTF-8'?>\n"
-            "<!DOCTYPE html PUBLIC '-//W3C//DTD XHTML 1.0 Transitional//EN' "
-            "'http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd'>\n"
-            "<html xmlns='http://www.w3.org/1999/xhtml' xml:lang='en' lang='en'>\n"
-            "<head><title></title></head>\n"
-            "<body>\n"
-        )
-
-        # Add each page's hOCR content
-        for i, (_, _, hocr_data) in enumerate(hocr_pages):
-            # hocr_data is the hOCR XML string for this page
-            combined += hocr_data + "\n"
-
-        # Close the document
-        combined += "</body></html>"
-
-        return combined
