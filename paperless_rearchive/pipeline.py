@@ -33,6 +33,15 @@ from paperless_rearchive.archive.replacer import (
 from paperless_rearchive.ocr.base import OcrProviderPlugin
 from paperless_rearchive.ocr.chandra_engine import ChandraOcrEngine
 
+
+def _format_size(size_bytes: int) -> str:
+    """Format file size in human-readable format."""
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size_bytes < 1024:
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.1f} TB"
+
 if TYPE_CHECKING:
     from paperless_rearchive.config import Settings
     from paperless_rearchive.paperless_api import PaperlessAPI
@@ -242,12 +251,56 @@ def process_document(
                 ctx.doc_id,
                 old_checksum,
             )
+            # Get original archive size before replacement
+            old_size = archive_path.stat().st_size if archive_path.exists() else 0
+            
             checksum = replace_archive(archive_path, result.pdf_path)
             log.info(
                 "Document %d: archive replaced, new SHA-256=%s",
                 ctx.doc_id,
                 checksum,
             )
+            
+            # Get new archive size after replacement
+            new_size = result.pdf_path.stat().st_size
+            
+            # Ratio + pct for concise logging, e.g. 624.5 KB to 625.1 KB (1.001x, +0.1%)
+            size_diff = new_size - old_size
+            if old_size > 0:
+                size_ratio = new_size / old_size
+                size_change_pct = (size_diff / old_size) * 100
+            else:
+                size_ratio = float("inf")
+                size_change_pct = 0.0
+
+            log.debug(
+                "Document %d: archive size changed from %s to %s (%.3fx, %+.1f%%)",
+                ctx.doc_id,
+                _format_size(old_size),
+                _format_size(new_size),
+                size_ratio,
+                size_change_pct,
+            )
+
+            # Check for drastic size changes
+            if old_size > 0:
+                if abs(size_change_pct) > 50:
+                    direction = "increased" if size_diff > 0 else "decreased"
+                    log.warning(
+                        "Document %d: archive size %s by %.1f%% (%.3fx, %s → %s)",
+                        ctx.doc_id,
+                        direction,
+                        abs(size_change_pct),
+                        size_ratio,
+                        _format_size(old_size),
+                        _format_size(new_size),
+                    )
+                    if size_diff > 0:
+                        log.warning(
+                            "Document %d: significant size increase may indicate fallback to force_ocr or other issues",
+                            ctx.doc_id,
+                        )
+            
             update_archive_checksum(settings.db, ctx.doc_id, checksum)
             log.info(
                 "Document %d: updated documents_document.archive_checksum to %s",
