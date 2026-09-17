@@ -386,8 +386,8 @@ docker compose logs -f paperless-rearchive   # watch the first cycles
 3. Wait for a poll cycle (or `docker kill -s HUP paperless-rearchive`).
 4. Check the outcome: the document should carry `re-ocr-all-success`, its `content` field fresh
    markdown, and an audit note; the archive file's `Creator` metadata should read
-   `OCRmyPDF … / Chandra …`. The old archive is kept as `.bak-<timestamp>` next to it (or in
-   `REARCHIVE_BACKUP_DIRECTORY`).
+   `OCRmyPDF … / Chandra …`. The old archive is kept as `.bak-<timestamp>` **in
+   `REARCHIVE_BACKUP_DIRECTORY`** — never in the archive directory.
 
 ## Secrets
 
@@ -603,11 +603,14 @@ services:
       REARCHIVE_BACKUP_DIRECTORY: "/archive-backups"
 ```
 
-The archive's sub-directory layout is mirrored below the backup directory. The sidecar **refuses
-to start** without the setting, when it resolves to the archive directory or a sub-directory of it
-(symlinks included), when the path exists but is not a directory, or when it is not writable — it
-creates the directory on startup if needed. Without this safeguard, paperless-ngx's health check
-reports every backup in the media directory as an orphaned file:
+The archive's sub-directory layout is mirrored below the backup directory. Backups are
+**unconditional** — every archive replacement creates one; there is no option to skip it. The
+sidecar **refuses to start** without the setting, when it resolves to the archive directory or a
+sub-directory of it (symlinks included), when the path exists but is not a directory, or when it
+is not writable — it creates the directory on startup if needed. And as a runtime backstop, the
+replacer refuses to write any backup whose destination resolves inside the archive directory, even
+if a symlink game changes the picture after startup. Without all of this, paperless-ngx's health
+check reports every backup in the media directory as an orphaned file:
 
 > `[WARNING] [paperless.sanity_checker] Orphaned file in media dir: …/documents/archive/….pdf.bak-…`
 

@@ -463,4 +463,6 @@ Secrets (already defined in `paperless-lxc/docker-compose.yml`): `chandra_api_ke
   orphaned-file health check. `REARCHIVE_BACKUP_DIRECTORY` relocates the backups outside the
   media dir (cross-disk safe: they are copied), mirrors the archive's sub-directory layout, is
   created/verified at startup, and is refused at/below the archive directory. It is now a
-  **mandatory** setting — the legacy next-to-archive fallback was removed entirely.
+  **mandatory** setting — the legacy next-to-archive fallback was removed entirely, backups are
+  unconditional (no skip option), and the replacer has a runtime backstop that refuses any backup
+  destination resolving inside the archive directory.

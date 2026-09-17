@@ -67,6 +67,13 @@ def backup_destination(
     The archive's path relative to ``archive_dir`` is recreated below
     ``backup_dir``, so template sub-directories are preserved. An archive
     that cannot be related to ``archive_dir`` is stored flat.
+
+    Raises:
+        ArchiveReplaceError: if the computed destination would land inside
+            the archive directory. Backups are **never** written there —
+            this is a runtime backstop for a ``backup_dir`` that turned out
+            to be inside the archive tree despite startup validation
+            (e.g. a symlink created after boot).
     """
     name = f"{archive_path.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
     rel: Path | None = None
@@ -79,37 +86,53 @@ def backup_destination(
                 archive_path,
                 archive_dir,
             )
-    if rel is None:
-        return Path(backup_dir) / name
-    return (Path(backup_dir) / rel).with_name(name)
+    dest = (Path(backup_dir) / rel).with_name(name) if rel is not None else Path(backup_dir) / name
+    _refuse_destination_inside_archive_dir(dest, archive_dir)
+    return dest
+
+
+def _refuse_destination_inside_archive_dir(dest: Path, archive_dir: Path | None) -> None:
+    """Hard backstop: a backup destination inside the archive tree is fatal."""
+    if archive_dir is None:
+        return
+    try:
+        inside = dest.resolve().is_relative_to(Path(archive_dir).resolve())
+    except OSError:  # unresolvable path - let the later mkdir/copy fail loudly
+        return
+    if inside:
+        raise ArchiveReplaceError(
+            f"Refusing to write a backup into the archive directory: {dest} "
+            f"is inside {archive_dir}. REARCHIVE_BACKUP_DIRECTORY must point "
+            "outside the archive tree."
+        )
 
 
 def replace_archive(
     archive_path: Path,
     new_pdf: Path,
     *,
-    keep_backup: bool = True,
     backup_dir: Path,
     archive_dir: Path | None = None,
 ) -> str:
     """Atomically replace ``archive_path`` with ``new_pdf``.
 
     Returns the SHA-256 checksum of the newly written file. The previous
-    archive version is preserved as ``<name>.bak-<timestamp>`` below the
-    required ``backup_dir`` (see :func:`backup_destination`). The backup is
-    *copied*, so ``backup_dir`` may live on a different filesystem/disk;
-    keeping it outside the media directory is what stops paperless-ngx's
-    health check from reporting the backups as orphaned files.
+    archive version is **always** preserved as ``<name>.bak-<timestamp>``
+    below the required ``backup_dir`` (see :func:`backup_destination`) — a
+    backup is never skipped and never written into the archive directory.
+    The backup is *copied*, so ``backup_dir`` may live on a different
+    filesystem/disk; keeping it outside the media directory is what stops
+    paperless-ngx's health check from reporting the backups as orphaned
+    files.
     """
-    if keep_backup:
-        backup_path = backup_destination(
-            archive_path, backup_dir=backup_dir, archive_dir=archive_dir
-        )
-        backup_path.parent.mkdir(parents=True, exist_ok=True)
-        # copy (never move): the target may be another disk, and the source
-        # must stay readable for verification until os.replace() runs.
-        shutil.copy2(archive_path, backup_path)
-        log.info("Backed up old archive to %s", backup_path)
+    backup_path = backup_destination(
+        archive_path, backup_dir=backup_dir, archive_dir=archive_dir
+    )
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    # copy (never move): the target may be another disk, and the source
+    # must stay readable for verification until os.replace() runs.
+    shutil.copy2(archive_path, backup_path)
+    log.info("Backed up old archive to %s", backup_path)
 
     # Stage on the same filesystem so os.replace() is atomic.
     staged = archive_path.with_name(f".{archive_path.name}.rearch-tmp")
