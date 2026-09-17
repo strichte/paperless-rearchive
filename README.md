@@ -576,6 +576,13 @@ with the engine, page outcome, archive size ratio and OCR duration — and a `Re
 note on failure. Both are skipped in dry-run mode and when `REARCHIVE_WRITE_PROVENANCE=false`;
 a provenance failure never fails the document.
 
+**Baked into the archive itself:** the regenerated PDF's `Creator` metadata records the full
+provenance of the text layer — `OCRmyPDF <version> / OCRmyPDF fpdf2 + Chandra <chandra-ocr
+version>` (composed by ocrmypdf from the engine's `creator_tag`) plus the served model name,
+appended as `[model: <PAPERLESS_CHANDRA_MODEL_NAME>]`. So the exact model travels with the file
+even outside paperless (visible via `pdfinfo`, readable by any PDF tool). The provenance check
+(`tests/integration/check_archive_provenance.sh`) still matches on `Chandra`.
+
 ## Manual trigger (SIGHUP)
 
 The polling loop runs on `REARCHIVE_POLL_INTERVAL` (default 300 s). To trigger an immediate poll:

@@ -414,6 +414,32 @@ class ChandraOcrEngine:
             errors=errors,
         )
 
+    def _stamp_model_provenance(self, pdf_path: Path) -> None:
+        """Append the served model name to the PDF's Creator metadata.
+
+        ocrmypdf records the engine/library versions ('OCRmyPDF … / … +
+        Chandra 0.2.0' via ``ChandraEngine.creator_tag``), but the *served
+        model* is a deployment choice (PAPERLESS_CHANDRA_MODEL_NAME) — so it
+        is appended here, making the archive itself carry the full provenance
+        of the text layer. docinfo ``/Creator`` and XMP ``xmp:CreatorTool``
+        are kept in sync through pikepdf's metadata API (PDF/A-safe).
+        """
+        import pikepdf
+
+        model = (self.model_name or "").strip()
+        if not model:
+            return
+        with pikepdf.open(pdf_path, allow_overwriting_input=True) as pdf:
+            creator = str(pdf.docinfo.get("/Creator", "") or "").strip()
+            stamped = f"{creator} [model: {model}]".strip()
+            with pdf.open_metadata(set_pikepdf_as_editor=False, update_docinfo=True) as meta:
+                meta["xmp:CreatorTool"] = stamped
+            pdf.docinfo["/Creator"] = stamped
+            # pikepdf's context manager does NOT auto-save; without an
+            # explicit save the metadata changes are discarded on close.
+            pdf.save(pdf_path)
+        log.info("Stamped model provenance into %s: %s", pdf_path.name, stamped)
+
     def _ocr_document_ingest_pass(
         self,
         pdf_path: Path,
@@ -526,6 +552,10 @@ class ChandraOcrEngine:
                 raise RuntimeError(
                     f"OCRmyPDF failed: {type(exc2).__name__}: {exc2}"
                 ) from exc2
+
+        # Bake the served model name into the archive itself (Creator/XMP),
+        # next to the engine + library versions ocrmypdf already recorded.
+        self._stamp_model_provenance(output_pdf_path)
 
         if sidecar.exists():
             content = sidecar_content(sidecar, output_pdf_path)

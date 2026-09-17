@@ -104,6 +104,14 @@ The original file is immutable; it is only downloaded via the API and used as OC
   same deterministic decode (temperature 0.0 / top_p 0.1) — the content path renders with
   PyMuPDF @300 dpi RGB, the archive path rasterizes via ocrmypdf/Ghostscript at the page's
   effective DPI — and borderline pages flip into/out of repetition loops depending on the pixels.
+- **Model provenance baked into the archive (2026-09-17)**: ocrmypdf's `Creator` metadata records
+  engine/library versions only (`ChandraEngine.creator_tag` → `Chandra <chandra-ocr version>` via
+  `importlib.metadata.version("chandra-ocr")`), so the served model name is appended after the
+  pass: `pdf.docinfo['/Creator'] += ' [model: <PAPERLESS_CHANDRA_MODEL_NAME>]'` with XMP
+  `xmp:CreatorTool` kept in sync via pikepdf (`_stamp_model_provenance`). Gotcha found while
+  implementing: pikepdf's context manager does **not** auto-save with
+  `allow_overwriting_input=True` — an explicit `pdf.save()` is required or the metadata changes
+  are silently discarded on close.
 - **Base image**: paperless-ngx now ships `python:3.14-slim` (Debian 13 *trixie*) and this
   sidecar uses the same base. `jbig2` (bilevel compression for ocrmypdf) is available as an apt
   package in trixie and is installed directly; together with `pngquant` it saved ~15-19% on a
