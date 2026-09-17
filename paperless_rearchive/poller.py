@@ -75,6 +75,11 @@ def cycle(settings: Settings, api: PaperlessAPI, provider_name: str) -> CycleRes
         settings.trigger_tag_all: True,
     }
     tag_ids = {name: api.ensure_tag(name) for name in triggers}
+    # ``REARCHIVE_FORCE_TAG`` is a modifier, not a trigger: it is never
+    # auto-created (a document can only carry it if an operator made it).
+    # Resolved once per cycle; it bypasses the provenance gate for that
+    # document. ``None`` when the tag does not exist or is disabled.
+    force_tag_id = api.tag_id(settings.force_tag) if settings.force_tag else None
     # Backlog snapshot before this cycle (for progress + tuning advice).
     backlog_start = {name: len(api.doc_ids_with_tag(tid, limit=100_000)) for name, tid in tag_ids.items()}
     total_backlog = sum(backlog_start.values())
@@ -91,13 +96,24 @@ def cycle(settings: Settings, api: PaperlessAPI, provider_name: str) -> CycleRes
         log.info("processing %d document(s) tagged %r: %s", len(doc_ids), name, doc_ids)
         for doc_id in doc_ids:
             doc = api.document(doc_id)
+            doc_tags = list(doc.get("tags", []))
+            forced = force_tag_id is not None and force_tag_id in doc_tags
             ctx = DocumentContext(
                 doc_id=doc_id,
                 trigger_tag_id=tag_id,
                 trigger_tag_name=name,
                 archive_mode=archive_mode,
-                current_tags=list(doc.get("tags", [])),
+                current_tags=doc_tags,
+                force=forced,
+                force_tag_id=force_tag_id if forced else None,
             )
+            if forced:
+                log.info(
+                    "Document %d: modifier tag %r present - provenance gate "
+                    "bypassed for this run.",
+                    doc_id,
+                    settings.force_tag,
+                )
             try:
                 process_document(settings, api, get_provider(provider_name), ctx)
                 succeeded += 1

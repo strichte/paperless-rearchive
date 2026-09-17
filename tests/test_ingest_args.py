@@ -10,6 +10,8 @@ import pytest
 from paperless_rearchive.ocr.ingest_args import (
     PDF_TEXT_MIN_LENGTH,
     build_ocrmypdf_args,
+    effective_mode,
+    has_visible_text_content,
     is_born_digital_text,
     is_tagged_pdf,
     pdf_born_digital_text,
@@ -143,30 +145,34 @@ def test_jobs_floor_is_one() -> None:
 # ── mode resolution ──────────────────────────────────────────────────────────
 
 
-def test_resolve_mode_auto_upgrades_to_redo_with_text() -> None:
-    assert resolve_mode("auto", pdf_has_text=True) == "redo"
+def test_resolve_mode_auto_skips_digital_born() -> None:
+    """auto + text + digital-born => off (preserve visible text)."""
+    assert resolve_mode("auto", pdf_has_text=True, pdf_is_digital_born=True) == "off"
 
 
-def test_resolve_mode_auto_stays_without_text() -> None:
-    assert resolve_mode("auto", pdf_has_text=False) == "auto"
+def test_resolve_mode_auto_redoes_ocr_text() -> None:
+    """auto + text + not digital-born (OCR overlay) => redo."""
+    assert resolve_mode("auto", pdf_has_text=True, pdf_is_digital_born=False) == "redo"
+
+
+def test_resolve_mode_auto_unchanged_without_text() -> None:
+    """auto + no text => auto, regardless of digital-born guess."""
+    assert resolve_mode("auto", pdf_has_text=False, pdf_is_digital_born=True) == "auto"
 
 
 def test_resolve_mode_explicit_modes_untouched() -> None:
     for mode in ("force", "redo", "off"):
-        assert resolve_mode(mode, pdf_has_text=True) == mode
+        assert resolve_mode(mode, pdf_has_text=True, pdf_is_digital_born=True) == mode
 
 
 def test_resolve_mode_legacy_names_map_to_auto() -> None:
-    assert resolve_mode("skip", pdf_has_text=False) == "auto"
-    assert resolve_mode("skip_noarchive", pdf_has_text=False) == "auto"
+    assert resolve_mode("skip", pdf_has_text=False, pdf_is_digital_born=False) == "auto"
+    assert resolve_mode("skip_noarchive", pdf_has_text=False, pdf_is_digital_born=False) == "auto"
 
 
 def test_resolve_mode_rejects_unknown() -> None:
     with pytest.raises(ValueError):
-        resolve_mode("turbo", pdf_has_text=False)
-
-
-# ── born-digital rule ────────────────────────────────────────────────────────
+        resolve_mode("turbo", pdf_has_text=False, pdf_is_digital_born=False)
 
 
 def _untagged_pdf(tmp_path: Path) -> Path:
@@ -234,3 +240,80 @@ def test_sidecar_missing_file_falls_back(tmp_path: Path) -> None:
         return_value="fallback",
     ):
         assert sidecar_content(tmp_path / "nope.txt", tmp_path / "out.pdf") == "fallback"
+
+
+# ── explicit skip mode ───────────────────────────────────────────────────────
+
+
+def test_skip_mode_uses_skip_text() -> None:
+    """``skip`` is the explicit per-page ``skip_text`` mode (layer 2)."""
+    args = _args(mode="skip")
+    assert args["skip_text"] is True
+    assert "redo_ocr" not in args
+
+
+# ── provenance-driven mode mapping (layer 1 -> layer 2) ──────────────────────
+
+
+def test_effective_mode_explicit_overrides_pass_through() -> None:
+    for mode in ("force", "off"):
+        for kind in ("text_based", "scanned", "mixed", "unknown"):
+            assert effective_mode(mode, kind) == mode
+
+
+def test_effective_mode_text_based_disables_ocr() -> None:
+    assert effective_mode("redo", "text_based") == "off"
+    assert effective_mode("auto", "text_based") == "off"
+
+
+def test_effective_mode_scanned_follows_configured_mode() -> None:
+    assert effective_mode("redo", "scanned") == "redo"
+    assert effective_mode("auto", "scanned") == "auto"
+
+
+def test_effective_mode_mixed_degrades_redo_to_skip() -> None:
+    """ocrmypdf applies one mode per file: ``redo`` would strip native pages."""
+    assert effective_mode("redo", "mixed") == "skip"
+    assert effective_mode("redo", "mixed", mixed_mode="redo") == "redo"
+    assert effective_mode("auto", "mixed") == "skip"
+
+
+def test_effective_mode_unknown_falls_back_to_auto() -> None:
+    assert effective_mode("redo", "unknown") == "auto"
+
+
+def test_effective_mode_rejects_invalid_inputs() -> None:
+    with pytest.raises(ValueError):
+        effective_mode("turbo", "scanned")
+    with pytest.raises(ValueError):
+        effective_mode("redo", "alien")
+    with pytest.raises(ValueError):
+        effective_mode("redo", "mixed", mixed_mode="turbo")
+
+
+def test_has_visible_text_content_distinguishes_digital_born(tmp_path: Path) -> None:
+    """Visible native text -> True; a page that is one big scan image -> False."""
+    import fitz
+
+    born = tmp_path / "born.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    for line in range(20):
+        page.insert_text((72, 72 + line * 20), "Visible native text on the page. " * 4)
+    doc.save(born)
+    doc.close()
+    assert has_visible_text_content(born) is True
+
+    src = fitz.open()
+    s = src.new_page(width=595, height=842)
+    for line in range(20):
+        s.insert_text((72, 72 + line * 20), "Baked-in scan content. " * 4)
+    pix = s.get_pixmap(dpi=150)
+    scan = tmp_path / "scan.pdf"
+    out = fitz.open()
+    scan_page = out.new_page(width=595, height=842)
+    scan_page.insert_image(fitz.Rect(0, 0, 595, 842), pixmap=pix)
+    out.save(scan)
+    out.close()
+    src.close()
+    assert has_visible_text_content(scan) is False

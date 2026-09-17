@@ -270,6 +270,8 @@ class ChandraOcrEngine:
         produce_pdf: bool = False,
         output_pdf_path: Path | None = None,
         settings: Any = None,
+        provenance: Any = None,
+        force: bool = False,
     ) -> OcrResult:
         """OCR a document using Chandra.
 
@@ -283,6 +285,14 @@ class ChandraOcrEngine:
                 (paperless parity; see doc/OCR_STRATEGY.md P2/P3). Without
                 it, the legacy two-pass flow (per-page Chandra for content,
                 plugin assembly for the archive) is used.
+            provenance: Optional :class:`~paperless_rearchive.ocr.provenance.PdfProvenance`
+                verdict for the original. When given, only the pages flagged
+                ``pages_needing_ocr`` are sent to Chandra and native pages
+                keep pdf-inspector's own markdown (content-only path), and an
+                archive run derives its effective ocrmypdf mode from the
+                verdict instead of the legacy document-level heuristics.
+            force: Bypass the provenance verdict and OCR every page (the
+                ``re-ocr-force`` modifier tag). Explicit operator override.
 
         Returns:
             OcrResult containing markdown, optionally PDF/A path, and error info.
@@ -291,7 +301,12 @@ class ChandraOcrEngine:
             raise ValueError("output_pdf_path is required when produce_pdf=True")
 
         if produce_pdf and settings is not None:
-            return self._ocr_document_ingest_pass(pdf_path, output_pdf_path, settings)
+            return self._ocr_document_ingest_pass(
+                pdf_path, output_pdf_path, settings, provenance=provenance, force=force
+            )
+
+        if provenance is not None and not produce_pdf:
+            return self._ocr_document_pages(pdf_path, provenance, force=force)
 
         # Render PDF pages to images
         images = self._render_pdf_pages(pdf_path)
@@ -440,11 +455,51 @@ class ChandraOcrEngine:
             pdf.save(pdf_path)
         log.info("Stamped model provenance into %s: %s", pdf_path.name, stamped)
 
+    def _resolve_ingest_mode(
+        self,
+        settings: Any,
+        pdf_path: Path,
+        provenance: Any,
+        force: bool,
+    ) -> str:
+        """Choose the ocrmypdf mode for an archive run (layer 2).
+
+        With a provenance verdict the mode is derived from the per-page
+        classification; without one (detection disabled, ``unknown``, or
+        non-PDF input) the legacy document-level heuristics apply, so
+        behaviour is unchanged.
+        """
+        from paperless_rearchive.ocr.ingest_args import (
+            effective_mode,
+            has_visible_text_content,
+            pdf_born_digital_text,
+            resolve_mode,
+        )
+
+        if force:
+            log.warning("forced OCR requested; ignoring the provenance verdict")
+            return "force"
+        kind = getattr(provenance, "kind", None)
+        if kind in ("text_based", "scanned", "mixed"):
+            return effective_mode(
+                settings.ocr_mode,
+                kind,
+                mixed_mode=settings.ocr_mixed_mode,
+            )
+        return resolve_mode(
+            settings.ocr_mode,
+            pdf_has_text=pdf_born_digital_text(pdf_path),
+            pdf_is_digital_born=has_visible_text_content(pdf_path),
+        )
+
     def _ocr_document_ingest_pass(
         self,
         pdf_path: Path,
         output_pdf_path: Path,
         settings: Any,
+        *,
+        provenance: Any = None,
+        force: bool = False,
     ) -> OcrResult:
         """Single ingest-identical ocrmypdf pass: PDF/A + markdown sidecar.
 
@@ -468,9 +523,7 @@ class ChandraOcrEngine:
         from paperless_rearchive.ocr.ingest_args import (
             build_ocrmypdf_args,
             extract_pdf_text,
-            pdf_born_digital_text,
             post_process_text,
-            resolve_mode,
             sidecar_content,
         )
 
@@ -485,10 +538,7 @@ class ChandraOcrEngine:
         if effective_pages > 0 and effective_pages > total_pages:
             effective_pages = total_pages
 
-        resolved_mode = resolve_mode(
-            settings.ocr_mode,
-            pdf_has_text=pdf_born_digital_text(pdf_path),
-        )
+        resolved_mode = self._resolve_ingest_mode(settings, pdf_path, provenance, force)
         sidecar = output_pdf_path.parent / "archive-sidecar.txt"
 
         def _build(*, safe_fallback: bool) -> dict[str, Any]:
@@ -585,6 +635,112 @@ class ChandraOcrEngine:
             page_count=total_pages,
         )
 
+    def _ocr_document_pages(
+        self,
+        pdf_path: Path,
+        provenance: Any,
+        *,
+        force: bool = False,
+    ) -> OcrResult:
+        """Content-only OCR driven by a per-page provenance verdict.
+
+        Only pages in ``provenance.pages_needing_ocr`` (or every page under
+        ``force``) are sent to Chandra; native pages keep pdf-inspector's
+        markdown (falling back to PyMuPDF text extraction), so born-digital
+        pages of a mixed document are never handed to the LLM.
+        """
+        import fitz  # PyMuPDF
+
+        doc = fitz.open(pdf_path)
+        parts: list[str] = [""] * len(doc)
+        error_pages: list[int] = []
+        errors: list[str] = []
+        try:
+            total_pages = len(doc)
+            cap = self.max_pages
+            needed = (
+                set(range(1, total_pages + 1))
+                if force
+                else set(provenance.pages_needing_ocr)
+            )
+            skipped = sorted(p for p in needed if cap > 0 and p > cap)
+            needed -= set(skipped)
+
+            log.info(
+                "Provenance-driven content OCR: %d page(s) total, %d to OCR, "
+                "%d native%s, dpi=%d",
+                total_pages,
+                len(needed),
+                total_pages - len(needed),
+                " (forced)" if force else "",
+                self.dpi,
+            )
+
+            native_count = 0
+            for page_num in range(1, total_pages + 1):
+                page = doc[page_num - 1]
+                if page_num not in needed:
+                    markdown = provenance.native_markdown.get(page_num, "")
+                    if not markdown.strip():
+                        markdown = (page.get_text() or "").strip()
+                    if markdown.strip():
+                        native_count += 1
+                    parts[page_num - 1] = markdown
+                    continue
+
+                image = self._render_page_image(page)
+                if image is None:
+                    log.debug("Page %d: blank, nothing to OCR", page_num)
+                    continue
+                try:
+                    markdown = self._ocr_page(image, page_num, total_pages)
+                except ChandraClientError:
+                    # Transient server failure: abort so the poller retries.
+                    raise
+                except Exception as e:  # noqa: BLE001 - page-level failure
+                    log.warning("OCR failed on page %d: %s", page_num, e)
+                    markdown = ""
+                if (markdown or "").strip():
+                    parts[page_num - 1] = markdown
+                else:
+                    error_pages.append(page_num)
+                    errors.append(f"Page {page_num}: no OCR result")
+
+            if skipped:
+                error_pages = sorted(set(error_pages) | set(skipped))
+                errors.append(
+                    f"Skipped {len(skipped)} page(s) beyond REARCHIVE_MAX_PAGES={cap}"
+                )
+
+            log.info(
+                "Provenance-driven content OCR done: %d page(s) OCR'd, %d kept "
+                "native, %d error(s)",
+                len(needed),
+                native_count,
+                len(error_pages),
+            )
+        finally:
+            doc.close()
+
+        return OcrResult(
+            markdown="\n\n".join(parts),
+            pdf_path=None,
+            page_count=len(parts),
+            error_pages=error_pages,
+            errors=errors,
+        )
+
+    def _render_page_image(self, page: Any) -> Any:
+        """Render one PyMuPDF page to a PIL Image, or None when blank."""
+        import fitz  # PyMuPDF
+        from PIL import Image
+
+        if not page.get_text().strip() and not page.get_images():
+            return None
+        zoom = self.dpi / 72.0
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+        return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
     def _render_pdf_pages(self, pdf_path: Path) -> list[Any]:
         """Render PDF pages to PIL Images using PyMuPDF.
 
@@ -592,7 +748,7 @@ class ChandraOcrEngine:
             pdf_path: Path to the PDF file.
 
         Returns:
-            List of PIL Images, one per page.
+            List of PIL Images, one per page (blank pages skipped).
         """
         import fitz  # PyMuPDF
 
@@ -600,20 +756,11 @@ class ChandraOcrEngine:
         try:
             doc = fitz.open(pdf_path)
             for page_num in range(len(doc)):
-                page = doc[page_num]
-                # Check if page has content
-                if not page.get_text().strip() and not page.get_images():
+                image = self._render_page_image(doc[page_num])
+                if image is None:
                     log.debug("Skipping blank page %d", page_num + 1)
                     continue
-
-                # Render page to image at the configured DPI
-                zoom = self.dpi / 72.0
-                mat = fitz.Matrix(zoom, zoom)
-                pix = page.get_pixmap(matrix=mat)
-                from PIL import Image
-
-                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                images.append(img)
+                images.append(image)
             doc.close()
         except Exception as e:
             log.error("Failed to render PDF pages: %s", e)

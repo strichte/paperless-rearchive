@@ -40,7 +40,12 @@ PDF_TEXT_MIN_LENGTH = 50
 _OCRMYPDF_PLUGIN_MODULE = "paperless_chandra.ocrmypdf_plugin"
 
 _LEGACY_MODE_MAP = {"skip": "auto", "skip_noarchive": "auto"}
-_VALID_MODES = {"auto", "force", "redo", "off"}
+#: ``skip`` is an explicit ``skip_text`` mode (OCR only textless pages, keep
+#: every existing text layer). It is distinct from ``auto``, which only
+#: applies ``skip_text`` when the caller knows text is present.
+_VALID_MODES = {"auto", "force", "redo", "off", "skip"}
+_VALID_PROVENANCE = {"text_based", "scanned", "mixed", "unknown"}
+_VALID_MIXED_MODES = {"skip", "redo", "force"}
 
 
 def post_process_text(text: str | None) -> str | None:
@@ -102,27 +107,148 @@ def is_born_digital_text(text: str | None, path: Path) -> bool:
     return is_tagged_pdf(path) or len(text) > PDF_TEXT_MIN_LENGTH
 
 
+def has_visible_text_content(path: Path) -> bool:
+    """Check if PDF has visible text as primary content (digital-born) vs invisible
+    OCR overlay on scanned images.
+
+    Digitally-born PDFs have text as the primary visual content with small images
+    (logos, icons). Scanned OCR'd PDFs have large scan images with invisible text
+    overlay for searchability.
+
+    Returns True when the PDF is likely digital-born and should not be OCR'd.
+    """
+    try:
+        import fitz
+    except ImportError:
+        # If PyMuPDF not available, fall back to basic text-only check
+        return False
+
+    try:
+        doc = fitz.open(path)
+        page = doc[0]
+        td = page.get_text('dict')
+
+        page_w = page.rect.width
+        page_h = page.rect.height
+        page_area = page_w * page_h
+
+        text_area = 0.0
+        img_area = 0.0
+        max_img_dim = 0
+
+        for block in td['blocks']:
+            bbox = fitz.Rect(block['bbox'])
+            if block['type'] == 0:  # text
+                text_area += bbox.width * bbox.height
+            elif block['type'] == 1:  # image
+                img_area += bbox.width * bbox.height
+                max_img_dim = max(max_img_dim, bbox.width, bbox.height)
+
+        doc.close()
+
+        text_pct = (text_area / page_area * 100) if page_area > 0 else 0
+        img_pct = (img_area / page_area * 100) if page_area > 0 else 0
+
+        # Digital-born heuristic:
+        # - Text covers reasonable portion of page (>=5%)
+        # - Images don't dominate (<50% of page)
+        # - No single image covering most of page (max dimension < 80% of page)
+        is_digital = (
+            text_pct >= 5 and
+            img_pct < 50 and
+            max_img_dim < max(page_w, page_h) * 0.8
+        )
+
+        return is_digital
+    except Exception:
+        # If analysis fails, don't assume digital-born
+        return False
+
+
 def pdf_born_digital_text(path: Path) -> bool:
     """Extract + normalise text from *path*, then apply the born-digital rule."""
     return is_born_digital_text(post_process_text(extract_pdf_text(path)), path)
 
 
-def resolve_mode(mode: str, *, pdf_has_text: bool) -> str:
+def resolve_mode(mode: str, *, pdf_has_text: bool, pdf_is_digital_born: bool = False) -> str:
     """Map REARCHIVE_OCR_MODE onto an effective ocrmypdf mode.
 
     Legacy ``skip``/``skip_noarchive`` map to ``auto`` (as paperless does).
-    ``auto`` upgrades to ``redo`` on text-bearing PDFs (see module docstring).
+    ``auto`` typically upgrades to ``redo`` on text-bearing PDFs, but skips
+    OCR entirely (``off``) when the PDF is digital-born with visible text.
+
+    The ``pdf_is_digital_born`` parameter should be True when the PDF has
+    visible text as primary content (e.g., created by wkhtmltopdf, Word, etc.)
+    rather than invisible OCR overlay on scanned images.
     """
     mode = _LEGACY_MODE_MAP.get(mode, mode)
     if mode not in _VALID_MODES:
         raise ValueError(f"Invalid OCR mode: {mode!r} (expected one of {sorted(_VALID_MODES)})")
     if mode == "auto" and pdf_has_text:
+        if pdf_is_digital_born:
+            log.info(
+                "mode=auto and PDF is digital-born (visible text, not OCR overlay); "
+                "skipping OCR (mode=off) to preserve existing text layer"
+            )
+            return "off"
         log.info(
             "mode=auto but the PDF already has a text layer; upgrading to "
             "redo (a re-OCR run must re-OCR; use mode=off for PDF/A-conversion-only)"
         )
         return "redo"
     return mode
+
+
+def effective_mode(
+    mode: str,
+    provenance_kind: str,
+    *,
+    mixed_mode: str = "skip",
+) -> str:
+    """Map the configured mode + a provenance verdict onto an ocrmypdf mode.
+
+    Layer 2 of the OCR strategy: the provenance gate decides *which pages*
+    are OCR candidates (layer 1, ``ocr/provenance.py``); this decides how an
+    existing text layer is treated on them.
+
+    Rules:
+
+    * ``force``/``off`` are explicit operator overrides and pass through.
+    * ``text_based`` (no page needs OCR) -> ``off`` (no OCR at all; callers
+      normally skip the archive pass entirely).
+    * ``scanned`` -> ``redo`` for ``redo``, otherwise the configured mode
+      (``auto`` keeps ocrmypdf's default, so deskew still applies).
+    * ``mixed`` -> ``mixed_mode`` for ``redo`` (ocrmypdf applies one mode per
+      file and ``redo`` would strip the native pages), otherwise an explicit
+      ``skip`` (``skip_text``): native pages keep their text, textless pages
+      are OCR'd.
+    * ``unknown`` -> ``auto`` (mode-driven fallback; callers use
+      :func:`resolve_mode` instead when they need the legacy heuristics).
+    """
+    mode = _LEGACY_MODE_MAP.get(mode, mode)
+    if mode not in _VALID_MODES:
+        raise ValueError(f"Invalid OCR mode: {mode!r} (expected one of {sorted(_VALID_MODES)})")
+    kind = (provenance_kind or "unknown").lower()
+    if kind not in _VALID_PROVENANCE:
+        raise ValueError(f"Invalid provenance kind: {provenance_kind!r}")
+    if mixed_mode not in _VALID_MIXED_MODES:
+        raise ValueError(f"Invalid mixed mode: {mixed_mode!r} (expected one of {sorted(_VALID_MIXED_MODES)})")
+
+    if mode in ("force", "off"):
+        return mode
+    if kind == "text_based":
+        return "off"
+    if kind == "scanned":
+        return "redo" if mode == "redo" else "auto"
+    if kind == "mixed":
+        if mode == "redo":
+            log.info(
+                "mixed provenance: redo would strip the native pages; "
+                "using %r (REARCHIVE_OCR_MIXED_MODE)", mixed_mode
+            )
+            return mixed_mode
+        return "skip"
+    return "auto"
 
 
 def build_ocrmypdf_args(
@@ -182,7 +308,9 @@ def build_ocrmypdf_args(
         ocrmypdf_args["force_ocr"] = True
     elif mode == "redo":
         ocrmypdf_args["redo_ocr"] = True
-    elif mode == "off":
+    elif mode in ("off", "skip"):
+        # ``skip`` is an explicit ``skip_text``: pages that already have a
+        # text layer are left alone, textless pages are OCR'd.
         ocrmypdf_args["skip_text"] = True
     elif mode == "auto":
         pass

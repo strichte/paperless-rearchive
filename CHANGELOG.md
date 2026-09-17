@@ -7,6 +7,31 @@ patch).
 
 ## Unreleased
 
+### Added
+- Born-digital provenance gate (pdf-inspector, per page): a PDF original is
+  classified as `text_based`, `scanned`, or `mixed` before any OCR run. A
+  born-digital document is left completely untouched (content and archive)
+  and tagged `re-ocr-preserved`; a mixed document is OCR'd only on the pages
+  that need it.
+- `re-ocr-force` modifier tag (configurable via `REARCHIVE_FORCE_TAG`):
+  placed next to a trigger, it bypasses the provenance gate and forces OCR of
+  every page for that document only.
+- New settings: `REARCHIVE_PDF_PROVENANCE`, `REARCHIVE_SKIP_BORN_DIGITAL`,
+  `REARCHIVE_PRESERVED_TAG`, `REARCHIVE_OCR_MIXED_MODE`,
+  `REARCHIVE_PROVENANCE_MAX_PAGES`, `REARCHIVE_FORCE_TAG`.
+- Explicit `skip` value for `REARCHIVE_OCR_MODE` (ocrmypdf `--skip-text`).
+- `inspect_pdf.py --decide` reports the sidecar's gate decision.
+
+### Fixed
+- `re-ocr-all` could mangle born-digital PDFs: the default `redo` mode
+  stripped their native text layer and replaced it with Chandra output.
+- `_finish()` logged `extra_tags` but never added them to the document.
+
+### Changed
+- OCR strategy is now two layers: provenance (which pages need OCR) and mode
+  (how existing text on those pages is treated). `auto` no longer silently
+  upgrades to `redo`; mixed documents use `--skip-text`.
+
 ## 0.1.0 — 2026-09-17
 
 First public release. Tag-driven re-OCR sidecar for paperless-ngx: re-OCR

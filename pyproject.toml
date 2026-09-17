@@ -16,6 +16,10 @@ dependencies = [
     "pillow>=10",
     "ocrmypdf>=17.4",
     "PyMuPDF>=1.24",
+    # Per-page born-digital vs scanned detection (layer 1 of the OCR
+    # strategy). Ships an abi3 manylinux wheel, so it installs on the
+    # python:3.14-slim image without a build toolchain.
+    "pdf-inspector>=1.20",
 ]
 
 [project.optional-dependencies]
@@ -33,6 +37,7 @@ dev = [
 
 [project.scripts]
 paperless-rearchive = "paperless_rearchive.poller:main"
+restore_backup = "paperless_rearchive.restore:main"
 
 [tool.setuptools.packages.find]
 include = ["paperless_rearchive*"]

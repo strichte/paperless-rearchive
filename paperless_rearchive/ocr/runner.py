@@ -17,6 +17,8 @@ import mimetypes
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from paperless_rearchive.ocr.ingest_args import has_visible_text_content
+
 if TYPE_CHECKING:
     from paperless_rearchive.config import Settings
     from paperless_rearchive.ocr.base import OcrProviderPlugin
@@ -173,25 +175,40 @@ def _env_ocr_mode(settings: Settings) -> str:
 _MODE_FLAGS = {"force": "force_ocr", "redo": "redo_ocr", "skip_text": "skip_text"}
 
 
-def select_ocr_strategy(ocr_mode: str, input_file: Path, mime_type: str) -> str:
-    """Pick the ocrmypdf mode flag: ``force``, ``redo`` or ``skip_text``.
+def select_ocr_strategy(
+    ocr_mode: str,
+    input_file: Path,
+    mime_type: str,
+    *,
+    pdf_is_digital_born: bool | None = None,
+) -> str:
+    """Pick the ocrmypdf mode flag: ``force``, ``redo``, ``skip_text`` or ``off``.
 
     ``redo`` swaps the invisible text layer for the new one and leaves the page
     images untouched, so the archive keeps its original size. ``force``
     rasterises every page - needed for text baked into the page content, but it
     re-renders the scan (measured: 616 KiB -> 4.6 MiB on a 72 dpi test scan).
     ``skip_text`` OCRs only the pages that carry no text layer at all.
+    ``off`` skips OCR entirely - used for digital-born PDFs with visible text.
 
-    ``auto`` therefore means "replace the OCR text layer in place when the PDF
-    has one, otherwise OCR the bare pages" - it never rasterises. Note that
-    ocrmypdf rejects ``--redo-ocr`` combined with ``--deskew``; the caller
-    drops deskew in that case (see :func:`build_ocrmypdf_args`).
+    ``auto`` means:
+    - Digital-born PDF (visible text, not OCR overlay): ``off`` (preserve text)
+    - PDF with OCR'd text layer: ``redo`` (replace the OCR)
+    - PDF without text layer: ``skip_text`` (OCR the bare pages)
+
+    Note that ocrmypdf rejects ``--redo-ocr`` combined with ``--deskew``; the
+    caller drops deskew in that case (see :func:`build_ocrmypdf_args`).
     """
+    if pdf_is_digital_born is None:
+        pdf_is_digital_born = False
+
     if ocr_mode == "force":
         return "force"
     if ocr_mode == "redo":
         return "redo"
     if mime_type.startswith("application/pdf") and has_text_layer(input_file):
+        if pdf_is_digital_born:
+            return "off"
         return "redo"
     return "skip_text"
 
@@ -209,7 +226,8 @@ def build_ocrmypdf_args(
 
     Mode resolution (``REARCHIVE_OCR_MODE``):
     * ``auto`` (default): ``redo_ocr`` when the input already has a text layer
-      (replaces it, keeps the page images -> archive size stays put),
+      and is not digital-born (replaces it, keeps the page images -> archive
+      size stays put); ``off`` when the PDF is digital-born with visible text;
       ``skip_text`` otherwise.
     * ``force``: always ``force_ocr`` - rasterises every page, so expect a much
       larger archive. Only worth it when the text cannot be redone.
@@ -217,7 +235,14 @@ def build_ocrmypdf_args(
     """
     mime_type = guess_mime_type(input_file)
     ocr_mode = _env_ocr_mode(settings)
-    strategy = select_ocr_strategy(ocr_mode, input_file, mime_type)
+    pdf_is_digital_born = (
+        has_visible_text_content(input_file)
+        if mime_type.startswith("application/pdf")
+        else False
+    )
+    strategy = select_ocr_strategy(
+        ocr_mode, input_file, mime_type, pdf_is_digital_born=pdf_is_digital_born
+    )
     args: dict[str, Any] = {
         "input_file_or_options": input_file,
         "output_file": output_file,

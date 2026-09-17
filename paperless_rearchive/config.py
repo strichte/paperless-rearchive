@@ -22,6 +22,16 @@ def _env_bool(name: str, default: bool) -> bool:
     return _env(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_optional(name: str, default: str) -> str:
+    """Like :func:`_env`, but an explicitly empty value is honoured.
+
+    Used for knobs that are *disabled* by setting them empty (e.g.
+    ``REARCHIVE_PRESERVED_TAG``, ``REARCHIVE_FORCE_TAG``).
+    """
+    value = os.environ.get(name)
+    return default if value is None else value
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(_env(name, str(default)))
@@ -81,7 +91,7 @@ class Settings:
 
     provider_name: str
     ocr_language: str
-    ocr_mode: str  # auto | force | redo | off
+    ocr_mode: str  # auto | force | redo | off | skip
     ocr_clean: str  # clean | final | none
     ocr_deskew: bool
     ocr_rotate: bool
@@ -92,6 +102,24 @@ class Settings:
     ocr_output_type: str
     ocr_user_args: dict[str, object]
     archive_for_images: bool
+
+    #: Provenance gate (layer 1 of the OCR strategy):
+    #: ``auto`` classifies each original with pdf-inspector; ``off`` keeps the
+    #: legacy mode-driven behaviour.
+    pdf_provenance: str  # auto | off
+    #: When True, born-digital originals are left untouched (content and
+    #: archive) instead of being re-OCR'd.
+    skip_born_digital: bool
+    #: Extra tag added when native text was preserved ("" disables).
+    preserved_tag: str
+    #: ocrmypdf mode for mixed-provenance archive runs (ocrmypdf applies one
+    #: mode per file, so ``redo`` would strip the born-digital pages).
+    ocr_mixed_mode: str  # skip | redo | force
+    #: Pages inspected by the provenance classifier (0 = all).
+    provenance_max_pages: int
+    #: Modifier tag that bypasses the provenance gate and forces OCR
+    #: ("" disables).
+    force_tag: str
 
     write_provenance: bool
 
@@ -136,6 +164,16 @@ class Settings:
             raise ValueError(
                 f"REARCHIVE_BACKUP_DIRECTORY {self.backup_dir} exists but is "
                 "not a directory."
+            )
+        if self.pdf_provenance not in ("auto", "off"):
+            raise ValueError(
+                f"REARCHIVE_PDF_PROVENANCE must be 'auto' or 'off', "
+                f"got {self.pdf_provenance!r}"
+            )
+        if self.ocr_mixed_mode not in ("skip", "redo", "force"):
+            raise ValueError(
+                f"REARCHIVE_OCR_MIXED_MODE must be 'skip', 'redo' or 'force', "
+                f"got {self.ocr_mixed_mode!r}"
             )
 
     def prepare_backup_dir(self) -> None:
@@ -231,6 +269,12 @@ class Settings:
             ocr_output_type=_env("REARCHIVE_OCR_OUTPUT_TYPE", "pdfa"),
             ocr_user_args=user_args,
             archive_for_images=_env_bool("REARCHIVE_ARCHIVE_FOR_IMAGES", False),
+            pdf_provenance=_env("REARCHIVE_PDF_PROVENANCE", "auto").strip().lower(),
+            skip_born_digital=_env_bool("REARCHIVE_SKIP_BORN_DIGITAL", True),
+            preserved_tag=_env_optional("REARCHIVE_PRESERVED_TAG", "re-ocr-preserved").strip(),
+            ocr_mixed_mode=_env("REARCHIVE_OCR_MIXED_MODE", "skip").strip().lower(),
+            provenance_max_pages=_env_int("REARCHIVE_PROVENANCE_MAX_PAGES", 0),
+            force_tag=_env_optional("REARCHIVE_FORCE_TAG", "re-ocr-force").strip(),
             write_provenance=_env_bool("REARCHIVE_WRITE_PROVENANCE", True),
             poll_interval=float(_env("REARCHIVE_POLL_INTERVAL", "300")),
             batch_limit=_env_int("REARCHIVE_BATCH_LIMIT", 5),

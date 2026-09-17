@@ -84,8 +84,9 @@ fetched with the `paperless-ngx` API.
 
 | Tag | Effect |
 | --- | --- |
-| `re-ocr-content` | Re-OCR run; the `content` field is replaced with the OCR output (markdown). No archive, no database access. |
-| `re-ocr-all` | As above, **plus** the archive version is regenerated (same ocrmypdf pipeline as paperless ingest, Chandra as the OCR engine), atomically replacing the file in `media/documents/archive/` and updating `documents_document.archive_checksum` in the database. |
+| `re-ocr-content` | Re-OCR run; the `content` field is replaced with the OCR output (markdown). No archive, no database access. Born-digital and native pages of mixed documents are left untouched (see [OCR strategy](#ocr-strategy-what-happens-to-pdfs-that-already-have-text)). |
+| `re-ocr-all` | As above, **plus** the archive version is regenerated (same ocrmypdf pipeline as paperless ingest, Chandra as the OCR engine), atomically replacing the file in `media/documents/archive/` and updating `documents_document.archive_checksum` in the database. A born-digital document is left completely untouched. |
+| `re-ocr-force` | **Modifier**, not a trigger: add it next to one of the above to bypass born-digital detection and force OCR of every page. Never auto-created. |
 
 After processing, the trigger tag is removed and replaced with an outcome tag:
 
@@ -93,6 +94,11 @@ After processing, the trigger tag is removed and replaced with an outcome tag:
 | --- | --- | --- |
 | Success | `re-ocr-content-success` | `re-ocr-all-success` |
 | Failure | `re-ocr-content-failure` | `re-ocr-all-failure` |
+
+Additional tags: a born-digital document that was preserved gets `re-ocr-preserved` alongside
+`-success`; a document whose provenance could not be determined gets `re-ocr-detection-unknown`
+and is then processed with the configured mode (never failed). Partial OCR in content mode adds
+`re-ocr-page-errors`.
 
 A trigger tag is only replaced when the pipeline reached a decision; transient upstream errors
 (OCR server unreachable, network hiccup) leave the trigger tag in place for the next poll cycle —
@@ -114,8 +120,12 @@ poller](#manual-trigger-sighup)).
   [Backup directory](#backup-directory)).
 - The archive is only replaced after verifying that the on-disk archive checksum still matches
   `documents_document.archive_checksum` (no concurrent modification).
-- Born-digital PDFs without an archive version, and non-PDF originals (images), are handled in
-  content-only mode — they have no archive file that could be regenerated in place.
+- **Born-digital PDFs are never re-OCR'd.** The immutable original is classified page by page
+  (pdf-inspector) before any OCR run; if every page carries native text, content and archive are
+  left exactly as they are and the document is tagged `re-ocr-preserved` for review. Mixed
+  documents are OCR'd only on the pages that actually need it.
+- Non-PDF originals (images) are handled in content-only mode — they have no archive file that
+  could be regenerated in place.
 - `REARCHIVE_DRY_RUN=true` performs the full OCR run and reports what *would* be written without
   touching paperless, the archives directory, or the database.
 
@@ -141,15 +151,55 @@ for the full story; the short version:
 paperless-ngx additionally defines `auto` (pick skip/redo sensibly per page) and `off`
 (PDF/A conversion only, no OCR).
 
-`REARCHIVE_OCR_MODE` maps onto this (default **`redo`** — this is a re-OCR tool, after all):
+### Layer 1: provenance first (born-digital detection)
 
-| `REARCHIVE_OCR_MODE` | ocrmypdf behaviour | Archive size |
+Before any OCR decision, the sidecar classifies the **immutable original** page by page with
+[pdf-inspector](https://github.com/firecrawl/pdf-inspector). Each page is either:
+
+- **native** — visible, real text drawn by the producing application (Word, wkhtmltopdf, LaTeX,
+  a bank's PDF generator…). Never OCR'd: the text *is* the content, and a vision LLM asked to
+  "read" it tends to describe the layout instead.
+- **an OCR candidate** — no text at all, or only an invisible OCR overlay on a scan.
+
+The document aggregates to `text_based`, `scanned`, or `mixed`, which decides what happens:
+
+| provenance | `re-ocr-content` | `re-ocr-all` |
 | --- | --- | --- |
-| `redo` *(default)* | Always `--redo-ocr`: old text layer replaced, page images untouched. | ≈ unchanged |
-| `auto` | Ingest semantics: OCRs only textless pages (`--skip-text`)… **except** that a PDF which already has a text layer is *upgraded to `redo`* — plain ingest semantics would make `auto` a no-op on exactly the documents this tool exists to process. | ≈ unchanged |
-| `force` | Always `--force-ocr`: every page is re-rasterised. | **much larger** |
-| `off` | No OCR at all: PDF/A conversion only (keeps whatever text layer exists). | ≈ unchanged |
-| `skip`, `skip_noarchive` | Accepted for compatibility with old paperless values; treated as `auto`. | — |
+| `text_based` (all pages native) | content left untouched — no OCR run | archive left untouched — no ocrmypdf pass |
+| `scanned` (all pages OCR candidates) | Chandra OCRs every page | `--redo-ocr` (or `force`/`off` per mode); archive replaced |
+| `mixed` (some of each) | Chandra OCRs only the scan pages; native pages keep their own text | `--skip-text`: native pages keep their text, textless pages get OCR |
+
+A preserved document is tagged `re-ocr-preserved` (alongside `-success`) and gets an audit note,
+so you can find and review what the gate skipped. This is what protects born-digital PDFs from
+being overwritten by a Chandra description of their own layout.
+
+### Layer 2: the ocrmypdf mode
+
+`REARCHIVE_OCR_MODE` is now applied **only to the pages layer 1 routed to OCR** (default
+`redo` — this is a re-OCR tool, after all):
+
+| `REARCHIVE_OCR_MODE` | ocrmypdf behaviour on OCR candidates | Archive size |
+| --- | --- | --- |
+| `redo` *(default)* | `--redo-ocr`: existing text layer replaced, page images untouched. On a `mixed` document this degrades to `skip` (see below). | ≈ unchanged |
+| `auto` | Ingest semantics: `--skip-text`; pages that already have text are kept. | ≈ unchanged |
+| `force` | `--force-ocr`: every page re-rasterised (provenance ignored). Prefer the `re-ocr-force` tag per document. | **much larger** |
+| `off` | No OCR at all: PDF/A conversion only. | ≈ unchanged |
+| `skip` | `--skip-text` explicitly: OCR only pages with no text. | ≈ unchanged |
+| `skip`, `skip_noarchive` | Legacy paperless aliases; treated as `auto`. | — |
+
+**Why mixed degrades to `skip`:** ocrmypdf applies *one* mode to the whole file. `--redo-ocr`
+would strip the text layer from the born-digital pages too — exactly the bug this section fixes.
+`--skip-text` is ocrmypdf's own per-page mode (OCR textless pages, leave the rest), so it is the
+only safe choice for mixed provenance. If a mixed document's *scan* pages carry an OCR layer you
+want re-done, add the `re-ocr-force` modifier tag (below).
+
+### Force, per document
+
+`re-ocr-force` is a **modifier tag**: add it next to a trigger (`re-ocr-all` + `re-ocr-force`) to
+bypass layer 1 and force `--force-ocr` for that document only. Use it for the rare false
+negative — a scan the classifier read as native, or a mixed document whose scan pages already
+have a text layer `--skip-text` won't touch. It is removed together with the trigger. Set
+`REARCHIVE_FORCE_TAG` empty to disable the modifier.
 
 OCR quality knobs (mirroring paperless's own settings):
 
@@ -347,7 +397,12 @@ services:
       REARCHIVE_MAX_PAGES: "0"             # 0 = all pages
       REARCHIVE_OCR_CONCURRENCY: "1"       # parallel pages (see reference)
       # --- OCR behaviour (mirrors PAPERLESS_OCR_*; see "OCR strategy") -------
-      REARCHIVE_OCR_MODE: "redo"           # redo | auto | force | off
+      REARCHIVE_OCR_MODE: "redo"           # redo | auto | force | off | skip
+      REARCHIVE_PDF_PROVENANCE: "auto"     # born-digital gate: auto | off
+      REARCHIVE_SKIP_BORN_DIGITAL: "true"  # never re-OCR born-digital PDFs
+      REARCHIVE_PRESERVED_TAG: "re-ocr-preserved"
+      REARCHIVE_OCR_MIXED_MODE: "skip"     # archive mode for mixed provenance
+      REARCHIVE_FORCE_TAG: "re-ocr-force"  # modifier tag: force OCR for one document
       REARCHIVE_OCR_CLEAN: "clean"         # clean | final | none
       REARCHIVE_OCR_DESKEW: "true"
       REARCHIVE_OCR_ROTATE_PAGES: "true"
@@ -522,7 +577,13 @@ block; the compose example above already lists all of them with defaults.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `REARCHIVE_PROVIDER` | `chandra` | OCR provider plugin. Only `chandra` exists today. |
-| `REARCHIVE_OCR_MODE` | `redo` | How existing text layers are treated — see [OCR strategy](#ocr-strategy-what-happens-to-pdfs-that-already-have-text). Values: `redo`, `auto`, `force`, `off` (legacy `skip`/`skip_noarchive` accepted as `auto`). |
+| `REARCHIVE_OCR_MODE` | `redo` | How existing text layers are treated **on the pages the provenance gate routed to OCR** — see [OCR strategy](#ocr-strategy-what-happens-to-pdfs-that-already-have-text). Values: `redo`, `auto`, `force`, `off`, `skip` (legacy `skip`/`skip_noarchive` accepted as `auto`). |
+| `REARCHIVE_PDF_PROVENANCE` | `auto` | Per-page born-digital detection (pdf-inspector): `auto` classifies each PDF original and decides which pages are OCR'd; `off` keeps the legacy mode-driven behaviour. |
+| `REARCHIVE_SKIP_BORN_DIGITAL` | `true` | `true`: a born-digital original is left untouched — no content PATCH, no ocrmypdf pass, no database access; it is tagged `re-ocr-preserved`. `false`: detect and annotate only, still OCR (quality A/B). |
+| `REARCHIVE_PRESERVED_TAG` | `re-ocr-preserved` | Tag added alongside `-success` when native text was preserved. Empty disables. |
+| `REARCHIVE_OCR_MIXED_MODE` | `skip` | ocrmypdf mode for mixed-provenance archive runs (`skip`/`redo`/`force`). `skip` = `--skip-text`, the only mode that keeps the native pages intact while OCR'ing the textless ones. |
+| `REARCHIVE_PROVENANCE_MAX_PAGES` | `0` | Pages inspected by the provenance classifier; `0` = all. |
+| `REARCHIVE_FORCE_TAG` | `re-ocr-force` | Modifier tag (never auto-created) added next to a trigger to bypass born-digital detection and force OCR of every page. Empty disables. |
 | `REARCHIVE_OCR_CLEAN` | `clean` | unpaper image cleaning before OCR: `clean` (pre-OCR), `final` (post-OCR; becomes pre-OCR under `redo`, as at ingest), `none`. |
 | `REARCHIVE_OCR_DESKEW` | `true` | Fix small skew (< 45°) before OCR. Silently skipped under `redo` mode (ocrmypdf constraint, same as paperless). |
 | `REARCHIVE_OCR_ROTATE_PAGES` | `true` | Fix 90/180/270° page orientation before OCR. Detection: Tesseract OSD, run locally by the Chandra engine plugin (ocrmypdf asks its OCR engine for orientation). |
@@ -634,6 +695,56 @@ check reports every backup in the media directory as an orphaned file:
 
 > `[WARNING] [paperless.sanity_checker] Orphaned file in media dir: …/documents/archive/….pdf.bak-…`
 
+## Restoring from backups (`restore_backup`)
+
+Every archive replacement leaves a `.bak-<timestamp>` copy in `REARCHIVE_BACKUP_DIRECTORY`.
+The `restore_backup` service script restores a document's archive file and/or `content` field
+from those backups. It is packaged with the sidecar image (a `restore_backup` console script)
+and runs inside the `paperless-rearchive` container, which already has the archive mount, the
+backup mount, the API token and the database credentials:
+
+```bash
+docker exec -it paperless-rearchive restore_backup [-a] [-c] [-f] [-v] DOC_ID|BACKUP [...]
+```
+
+| Flag | Effect |
+| --- | --- |
+| (none) | Restore **both** the archive file and the `content` field. |
+| `-a`, `--archive-only` | Restore only the archive file. |
+| `-c`, `--content-only` | Restore only the `content` field. |
+| `-f`, `--force` | Overwrite without asking for confirmation. |
+| `-v`, `--version` | Show paperless-rearchive's version and exit. |
+| `-h`, `--help` | Show help and exit. |
+
+Operands are one or more numeric document IDs or backup file names (basename,
+`<name>.pdf.bak-<stamp>`, or glob, matched recursively below
+`REARCHIVE_BACKUP_DIRECTORY`). The document is matched via the paperless database
+(`id` / `archive_filename`):
+
+```bash
+# restore both archive and content for document 3452
+docker exec -it paperless-rearchive restore_backup 3452
+
+# restore only the content field from an explicit backup version
+docker exec -it paperless-rearchive restore_backup -c \
+  '2024-12-14_Bali Ubud Villa Lora Confirmation_for_Booking_ID__1274639717.pdf.bak-20260917-080951'
+```
+
+If more than one backup exists for a document you are asked which version to use.
+Overwriting an archive file or a `content` field always asks for confirmation first,
+unless `-f` is given.
+
+How each part is restored:
+
+- **Archive:** the backup is copied over the live file under `/archives/<archive_filename>`
+  (staged + atomic replace), then `documents_document.archive_checksum` is updated to the
+  restored file's SHA-256 (the REST API cannot do either step).
+- **Content:** text is re-extracted from the *backed-up* archive with
+  `pdftotext -q -layout -enc UTF-8`, cleaned with the same `post_process_text()` normalisation
+  the paperless-ngx parser applies, and written back via `PATCH /api/documents/<id>/`.
+  Caveat: the restored content may still differ from the original `content` field, depending on
+  how OCR was configured in paperless-ngx at the time of ingestion.
+
 ## Status
 
 | Component | State |
@@ -641,6 +752,7 @@ check reports every backup in the media directory as an orphaned file:
 | Tag poller (SIGHUP wake, batching, error isolation) | ✅ done + verified live |
 | `paperless_api` client (original download, content PATCH, tag swap, notes, custom fields) | ✅ done + verified live |
 | Ingest-parity OCR: one ocrmypdf pass via the `paperless_chandra` plugin (archive + content) | ✅ done + verified live |
+| Born-digital provenance gate (pdf-inspector, per page) | ✅ done — unit-tested; live `--decide` verified (3452 preserved, 4221 OCR'd) |
 | Content-only fast path (per-page Chandra, `re-ocr-page-errors` tracking) | ✅ done + verified live |
 | Archive replacer (checksum verify, `.bak` backups, atomic replace, DB checksum update) | ✅ done + verified live |
 | Dockerfile (CPU-only; ghostscript/tesseract/unpaper/jbig2/pngquant) | ✅ done |

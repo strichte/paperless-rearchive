@@ -436,6 +436,12 @@ token, the Chandra key, and the database user/password.
 | `REARCHIVE_WRITE_PROVENANCE` | `true` | write OCR run provenance to custom fields (`OCR engine`, `OCR date`, `OCR pages`, `OCR archive ratio` for re-ocr-all) and append an audit note per run (`POST /api/documents/{id}/notes/`, also on failure); definitions auto-created once via API, skipped in dry-run |
 | `REARCHIVE_OCR_CONCURRENCY` | `1` | pages OCR'd concurrently per document (ThreadPoolExecutor around the blocking Chandra call). Default 1 = sequential. WARNING: local vision LLM = GPU bottleneck; >1 only piles competing requests onto the same GPU (higher per-page latency, timeout/OOM risk). Raise gradually, watch GPU. |
 | `REARCHIVE_MAX_PAGES` | `0` | max pages OCR'd per document; 0 = all pages, otherwise only the first N pages are processed (page_count still reports the total; skipped pages recorded in error_pages) |
+| `REARCHIVE_PDF_PROVENANCE` | `auto` | per-page born-digital detection (pdf-inspector): `auto` classifies each PDF original and routes pages to OCR; `off` keeps the legacy mode-driven behaviour. See §8 |
+| `REARCHIVE_SKIP_BORN_DIGITAL` | `true` | `true`: a born-digital original is left untouched (no content PATCH, no ocrmypdf pass, no DB access); `false`: detect + annotate only, still OCR |
+| `REARCHIVE_PRESERVED_TAG` | `re-ocr-preserved` | tag added alongside `-success` when native text was preserved; set empty to disable |
+| `REARCHIVE_OCR_MIXED_MODE` | `skip` | ocrmypdf mode for mixed-provenance archive runs (`skip`/`redo`/`force`); `skip` = `--skip-text`, the only mode that keeps native pages intact while OCR'ing textless ones |
+| `REARCHIVE_PROVENANCE_MAX_PAGES` | `0` | pages inspected by the provenance classifier; 0 = all |
+| `REARCHIVE_FORCE_TAG` | `re-ocr-force` | modifier tag (never auto-created) placed alongside a trigger to bypass the provenance gate and force OCR of every page; set empty to disable |
 | `REARCHIVE_DRY_RUN` | `false` | OCR + report only, no writes |
 | `REARCHIVE_RUN_ONCE` | `false` | single cycle then exit |
 | `REARCHIVE_LOG_LEVEL` | `INFO` | log level |
@@ -513,6 +519,17 @@ Secrets (already defined in `paperless-lxc/docker-compose.yml`): `chandra_api_ke
   unconditional (no skip option), and the replacer has a runtime backstop that refuses any backup
   destination resolving inside the archive directory.
 
+- ✅ **Resolved** — born-digital PDFs were mangled by `re-ocr-all` under the default
+  `REARCHIVE_OCR_MODE=redo` (incident 2026-09-18, doc 3452). See §8: a pdf-inspector
+  provenance gate now keeps native text and skips the document entirely.
+- ⬜ **Mixed-provenance archive divergence**: ocrmypdf applies one mode per file, so a mixed
+  document is archived with `--skip-text`; a "scanned" page that already carries an *untrusted*
+  OCR layer is therefore left as-is (pdf-inspector can flag it while ocrmypdf considers it
+  text-bearing). Mitigations: `re-ocr-force` modifier, or future split/redo/merge. See §8.9.
+- ⬜ **pdf-inspector dependency**: a ~15 MB `cp38-abi3-manylinux_2_17_x86_64` wheel (no build
+  toolchain, installs on `python:3.14-slim`); `classify_pdf` never raises and falls back to the
+  legacy heuristics if it is missing, but the fallback cannot see per-page detail.
+
 ### Phase 6 — Release engineering ✅
 
 - ✅ `CHANGELOG.md` (Keep a Changelog) seeded with the 0.1.0 release notes.
@@ -529,3 +546,150 @@ Secrets (already defined in `paperless-lxc/docker-compose.yml`): `chandra_api_ke
   parked runner setup remains at `/home/paperless/act-runner/` (not registered, not running).
 - ✅ `docker/Dockerfile`: `CHANDRA_REF` build-arg pins the paperless-chandra ref (closes the
   reproducibility risk above for release artifacts).
+
+## 8. Born-digital provenance gate (pdf-inspector)
+
+### 8.1 Incident 2026-09-18: `re-ocr-all` mangled a born-digital PDF
+
+Document 3452 (Agoda Bali voucher, `wkhtmltopdf 0.12.6`) is a born-digital PDF with a
+perfectly good native text layer. It was re-archived with `re-ocr-all`; the archive's
+`Creator` changed from `wkhtmltopdf 0.12.6` to `OCRmyPDF 17.7.1 / Chandra 0.2.0` and the
+content field became a Chandra *description of the layout* ("Two empty rectangular boxes
+stacked vertically…") instead of the text. Root cause: the only born-digital protection in
+the pipeline (`resolve_mode` + `has_visible_text_content` + `pdf_born_digital_text`) is
+consulted **only when `REARCHIVE_OCR_MODE=auto`**; the default `redo` strips and re-OCRs
+every page unconditionally. Re-OCR is the tool's purpose, so the gate must be independent
+of the mode.
+
+### 8.2 pdf-inspector evaluation (measured live, 1.20.0, `cp38-abi3` wheel)
+
+Probes run on this instance (doc originals/archives) and synthetic PDFs:
+
+| input | `detect_pdf` (document-level, ~2 ms) | `extract_pages_markdown` per-page `needs_ocr` (~7–25 ms) |
+| --- | --- | --- |
+| 3452 original (born-digital) | `text_based` 1.00, none | p1 native ok; markdown `## Booking Confirmation…` |
+| 3452 archive (after re-OCR) | `text_based` 1.00, none | p1 native ok |
+| 4221 original (raw scan, 8 pp) | `scanned` 0.95, all 8 | all 8 `needs_ocr`, reason=`scanned` |
+| 4221 archive (scan + invisible OCR layer) | **`text_based` 1.00, none — WRONG** | **all 8 `needs_ocr` — correct** |
+| synthetic 1 text + 1 image page (mixed) | **`image_based` 0.80, needs [1,2] — WRONG** | p1 native ok, p2 `needs_ocr` — correct |
+| synthetic image-only | `scanned` 0.95, all 1 | `needs_ocr`, reason=`scanned` |
+| synthetic image + invisible text overlay | `image_based` 0.80 | `needs_ocr`, reason=`scanned` — correct |
+
+Findings (these decide the design):
+
+- **Use `extract_pages_markdown`, not `detect_pdf`/`classify_pdf`, as the authoritative
+  signal.** The fast document-level classifier is fooled by an invisible OCR overlay
+  (calls an OCR'd scan "text-based") and misclassifies mixed documents. The per-page
+  `needs_ocr` correctly distinguishes native visible text from an OCR overlay in both cases.
+- `extract_pages_markdown` also returns **native markdown per page** (empty when
+  `needs_ocr` is true) — free, better-than-Chandra content for born-digital pages.
+- Index conventions differ: `PageMarkdown.page` is **0-indexed**, `pages_needing_ocr` on
+  `PagesExtractionResult` is **1-indexed** (as is `detect_pdf.pages_needing_ocr`;
+  `classify_pdf.pages_needing_ocr` is 0-indexed). `ocr/provenance.py` normalises
+  everything to 1-indexed page numbers internally.
+- All `pdf_inspector` entry points take **`str`** paths; a `PosixPath` raises `TypeError`.
+  Cost is ~2 ms (`detect_pdf`) / ~7–25 ms (`extract_pages_markdown`) per document, far
+  below one Chandra page (tens of seconds) — no meaningful bulk-run cost.
+- We do **not** use pdf-inspector's own OCR (`process_pdf_with_ocr`): Chandra stays the
+  OCR engine; pdf-inspector is used only for provenance + native text extraction.
+
+### 8.3 Decision: whole-document gate, per-page handling for mixed provenance
+
+- **Whole document is the primary gate.** For all-native-text (born-digital) and
+  all-scanned documents the aggregate verdict is unambiguous and cheap; this covers the
+  overwhelming majority of the corpus.
+- **Per page for mixed provenance.** When only some pages need OCR, native pages keep
+  their own text (content: pdf-inspector native markdown; archive: ocrmypdf `skip_text`,
+  which OCRs exactly the textless pages) and only the `needs_ocr` pages go to Chandra.
+- Aggregate rule: `pages_needing_ocr == ∅` → `text_based`; `== all` → `scanned`;
+  otherwise → `mixed`; detection error/unavailable → `unknown` (fall back to mode-driven
+  behaviour, loud warning + `re-ocr-detection-unknown` tag, never crash).
+
+### 8.4 Two-layer OCR strategy
+
+Layer 1 (**provenance**, per page) answers *does this page have trustworthy native text?*
+Layer 2 (**mode**, ocrmypdf) answers *for the pages routed to OCR, how is an existing text
+layer treated?* `REARCHIVE_OCR_MODE` becomes the layer-2 knob applied to OCR candidates
+only; it is no longer the top-level policy. Implemented as:
+
+- Layer 1: `paperless_rearchive/ocr/provenance.py` — `PdfProvenance` dataclass +
+  `classify_pdf(path, *, max_pages=0)`, wrapping `extract_pages_markdown(str(path))` and
+  aggregating per §8.3. Never raises; falls back to the historical heuristics
+  (`pdf_born_digital_text` + `has_visible_text_content`) and then to `unknown`.
+- Layer 2: `paperless_rearchive/ocr/ingest_args.py` — `effective_mode(mode, kind,
+  mixed_mode=...)` maps the configured mode + verdict onto an ocrmypdf mode, and the new
+  explicit `skip` mode (→ `skip_text`). The old `auto`→`redo` "deviation" is retired for
+  provenance-driven runs.
+
+### 8.5 Pipeline policy (implemented)
+
+| provenance | `re-ocr-content` | `re-ocr-all` |
+| --- | --- | --- |
+| `text_based` | **No Chandra, no PATCH** — content untouched; `-success` + `re-ocr-preserved` + audit note | **No re-OCR, no ocrmypdf pass, no DB access** — archive byte-identical; same tags |
+| `scanned` | Chandra every page (as before) | ocrmypdf `redo`/`force` per mode; archive replaced |
+| `mixed` | Chandra only `pages_needing_ocr`; native markdown for the rest; merged in page order | ocrmypdf **`skip_text`** (OCR only textless pages, native pages preserved); archive replaced; note records the split |
+| `unknown` | mode-driven fallback + `re-ocr-detection-unknown` | same |
+
+- `REARCHIVE_OCR_MODE=force`/`off` are explicit overrides and bypass the gate.
+- The gate never fails a document; escalation to `-failure` after 3 attempts is unchanged.
+- Unsure detection defaults to **skip** (non-destructive) and is tagged for review.
+
+### 8.6 `re-ocr-force`: an explicit per-document override
+
+A conservative gate will have false negatives (a scan the classifier reads as native, or a
+mixed document whose scan pages carry an untrusted OCR layer that `skip_text` will not
+touch). The modifier tag `REARCHIVE_FORCE_TAG` (default `re-ocr-force`) is placed
+*alongside* a trigger; the poller resolves it once per cycle, marks the document forced,
+and `_resolve_ingest_mode` returns `force` (rasterise + OCR everything). The modifier is
+removed together with the trigger (`DocumentContext.removal_tag_ids()`). It is never
+auto-created — the tag must already exist. This replaces reaching for the global
+`REARCHIVE_OCR_MODE=force` (which would rasterise the entire backlog).
+
+### 8.7 ocrmypdf mode-mapping fix (parity gap uncovered by this work)
+
+`build_ocrmypdf_args(mode="auto")` sets **no** flag; ocrmypdf then *errors* if any page
+already has text, and the generic `safe_fallback` retries with `force_ocr` — rasterising
+and mangling the native pages of a mixed document. Upstream
+`paperless_chandra.parser` passes `skip_text=True` for `AUTO` + text-present; our port
+dropped that parameter. The new explicit `skip` mode closes the gap, and provenance-driven
+runs never emit bare `auto` for a text-bearing PDF (mixed → `skip`).
+
+### 8.8 Implementation (Phase 7)
+
+- ✅ `pyproject.toml`: `pdf-inspector>=1.20` as a core dependency (abi3 wheel; no build
+  toolchain; installs on `python:3.14-slim`).
+- ✅ `ocr/provenance.py`: `PdfProvenance` + `classify_pdf()` + heuristic fallback.
+- ✅ `ocr/ingest_args.py`: `skip` mode (`skip_text`), `effective_mode()`.
+- ✅ `ocr/chandra_engine.py`: `ocr_document(..., provenance=, force=)`;
+  `_ocr_document_pages()` (content path OCRs only `pages_needing_ocr`, native pages keep
+  pdf-inspector markdown); `_resolve_ingest_mode()` (archive path).
+- ✅ `pipeline.py`: provenance gate after download; `_preserve_born_digital()` (born-digital
+  short-circuit before any DB/archive work); provenance added to the audit note;
+  `_finish()` now actually adds `extra_tags` (latent bug fixed).
+- ✅ `poller.py`: resolves the `re-ocr-force` modifier tag per cycle.
+- ✅ `config.py`: the six new settings (validated).
+- ✅ `tests/`: `test_provenance.py` (synthetic born-digital / scan / scan+invisible-overlay /
+  mixed / capped / fallback / garbage); `test_ingest_args.py` (`skip`, `effective_mode`);
+  `test_chandra_engine.py` (per-page content path, forced path, mode resolution);
+  `test_pipeline.py` (preserved / forced / scanned gate); `test_config.py`.
+- ✅ `tests/integration/inspect_pdf.py --decide`: prints the sidecar's gate decision.
+- ✅ README "OCR strategy" rewritten as the two-layer model (provenance + mode), `re-ocr-force`
+  modifier, new settings, updated guarantees/status.
+- ✅ Dry-run on doc 3452 (2026-09-18): `provenance=text_based` → preserved, no writes; live
+  `--decide` verified on 3452 (PRESERVE) and 4221 (OCR every page).
+- ⬜ A real **mixed** document still needs a dry run before mass use.
+
+### 8.9 Risks / open questions
+
+- ⬜ **Real mixed-provenance sample** still to be dry-run; the per-page rule is verified on
+  synthetic cases and the two known documents only.
+- ⬜ **Mixed archive divergence** (see §7): `--skip-text` leaves untrusted OCR layers on
+  scan pages untouched. Mitigation today: `re-ocr-force`. Future: split the original into
+  native and scan PDFs, `redo` the latter, merge with pikepdf.
+- ⬜ **Native markdown fidelity**: for mixed content runs, native pages are re-serialised
+  from pdf-inspector's markdown, which may differ from what paperless ingest stored.
+- ⬜ **Pre-OCR'd scan originals** (uploaded already OCR'd) are detected as `scanned` by the
+  per-page signal even though `detect_pdf` disagrees — regression-tested, but worth
+  watching on real documents.
+- ⬜ **Blank pages**: `_render_pdf_pages`/`_render_page_image` skip blank pages; the
+  provenance path iterates real page numbers so OCR-page selection cannot shift.

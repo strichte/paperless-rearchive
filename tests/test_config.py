@@ -109,3 +109,45 @@ def test_prepare_backup_dir_dry_run_does_not_create(tmp_path: Path) -> None:
     )
     s.prepare_backup_dir()
     assert not backup_dir.exists()
+
+
+# ── provenance gate settings ─────────────────────────────────────────────────
+
+
+def test_provenance_defaults() -> None:
+    s = _settings()
+    assert s.pdf_provenance == "auto"
+    assert s.skip_born_digital is True
+    assert s.preserved_tag == "re-ocr-preserved"
+    assert s.ocr_mixed_mode == "skip"
+    assert s.provenance_max_pages == 0
+    assert s.force_tag == "re-ocr-force"
+
+
+def test_provenance_settings_from_env() -> None:
+    s = _settings(
+        REARCHIVE_PDF_PROVENANCE="off",
+        REARCHIVE_SKIP_BORN_DIGITAL="false",
+        REARCHIVE_PRESERVED_TAG="",
+        REARCHIVE_OCR_MIXED_MODE="redo",
+        REARCHIVE_PROVENANCE_MAX_PAGES="3",
+        REARCHIVE_FORCE_TAG="re-ocr-hard",
+    )
+    assert s.pdf_provenance == "off"
+    assert s.skip_born_digital is False
+    assert s.preserved_tag == ""
+    assert s.ocr_mixed_mode == "redo"
+    assert s.provenance_max_pages == 3
+    assert s.force_tag == "re-ocr-hard"
+
+
+def test_validate_rejects_unknown_provenance_mode() -> None:
+    s = _settings(REARCHIVE_PDF_PROVENANCE="sometimes")
+    with pytest.raises(ValueError, match="REARCHIVE_PDF_PROVENANCE"):
+        s.validate()
+
+
+def test_validate_rejects_unknown_mixed_mode() -> None:
+    s = _settings(REARCHIVE_OCR_MIXED_MODE="turbo")
+    with pytest.raises(ValueError, match="REARCHIVE_OCR_MIXED_MODE"):
+        s.validate()

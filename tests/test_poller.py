@@ -112,6 +112,10 @@ class _FakeAPI:
     def ensure_tag(self, name: str) -> int:
         return {"re-ocr-content": 11, "re-ocr-all": 22}[name]
 
+    def tag_id(self, name: str) -> int | None:
+        # No ``re-ocr-force`` modifier tag exists in this fixture.
+        return None
+
     def doc_ids_with_tag(self, tag_id: int, limit: int) -> list[int]:
         if limit <= 0:
             return []

@@ -7,6 +7,8 @@
 # | Script | What it does |
 # | --- | --- |
 # | `check_archive_provenance.sh <rel_path>...` (or `--all [root] [--limit N]`) | Report which engine (Chandra vs Tesseract) produced an archive's text layer, from the PDF `Creator` metadata. Exit 1 if any archive was not written by Chandra or could not be verified - the P1 acceptance check (`doc/OCR_STRATEGY.md`). |
+# | `pdfinfo_compare.sh [-a | -o] <doc_id>...` | Full pdfinfo output: archive only with `-a`, original only with `-o`, both by default. Runs read-only via Postgres and the paperless container; no API token needed. |
+# | `inspect_pdf.py [--per-page] [--decide] <doc_id|file>...` | Classify PDFs with pdf-inspector. `--decide` additionally prints the sidecar's provenance gate decision (`PRESERVE` / `OCR every page` / mixed / unknown). |
 # | `check_download.py <doc_id>` | Verify `download_original()` returns the immutable original, not the archive (`?original=true`). |
 # | `check_tags.py` | Probe `/api/tags/` filter semantics (documents which query params work). |
 # | `diag_original.py <doc_id>` | Dump what the API serves for a document (original vs archive, text layer, mime). |

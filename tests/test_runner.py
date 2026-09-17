@@ -269,6 +269,20 @@ class TestSelectOcrStrategy:
         with patch("paperless_rearchive.ocr.runner.has_text_layer", return_value=True):
             assert select_ocr_strategy("auto", pdf, "application/pdf") == "redo"
 
+    def test_auto_with_text_layer_skips_digital_born(self, tmp_path: Path) -> None:
+        from paperless_rearchive.ocr.runner import select_ocr_strategy
+
+        pdf = tmp_path / "a.pdf"
+        pdf.write_bytes(b"%PDF-1.4\n")
+        # When pdf_is_digital_born=True is passed AND there's a text layer,
+        # the function should return "off" to skip OCR on digital-born PDFs
+        with patch(
+            "paperless_rearchive.ocr.runner.has_text_layer", return_value=True
+        ):
+            assert select_ocr_strategy(
+                "auto", pdf, "application/pdf", pdf_is_digital_born=True
+            ) == "off"
+
     def test_auto_non_pdf_uses_skip_text(self, tmp_path: Path) -> None:
         from paperless_rearchive.ocr.runner import select_ocr_strategy
 

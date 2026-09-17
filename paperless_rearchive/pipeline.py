@@ -33,6 +33,12 @@ from paperless_rearchive.archive.replacer import (
 )
 from paperless_rearchive.ocr.base import OcrProviderPlugin
 from paperless_rearchive.ocr.chandra_engine import ChandraOcrEngine, OcrResult
+from paperless_rearchive.ocr.provenance import (
+    TEXT_BASED,
+    UNKNOWN,
+    PdfProvenance,
+    classify_pdf,
+)
 
 
 def _format_size(size_bytes: int) -> str:
@@ -59,6 +65,18 @@ class DocumentContext:
     trigger_tag_name: str
     archive_mode: bool  # True: re-ocr-all, False: re-ocr-content only
     current_tags: list[int]
+    #: ``re-ocr-force`` modifier present: bypass the provenance gate and OCR
+    #: every page (explicit operator override).
+    force: bool = False
+    #: Id of the force modifier tag, removed together with the trigger.
+    force_tag_id: int | None = None
+
+    def removal_tag_ids(self) -> list[int]:
+        """Tags to strip when the trigger is swapped for an outcome tag."""
+        ids = [self.trigger_tag_id]
+        if self.force_tag_id is not None and self.force_tag_id not in ids:
+            ids.append(self.force_tag_id)
+        return ids
 
 
 def process_document(
@@ -89,6 +107,36 @@ def process_document(
         log.debug("Document %d: original file size=%d bytes, mime=%s",
                   ctx.doc_id, original.stat().st_size,
                   original.suffix.lower())
+
+        # Layer 1 of the OCR strategy: per-page provenance (born-digital vs
+        # scanned vs mixed). The verdict routes pages to OCR and, for a
+        # born-digital document, stops the run before anything is written.
+        provenance: PdfProvenance | None = None
+        if settings.pdf_provenance == "auto" and original.suffix.lower() == ".pdf":
+            provenance = classify_pdf(original, max_pages=settings.provenance_max_pages)
+            log.info(
+                "Document %d: provenance=%s%s",
+                ctx.doc_id,
+                provenance.summary(),
+                " (forced)" if ctx.force else "",
+            )
+            if ctx.force:
+                log.warning(
+                    "Document %d: modifier tag %r present - provenance gate "
+                    "bypassed, every page will be OCR'd",
+                    ctx.doc_id,
+                    settings.force_tag,
+                )
+            elif provenance.kind == TEXT_BASED and settings.skip_born_digital:
+                _preserve_born_digital(settings, api, ctx, provenance)
+                return
+            elif provenance.kind == UNKNOWN:
+                log.warning(
+                    "Document %d: provenance unknown - falling back to "
+                    "mode-driven behaviour (REARCHIVE_OCR_MODE=%s)",
+                    ctx.doc_id,
+                    settings.ocr_mode,
+                )
 
         do_archive = ctx.archive_mode
         archive_path: Path | None = None
@@ -197,6 +245,8 @@ def process_document(
             produce_pdf=produce_pdf,
             output_pdf_path=output_pdf_path,
             settings=settings,
+            provenance=provenance,
+            force=ctx.force,
         )
 
         log.info(
@@ -258,6 +308,13 @@ def process_document(
                 )
             except Exception:
                 log.exception("Could not add re-ocr-page-errors tag for document %d", ctx.doc_id)
+        if provenance is not None and provenance.kind == UNKNOWN:
+            try:
+                extra_tags.append(api.ensure_tag("re-ocr-detection-unknown"))
+            except Exception:
+                log.exception(
+                    "Could not add re-ocr-detection-unknown tag for document %d", ctx.doc_id
+                )
 
         size_ratio: float | None = None
         if result.pdf_path is not None and archive_path is not None:
@@ -345,6 +402,7 @@ def process_document(
             result,
             size_ratio=size_ratio,
             ocr_seconds=ocr_seconds,
+            provenance=provenance,
         )
 
         # Finish: swap trigger tag for outcome tag
@@ -354,7 +412,7 @@ def process_document(
             all_tags_to_add = [outcome_tag_id] + extra_tags
             api.set_tags(
                 ctx.doc_id,
-                remove=[ctx.trigger_tag_id],
+                remove=ctx.removal_tag_ids(),
                 add=all_tags_to_add,
                 current_tags=ctx.current_tags,
             )
@@ -419,6 +477,7 @@ def _write_provenance(
     *,
     size_ratio: float | None,
     ocr_seconds: float,
+    provenance: PdfProvenance | None = None,
 ) -> None:
     """Record OCR run provenance: custom fields (latest state wins) + audit note.
 
@@ -449,6 +508,8 @@ def _write_provenance(
         f"Engine: {provider.model_name}",
         f"Pages: {pages_value}",
     ]
+    if provenance is not None:
+        note_lines.append(f"Detected: {provenance.summary()}")
     if ctx.archive_mode and size_ratio is not None:
         note_lines.append(f"Archive size ratio: {size_ratio:.3f}")
     note_lines.append(f"OCR duration: {ocr_seconds:.1f}s")
@@ -502,6 +563,47 @@ def _write_audit_note(api: PaperlessAPI, ctx: DocumentContext, note: str) -> Non
         log.exception("Document %d: could not append audit note.", ctx.doc_id)
 
 
+def _preserve_born_digital(
+    settings: Settings,
+    api: PaperlessAPI,
+    ctx: DocumentContext,
+    provenance: PdfProvenance,
+) -> None:
+    """No-op outcome for a born-digital document: keep its native text.
+
+    Layer 1 of the OCR strategy: re-OCR'ing a PDF whose text is *visible,
+    native* content (wkhtmltopdf, Word, LaTeX, ...) destroys it - the LLM
+    describes the page layout instead of reading it. Nothing is written:
+    neither ``content`` nor the archive, and no database connection is
+    opened. The trigger is swapped for ``<trigger>-success`` plus the
+    ``re-ocr-preserved`` tag, and an audit note records the verdict.
+    """
+    note = (
+        f"Re-OCR skipped ({ctx.trigger_tag_name}): born-digital PDF - native "
+        f"text preserved.\nDetected: {provenance.summary()}"
+    )
+    log.info("Document %d: %s", ctx.doc_id, note.replace("\n", " | "))
+    if settings.dry_run:
+        log.info(
+            "DRY-RUN document %d: would preserve native text (trigger tag kept).",
+            ctx.doc_id,
+        )
+        return
+
+    extra_tags: list[int] = []
+    if settings.preserved_tag:
+        try:
+            extra_tags.append(api.ensure_tag(settings.preserved_tag))
+        except Exception:  # noqa: BLE001 - tag is informational
+            log.exception(
+                "Could not ensure preserved tag %r for document %d",
+                settings.preserved_tag,
+                ctx.doc_id,
+            )
+
+    _finish(api, ctx, success=True, note=note, settings=settings, extra_tags=extra_tags)
+
+
 def _finish(
     api: PaperlessAPI,
     ctx: DocumentContext,
@@ -532,10 +634,11 @@ def _finish(
             outcome_tag_name,
             outcome_tag_id,
         )
+        extra = extra_tags or []
         api.set_tags(
             ctx.doc_id,
-            remove=[ctx.trigger_tag_id],
-            add=[outcome_tag_id],
+            remove=ctx.removal_tag_ids(),
+            add=[outcome_tag_id, *extra],
             current_tags=ctx.current_tags,
         )
         log.info(
@@ -546,7 +649,6 @@ def _finish(
             outcome_tag_id,
             outcome_tag_name,
         )
-        extra = extra_tags or []
         if extra:
             log.info(
                 "Document %d: also added %d extra tag(s): %s",
@@ -559,10 +661,14 @@ def _finish(
         return
     if not success and note:
         log.error("Document %d failed: %s", ctx.doc_id, note)
-        if settings is not None and not settings.dry_run and settings.write_provenance:
-            _write_audit_note(
-                api,
-                ctx,
+    if note and settings is not None and not settings.dry_run and settings.write_provenance:
+        _write_audit_note(
+            api,
+            ctx,
+            note
+            if success
+            else (
                 f"Re-OCR failed ({ctx.trigger_tag_name}) for document "
-                f"{ctx.doc_id}\n{note}",
-            )
+                f"{ctx.doc_id}\n{note}"
+            ),
+        )
