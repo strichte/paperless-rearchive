@@ -31,12 +31,13 @@ live with every item on this list:
   field, and manages tags, notes and custom fields through the REST API. Create the token in
   paperless under *Admin → Documents → Tokens*.
 - **You have direct PostgreSQL access** (needed for `re-ocr-all` only) — and your paperless runs
-  **on PostgreSQL**. The sidecar talks to the database with `psycopg` only; paperless-instances on
-  SQLite (or the removed-in-2.0 MySQL) are not supported. Replacing an archive file also requires
-  updating `documents_document.archive_checksum` in the database — paperless has no API for that,
-  and the sidecar verifies the old checksum before touching anything so it never races a
-  concurrent modification. Reuse the same `PAPERLESS_DB*` credentials paperless itself uses.
-  (Content-only re-OCR does not need the database.)
+  **on PostgreSQL**. The sidecar talks to the database with `psycopg` only; paperless instances on
+  SQLite (or the removed-in-2.0 MySQL) are not supported. The archive flow (`re-ocr-all`) reads
+  the archive file's on-disk path and expected checksum from the database, re-verifies the
+  checksum just before replacing the file (so it never races a concurrent modification), and
+  updates the stored checksum afterwards — none of that has an API equivalent. **`re-ocr-content`
+  runs never open a database connection.** Reuse the same `PAPERLESS_DB*` credentials paperless
+  itself uses.
 - **You have a running Chandra OCR server with an OpenAI-compatible API.** All inference happens
   there (typically [paperless-chandra](https://github.com/flobernd/paperless-chandra)'s server on
   a GPU box, e.g. `http://ai:8110/v1`). The sidecar container itself is CPU-only; it drives
@@ -181,22 +182,7 @@ cd /opt/paperless            # wherever your paperless-ngx docker-compose.yml li
 git clone https://github.com/<you>/paperless-rearchive.git
 ```
 
-### 2. Provide the API token
-
-Simplest option: a dedicated env file read via compose's `env_file:`:
-
-```bash
-# .env.paperless-rearchive  (next to docker-compose.yml)
-PAPERLESS_API_TOKEN=paste-your-paperless-api-token-here
-```
-
-`env_file` values are injected straight into the container's environment. Note that **every
-credential in this project can alternatively use the `_FILE` secret-file mechanism — including
-the token** (`PAPERLESS_API_TOKEN_FILE`); the env file is a convenience, not a requirement. See
-[Secrets](#secrets) for all options. The examples below use the env file for the token and docker
-secret files for the other two credentials, but you can mix and match per credential.
-
-### 3. Add the service to `docker-compose.yml`
+### 2. Add the service to `docker-compose.yml`
 
 The sidecar belongs in the same compose file as paperless. Here is an abbreviated but complete
 typical setup — paperless-ngx with its supporting services (postgres, valkey or redis, tika,
@@ -216,6 +202,8 @@ secrets:
     file: ./secrets/paperless_secret_key
   chandra_api_key:
     file: ./secrets/chandra_api_key                 # omit if server needs no auth
+  paperless_api_token:
+    file: ./secrets/paperless_api_token
 
 services:
   # ─── PostgreSQL ────────────────────────────────────────────────────────────
@@ -260,7 +248,7 @@ services:
     # paperless-chandra's example Dockerfile. (With the stock paperless-ngx
     # image the PAPERLESS_CHANDRA_* options below would be ignored.)
     build:
-      context: ../paperless-chandra/examples
+      context: ./paperless-chandra/examples
       dockerfile: Dockerfile
       args:
         PLUGIN_REF: ${PLUGIN_REF:-master}     # paperless-chandra plugin ref
@@ -310,14 +298,10 @@ services:
     networks: [backend]
     depends_on:
       - paperless
-    env_file:
-      # Contains only the API token (step 2):
-      #   PAPERLESS_API_TOKEN=...
-      - .env.paperless-rearchive
     environment:
       # ---- required: where to find things -----------------------------------
       PAPERLESS_BASE_URL: "http://paperless:8000"     # paperless web UI/API
-      # PAPERLESS_API_TOKEN comes from .env.paperless-rearchive (env_file).
+      PAPERLESS_API_TOKEN_FILE: /run/secrets/paperless_api_token
       # Chandra inference server (OpenAI-compatible /v1 API):
       PAPERLESS_CHANDRA_SERVER_URL: "http://ai:8110/v1"
       PAPERLESS_CHANDRA_MODEL_NAME: "chandra-ocr-2-q8"
@@ -368,6 +352,7 @@ services:
     secrets:
       - chandra_api_key
       - paperless_db_paperless_passwd
+      - paperless_api_token
     logging:
       driver: "json-file"
       options:
@@ -380,7 +365,7 @@ services:
 > Mount exactly that directory (not its parent) read-write.
 
 
-### 4. Build and start
+### 3. Build and start
 
 ```bash
 docker compose build paperless-rearchive
@@ -388,7 +373,7 @@ docker compose up -d paperless-rearchive
 docker compose logs -f paperless-rearchive   # watch the first cycles
 ```
 
-### 5. First test
+### 4. First test
 
 1. Set `REARCHIVE_DRY_RUN: "true"` first if you want a no-write rehearsal.
 2. Tag one **disposable test document** `re-ocr-all` in the paperless UI.
@@ -401,22 +386,36 @@ docker compose logs -f paperless-rearchive   # watch the first cycles
 ## Secrets
 
 Three values are sensitive: the paperless API token, the Chandra API key, and the database
-password (plus, optionally, the database user). Each can be supplied in two ways — per
-credential, mix and match:
+password (plus, optionally, the database user). All of them — including the API token — can be
+supplied three different ways. Pick **one way for all of them**, or mix and match per credential;
+nothing in the sidecar cares which you choose.
 
-**1. `env_file`.** The service reads `.env.paperless-rearchive` via compose's `env_file:`; every
-`KEY=value` in it is injected straight into the container's environment. Any of the credentials
-can live there — as can any other plain variable.
+### Way 1: plain values (`environment:` or a compose env file)
+
+The simplest option — the value sits in the compose file (or in a file referenced by `env_file:`):
+
+```yaml
+services:
+  paperless-rearchive:
+    image: paperless-rearchive:latest
+    environment:
+      PAPERLESS_API_TOKEN: "paste-your-paperless-api-token-here"
+      PAPERLESS_CHANDRA_API_KEY: "paste-your-chandra-api-key-here"   # omit if no auth needed
+      PAPERLESS_DBPASS: "your-postgres-password-for-paperless"
+```
+
+Fine for a single-operator instance where the compose file is already private. Values in a
+separate env file (referenced via `env_file:`) are equally injected into the container — see
+[`doc/deploy/env.example`](doc/deploy/env.example).
 
 > ℹ️ Compose interpolation `${…}` in the YAML is resolved from the project's root `.env` (or the
-> shell) **before** `env_file:` files are read — so you cannot `${…}`-reference a value that
-> lives in `.env.paperless-rearchive`. That is why the example passes the token via `env_file`
-> and the other secrets via `secrets:` instead of trying to interpolate them. This split is
-> convention for readability, **not** a technical constraint.
+> shell) **before** any `env_file:` is read — so you cannot `${…}`-reference a value that lives
+> in an env file. If you want file-based secrets, use Way 2 or 3.
 
-**2. Secret files (paperless-ngx convention).** For every credential `NAME`, the sidecar
-understands a `NAME_FILE` environment variable pointing at a file whose content is the secret.
-This works for **all four** credentials, API token included:
+### Way 2: `_FILE` variables pointing at a file
+
+For every credential `NAME`, the sidecar understands a `NAME_FILE` environment variable whose
+content is the secret. This works for **all four** credentials:
 
 | Plain variable | File variant | Used for |
 | --- | --- | --- |
@@ -425,8 +424,28 @@ This works for **all four** credentials, API token included:
 | `PAPERLESS_DBPASS` | `PAPERLESS_DBPASS_FILE` | PostgreSQL password |
 | `PAPERLESS_DBUSER` | `PAPERLESS_DBUSER_FILE` | PostgreSQL user |
 
-If both are set, **the `_FILE` variant wins**. Combine with docker's top-level `secrets:` section
-(or a plain bind-mounted file) — exactly how paperless-ngx itself consumes `PAPERLESS_DBPASS_FILE`:
+The file can be anywhere the container can read — e.g. a bind mount:
+
+```yaml
+services:
+  paperless-rearchive:
+    image: paperless-rearchive:latest
+    volumes:
+      - /data/paperless/secrets:/run/secrets:ro
+    environment:
+      PAPERLESS_API_TOKEN_FILE: /run/secrets/paperless_api_token
+      PAPERLESS_CHANDRA_API_KEY_FILE: /run/secrets/chandra_api_key
+      PAPERLESS_DBPASS_FILE: /run/secrets/paperless_db_paperless_passwd
+```
+
+If both the plain variable and its `_FILE` variant are set, **the `_FILE` variant wins**.
+
+### Way 3: docker compose `secrets:` (paperless-ngx convention)
+
+Docker's `secrets:` section mounts files at `/run/secrets/<name>` inside the container; consume
+them with the same `_FILE` variables. This is exactly how paperless-ngx itself consumes
+`PAPERLESS_DBPASS_FILE`, and it keeps secret values out of the compose file and out of
+`docker inspect` output:
 
 ```yaml
 secrets:
@@ -434,23 +453,27 @@ secrets:
     file: ./secrets/paperless_api_token
   chandra_api_key:
     file: ./secrets/chandra_api_key
-  paperless_db_passwd:
-    file: ./secrets/paperless_db_passwd
+  paperless_db_paperless_passwd:
+    file: ./secrets/paperless_db_paperless_passwd
 
 services:
   paperless-rearchive:
+    image: paperless-rearchive:latest
     environment:
       PAPERLESS_API_TOKEN_FILE: /run/secrets/paperless_api_token
       PAPERLESS_CHANDRA_API_KEY_FILE: /run/secrets/chandra_api_key
-      PAPERLESS_DBPASS_FILE: /run/secrets/paperless_db_passwd
+      PAPERLESS_DBPASS_FILE: /run/secrets/paperless_db_paperless_passwd
     secrets:
       - paperless_api_token
       - chandra_api_key
-      - paperless_db_passwd
+      - paperless_db_paperless_passwd
 ```
 
-Surrounding whitespace in the file is stripped; a trailing newline from `echo` is fine. A
-runnable variant of both styles lives in
+This is what the full-stack example in [Setup](#setup-docker-compose) uses.
+
+Notes: surrounding whitespace in secret files is stripped (a trailing newline from `echo` is
+fine); the database **user** name can also be file-based via `PAPERLESS_DBUSER_FILE` if you
+prefer. A runnable variant lives in
 [`doc/deploy/compose-snippet.yml`](doc/deploy/compose-snippet.yml).
 
 ## Configuration reference
@@ -568,6 +591,9 @@ Set `REARCHIVE_BACKUP_DIRECTORY` to move the backups out of the media directory.
 may even be a different disk (backups are *copied*, not moved):
 
 ```yaml
+services:
+  paperless-rearchive:
+    image: paperless-rearchive:latest
     volumes:
       - /opt/paperless/media/documents/archive:/archives
       - /opt/paperless/archive-backups:/archive-backups   # different directory / disk

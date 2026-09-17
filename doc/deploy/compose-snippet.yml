@@ -1,13 +1,12 @@
 # Add to paperless-lxc/docker-compose.yml (services:) and set the secrets
-# shown at the bottom if not already present. Environment lives in
-# .env.paperless-rearchive (see .env.example next to this file).
+# shown at the bottom if not already present.
 #
-# Secret convention: every credential can be set inline (<VAR>) or via a
-# mounted secret file (<VAR>_FILE), paperless-ngx style. The *_FILE variant
-# wins when both are set. This snippet uses *_FILE for all existing Docker
-# secrets; the API token is still passed inline from .env.paperless-rearchive
-# (in your deployment you may instead add PAPERLESS_API_TOKEN_FILE if the token
-# should live in a secret file).
+# Secret convention: every credential (API token, Chandra API key, DB user
+# and password) can be set as a plain value (<VAR>) in `environment:` or an
+# env_file, OR via a mounted secret file (<VAR>_FILE) — paperless-ngx style.
+# The *_FILE variant wins when both are set. This snippet uses *_FILE for
+# ALL credentials, including the API token (add the paperless_api_token
+# secret next to the others in the top-level `secrets:` section).
 
   paperless-rearchive:
     build:
@@ -19,10 +18,9 @@
     user: "1001:1001"
     networks:
       - backend
-    env_file:
-      - .env.paperless-rearchive
     environment:
       PAPERLESS_BASE_URL: "http://paperless:8000"
+      PAPERLESS_API_TOKEN_FILE: /run/secrets/paperless_api_token
       REARCHIVE_ARCHIVE_DIR: "/archives"
       # Optional: keep `.bak-<ts>` archive backups OUTSIDE the media directory
       # so paperless's health check does not report them as orphaned files.
@@ -58,6 +56,7 @@
       # May be a different disk than the archive mount.
       # - /data/paperless/archive-backups:/archive-backups
     secrets:
+      - paperless_api_token
       - chandra_api_key
       - paperless_db_paperless_passwd
     logging:
@@ -70,6 +69,8 @@
       - paperless
 
 # Secrets (already defined in the top-level `secrets:` section):
+#   paperless_api_token:
+#     file: ./secrets/paperless_api_token
 #   chandra_api_key:
 #     file: ./secrets/chandra_api_key
 #   paperless_db_paperless_passwd:
