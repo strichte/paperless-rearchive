@@ -47,7 +47,7 @@ live with every item on this list:
   are recorded (audit note per run, provenance custom fields, `.bak` backups of replaced
   archives), but there is no undo button. Start with `REARCHIVE_DRY_RUN=true` and one test
   document.
-- **You can provide a backup directory outside the archive tree** (mandatory). Before an archive
+- **You must provide a backup directory outside the archive tree.** Before an archive
   is replaced, the old version is copied to `REARCHIVE_BACKUP_DIRECTORY` — the sidecar refuses to
   run without it, and refuses to run if it points into the archive tree. Ideally a separate bind
   mount (it may even be another disk; backups are *copied*).
@@ -386,8 +386,8 @@ docker compose logs -f paperless-rearchive   # watch the first cycles
 3. Wait for a poll cycle (or `docker kill -s HUP paperless-rearchive`).
 4. Check the outcome: the document should carry `re-ocr-all-success`, its `content` field fresh
    markdown, and an audit note; the archive file's `Creator` metadata should read
-   `OCRmyPDF … / Chandra …`. The old archive is kept as `.bak-<timestamp>` **in
-   `REARCHIVE_BACKUP_DIRECTORY`** — never in the archive directory.
+   `OCRmyPDF … / Chandra …`. The old archive is kept as `.bak-<timestamp>` in
+   `REARCHIVE_BACKUP_DIRECTORY`.
 
 ## Secrets
 
@@ -613,9 +613,6 @@ if a symlink game changes the picture after startup. Without all of this, paperl
 check reports every backup in the media directory as an orphaned file:
 
 > `[WARNING] [paperless.sanity_checker] Orphaned file in media dir: …/documents/archive/….pdf.bak-…`
-
-Existing `.bak-*` files in the archive directory (from earlier versions) can be moved to the
-backup directory (or deleted) to clear those warnings.
 
 ## Status
 
