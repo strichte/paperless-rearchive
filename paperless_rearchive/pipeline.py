@@ -116,34 +116,45 @@ def process_document(
                 do_archive = False
             else:
                 archive_path = settings.archive_dir / archive_filename
+                # A DB failure here is transient: let it propagate so the
+                # poller keeps the trigger tag and retries next cycle - the
+                # same treatment fetch_archive_filename above gets.
+                archive_checksum = fetch_archive_checksum(settings.db, ctx.doc_id)
+                log.debug(
+                    "Document %d: archive checksum from DB=%s",
+                    ctx.doc_id,
+                    archive_checksum,
+                )
                 try:
-                    archive_checksum = fetch_archive_checksum(settings.db, ctx.doc_id)
+                    verify_current_checksum(archive_path, archive_checksum)
                     log.debug(
-                        "Document %d: archive checksum from DB=%s",
+                        "Document %d: archive checksum verified (DB %s == disk)",
                         ctx.doc_id,
                         archive_checksum,
                     )
+                except ArchiveReplaceError as e:
+                    log.warning(
+                        "Document %d: archive checksum mismatch, attempting repair",
+                        ctx.doc_id,
+                    )
                     try:
-                        verify_current_checksum(archive_path, archive_checksum)
-                        log.debug(
-                            "Document %d: archive checksum verified (DB %s == disk)",
-                            ctx.doc_id,
-                            archive_checksum,
-                        )
-                    except ArchiveReplaceError as e:
-                        log.warning(
-                            "Document %d: archive checksum mismatch, attempting repair",
-                            ctx.doc_id,
-                        )
                         _repair_checksum_drift(settings, ctx, archive_path, archive_checksum, e)
-                except (ArchiveReplaceError, RuntimeError) as e:
-                    if settings.dry_run:
-                        log.error(
-                            "DRY-RUN document %d: archive check failed: %s", ctx.doc_id, e
+                    except ArchiveReplaceError as repair_error:
+                        # Unrepairable drift is a decision: fail the document
+                        # (never retried). A RuntimeError from the repair's
+                        # own DB update propagates instead (transient ->
+                        # trigger kept), keeping DB handling consistent.
+                        if settings.dry_run:
+                            log.error(
+                                "DRY-RUN document %d: archive check failed: %s",
+                                ctx.doc_id,
+                                repair_error,
+                            )
+                            return
+                        _finish(
+                            api, ctx, success=False, note=str(repair_error), settings=settings
                         )
                         return
-                    _finish(api, ctx, success=False, note=str(e), settings=settings)
-                    return
 
         # Use unified Chandra OCR engine
         log.info(

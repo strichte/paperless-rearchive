@@ -95,7 +95,11 @@ After processing, the trigger tag is removed and replaced with an outcome tag:
 | Failure | `re-ocr-content-failure` | `re-ocr-all-failure` |
 
 A trigger tag is only replaced when the pipeline reached a decision; transient upstream errors
-(OCR server unreachable, network hiccup) leave the trigger tag in place for the next poll cycle.
+(OCR server unreachable, network hiccup) leave the trigger tag in place for the next poll cycle —
+so those documents self-heal when the problem goes away. To keep permanently broken documents
+from retrying forever, a document that fails **3 consecutive times** is escalated: its trigger
+tag is swapped for `<trigger>-failure` and an audit note with the last error is appended.
+Counters reset on any success.
 
 **No manual tag creation needed.** The sidecar creates both trigger tags automatically if they don't exist. Tag a document and wait for the next cycle (or [nudge the
 poller](#manual-trigger-sighup)).
@@ -530,7 +534,7 @@ block; the compose example above already lists all of them with defaults.
 | `REARCHIVE_TRIGGER_TAG_ALL` | `re-ocr-all` | Trigger tag for content+archive runs (auto-created). |
 | `REARCHIVE_SUCCESS_SUFFIX` | `-success` | Outcome tag suffix appended to the trigger tag name on success. |
 | `REARCHIVE_FAILURE_SUFFIX` | `-failure` | Outcome tag suffix on failure. |
-| `REARCHIVE_POLL_INTERVAL` | `300` | Seconds between poll cycles. |
+| `REARCHIVE_POLL_INTERVAL` | `300` | Seconds between poll cycles **when idle**. While a backlog is draining, cycles automatically run ~10 s apart (fixed, not configurable) and back off exponentially if a cycle attempts documents without any success — so mass re-OCR wastes no time waiting and a broken OCR server never causes a retry storm. |
 | `REARCHIVE_BATCH_LIMIT` | `5` | Maximum documents processed per cycle (more stay tagged for the next cycle). |
 | `REARCHIVE_ARCHIVE_DIR` | `/archives` | Inside the container: where paperless's archive directory is mounted. Must match the `volumes:` entry. |
 | `REARCHIVE_BACKUP_DIRECTORY` | *(required)* | Where `.bak-<timestamp>` backups of replaced archives are kept. Must be outside the archive tree (the sidecar refuses to start otherwise) — see [Backup directory](#backup-directory). |
@@ -624,7 +628,9 @@ check reports every backup in the media directory as an orphaned file:
 | Content-only fast path (per-page Chandra, `re-ocr-page-errors` tracking) | ✅ done + verified live |
 | Archive replacer (checksum verify, `.bak` backups, atomic replace, DB checksum update) | ✅ done + verified live |
 | Dockerfile (CPU-only; ghostscript/tesseract/unpaper/jbig2/pngquant) | ✅ done |
-| Unit tests | ✅ 97 passing |
+| Adaptive polling (drain backlog at ~10 s cycles, exponential backoff on no-progress) | ✅ done |
+| Failure escalation (3 consecutive failures per document → `-failure` + audit note) | ✅ done |
+| Unit tests | ✅ 109 passing |
 | Failed-scan detection (Chandra repeat-loop heuristics) | ⬜ open — see PLANNING Risks |
 | Bulk re-OCR rehearsal guidance before mass use | ⬜ open |
 

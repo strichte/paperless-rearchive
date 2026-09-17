@@ -25,6 +25,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from paperless_chandra.engine import client as chandra_client
+from paperless_chandra.engine.client import ChandraClientError
 
 try:
     from chandra.model.util import detect_repeat_token as _detect_repeat_token
@@ -344,18 +345,29 @@ class ChandraOcrEngine:
                     n = futures[future]
                     try:
                         ordered[n] = future.result()
+                    except ChandraClientError:
+                        # Server-side/transient failure (the client already
+                        # exhausted its retries): abort the whole document so
+                        # the poller keeps the trigger tag and retries - the
+                        # same semantics the archive path gets from ocrmypdf.
+                        raise
                     except Exception as e:
                         log.warning("OCR failed on page %d: %s", n, e)
-                        ordered[n] = ("", None)
+                        ordered[n] = ""
             results = [ordered[n] for n, _ in indexed]
         else:
             results = []
             for n, img in indexed:
                 try:
                     results.append(self._ocr_page(img, n, len(indexed)))
+                except ChandraClientError:
+                    # See the concurrent branch above: transient server
+                    # failures abort the document instead of becoming
+                    # per-page errors.
+                    raise
                 except Exception as e:
                     log.warning("OCR failed on page %d: %s", n, e)
-                    results.append(("", None))
+                    results.append("")
 
         for page_num, markdown in enumerate(results, start=1):
             all_markdown_parts[page_num - 1] = markdown

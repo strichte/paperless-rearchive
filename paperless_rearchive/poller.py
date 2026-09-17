@@ -1,4 +1,17 @@
-"""Main loop: poll trigger tags and feed the pipeline."""
+"""Main loop: poll trigger tags and feed the pipeline.
+
+Polling is adaptive while a backlog drains: as long as a cycle made progress
+or documents remain tagged, the next cycle starts ~10 s later (fixed); once
+the queue is empty, the poller settles back to the full idle
+``REARCHIVE_POLL_INTERVAL``. Cycles that attempt documents but never succeed
+(e.g. an OCR server outage - those documents keep their trigger tag) back off
+exponentially from the active interval up to the full interval, so a broken
+server never turns into a tight retry loop.
+
+Documents that fail ``_MAX_CONSECUTIVE_FAILURES`` times in a row are
+escalated: the trigger tag is swapped for ``<trigger>-failure`` plus an audit
+note, so permanently broken documents do not retry forever.
+"""
 
 from __future__ import annotations
 
@@ -7,16 +20,47 @@ import signal
 import sys
 import threading
 import time
+from dataclasses import dataclass
 
 from paperless_rearchive.config import Settings
 from paperless_rearchive.logging_setup import configure_logging
 from paperless_rearchive.ocr.base import get_provider
 from paperless_rearchive.paperless_api import PaperlessAPI, PaperlessError
-from paperless_rearchive.pipeline import DocumentContext, process_document
+from paperless_rearchive.pipeline import (
+    DocumentContext,
+    _finish,
+    process_document,
+)
 
 log = logging.getLogger("rearchive")
 
 _wake = threading.Event()
+
+#: Consecutive failed attempts (per document + trigger tag) before the
+#: document is escalated to ``<trigger>-failure`` instead of being retried
+#: forever. Deliberately not configurable - re-OCR is idempotent and cheap
+#: to retry, 3 strikes are enough to tell "broken server" from "broken doc".
+_MAX_CONSECUTIVE_FAILURES = 3
+
+#: Seconds between cycles while a backlog is being drained. Fixed (not
+#: configurable): it only needs to be small relative to a document's OCR
+#: time so draining a large queue wastes ~no time between cycles.
+_ACTIVE_POLL_INTERVAL_S = 10.0
+
+#: (doc_id, trigger_tag_name) -> consecutive failed attempts. Process-local:
+#: a restart resets the counters, which is fine (re-OCR is idempotent).
+_FAILURE_ATTEMPTS: dict[tuple[int, str], int] = {}
+
+
+@dataclass
+class CycleResult:
+    """Outcome of one poll cycle, used to schedule the next one."""
+
+    processed: int
+    succeeded: int
+    failed: int
+    #: Documents still tagged when the cycle ended (backlog left to drain).
+    remaining: int
 
 
 def _on_signal(signum: int, _frame: object) -> None:
@@ -24,7 +68,7 @@ def _on_signal(signum: int, _frame: object) -> None:
     log.info("signal %d received; forcing a poll cycle", signum)
 
 
-def cycle(settings: Settings, api: PaperlessAPI, provider_name: str) -> None:
+def cycle(settings: Settings, api: PaperlessAPI, provider_name: str) -> CycleResult:
     triggers = {
         settings.trigger_tag_content: False,  # archive_mode
         settings.trigger_tag_all: True,
@@ -56,12 +100,15 @@ def cycle(settings: Settings, api: PaperlessAPI, provider_name: str) -> None:
             try:
                 process_document(settings, api, get_provider(provider_name), ctx)
                 succeeded += 1
-            except PaperlessError:
+                _FAILURE_ATTEMPTS.pop((doc_id, name), None)
+            except PaperlessError as exc:
                 log.exception("API error on document %d; keeping trigger tag.", doc_id)
                 failed += 1
-            except Exception:  # noqa: BLE001 - unexpected bug: keep trigger, keep going
+                _record_failure(settings, api, ctx, exc)
+            except Exception as exc:  # noqa: BLE001 - unexpected bug: keep trigger, keep going
                 log.exception("Unexpected error on document %d; keeping trigger tag.", doc_id)
                 failed += 1
+                _record_failure(settings, api, ctx, exc)
             processed += 1
             if processed >= settings.batch_limit:
                 break
@@ -75,6 +122,59 @@ def cycle(settings: Settings, api: PaperlessAPI, provider_name: str) -> None:
         _log_cycle_summary(
             settings, processed, succeeded, failed, elapsed, total_backlog, remaining
         )
+    else:
+        # Nothing attempted: either the queue is empty or everything in it
+        # exceeded the batch limit mid-cycle (impossible today) - either way
+        # the tagged documents are what remains.
+        remaining = total_backlog
+    return CycleResult(
+        processed=processed, succeeded=succeeded, failed=failed, remaining=remaining
+    )
+
+
+def _record_failure(
+    settings: Settings, api: PaperlessAPI, ctx: DocumentContext, exc: Exception
+) -> None:
+    """Count a failed attempt for (doc, trigger); escalate after N in a row.
+
+    Escalation swaps the trigger tag for ``<trigger>-failure`` plus an audit
+    note (via :func:`paperless_rearchive.pipeline._finish`), so permanently
+    broken documents stop being retried every cycle. Counters are
+    process-local and reset on success or restart.
+    """
+    key = (ctx.doc_id, ctx.trigger_tag_name)
+    attempts = _FAILURE_ATTEMPTS.get(key, 0) + 1
+    _FAILURE_ATTEMPTS[key] = attempts
+    if attempts < _MAX_CONSECUTIVE_FAILURES:
+        return
+    log.error(
+        "Document %d failed %d consecutive times; escalating to %r.",
+        ctx.doc_id,
+        attempts,
+        f"{ctx.trigger_tag_name}{settings.failure_suffix}",
+    )
+    if settings.dry_run:
+        log.warning(
+            "DRY-RUN: escalation for document %d skipped (dry runs change no tags).",
+            ctx.doc_id,
+        )
+        _FAILURE_ATTEMPTS.pop(key, None)
+        return
+    try:
+        _finish(
+            api,
+            ctx,
+            success=False,
+            note=(
+                f"Escalated after {attempts} consecutive failed re-OCR attempts. "
+                f"Last error: {type(exc).__name__}: {exc}"
+            ),
+            settings=settings,
+        )
+    except Exception:  # noqa: BLE001 - API down: keep trigger, count restarts
+        log.exception("Escalation failed for document %d; keeping trigger tag.", ctx.doc_id)
+        return
+    _FAILURE_ATTEMPTS.pop(key, None)
 
 
 def _log_cycle_summary(
@@ -145,6 +245,21 @@ def _log_cycle_summary(
         )
 
 
+def _next_wait(settings: Settings, result: CycleResult, no_progress_streak: int) -> float:
+    """Wait before the next cycle, from the just-finished cycle's outcome.
+
+    * idle (nothing attempted, nothing tagged) -> full ``REARCHIVE_POLL_INTERVAL``
+    * progress or known backlog -> the fixed active interval (drain mode)
+    * attempts but no successes -> exponential backoff from the active
+      interval, capped at the full interval (never a tight retry loop)
+    """
+    if result.processed == 0 and result.remaining == 0:
+        return settings.poll_interval
+    if no_progress_streak <= 0:
+        return _ACTIVE_POLL_INTERVAL_S
+    return min(settings.poll_interval, _ACTIVE_POLL_INTERVAL_S * (2**no_progress_streak))
+
+
 def _sleep_or_immediate(poll_interval: float, wake: threading.Event) -> bool:
     """Post-cycle wait; returns True when the next cycle must start now.
 
@@ -178,25 +293,50 @@ def main() -> None:
     api = PaperlessAPI(settings.paperless_url, settings.api_token)
     log.info(
         "paperless-rearchive starting — paperless=%s provider=%s dry_run=%s "
-        "poll=%ss batch=%d",
+        "poll=%ss idle (~%ss while draining) batch=%d",
         settings.paperless_url,
         settings.provider_name,
         settings.dry_run,
         settings.poll_interval,
+        _ACTIVE_POLL_INTERVAL_S,
         settings.batch_limit,
     )
 
     signal.signal(signal.SIGHUP, _on_signal)
     signal.signal(signal.SIGUSR1, _on_signal)
 
+    no_progress_streak = 0
+    previous_wait: float | None = None
     while True:
+        result: CycleResult | None = None
         try:
-            cycle(settings, api, settings.provider_name)
-        except Exception:  # noqa: BLE001 - network hiccup: retry next cycle
-            log.exception("cycle failed; retrying in %.0fs", settings.poll_interval)
+            result = cycle(settings, api, settings.provider_name)
+            if result.succeeded > 0 or (result.processed == 0 and result.remaining == 0):
+                no_progress_streak = 0
+            elif result.processed > 0:
+                # Attempts, but nothing succeeded: those documents keep their
+                # trigger tag and will be retried - back off.
+                no_progress_streak += 1
+            wait = _next_wait(settings, result, no_progress_streak)
+        except Exception:  # noqa: BLE001 - network hiccup: back off, retry next cycle
+            log.exception("cycle failed; retrying after backoff")
+            no_progress_streak += 1
+            wait = min(
+                settings.poll_interval,
+                _ACTIVE_POLL_INTERVAL_S * (2**no_progress_streak),
+            )
         if settings.run_once:
             return
-        if _sleep_or_immediate(settings.poll_interval, _wake):
+        if wait != previous_wait:
+            state = "draining" if wait < settings.poll_interval else "idle"
+            log.info(
+                "next cycle in %.0fs (%s; streak=%d)",
+                wait,
+                state,
+                no_progress_streak,
+            )
+            previous_wait = wait
+        if _sleep_or_immediate(wait, _wake):
             continue
 
 

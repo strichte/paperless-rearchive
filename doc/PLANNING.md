@@ -403,7 +403,7 @@ token, the Chandra key, and the database user/password.
 | `REARCHIVE_OCR_OUTPUT_TYPE` | `pdfa` | archive PDF/A flavour |
 | `REARCHIVE_OCR_USER_ARGS` | *(unset)* | extra ocrmypdf kwargs (JSON), e.g. paperless `PAPERLESS_OCR_USER_ARGS` |
 | `REARCHIVE_ARCHIVE_FOR_IMAGES` | `false` | experimental: create archive for non-PDF originals |
-| `REARCHIVE_POLL_INTERVAL` | `300` | seconds between polls; each cycle logs docs/min + backlog ETA and recommends batch/poll values so the sidecar doesn't idle while docs wait |
+| `REARCHIVE_POLL_INTERVAL` | `300` | seconds between polls **when idle**. Adaptive draining: while a backlog exists (or a cycle made progress), cycles run ~10 s apart (fixed `_ACTIVE_POLL_INTERVAL_S`); no-progress cycles back off exponentially to the idle interval. Each cycle logs docs/min + backlog ETA and recommends batch/poll values |
 | `REARCHIVE_BATCH_LIMIT` | `5` | max documents per cycle |
 | `REARCHIVE_WRITE_PROVENANCE` | `true` | write OCR run provenance to custom fields (`OCR engine`, `OCR date`, `OCR pages`, `OCR archive ratio` for re-ocr-all) and append an audit note per run (`POST /api/documents/{id}/notes/`, also on failure); definitions auto-created once via API, skipped in dry-run |
 | `REARCHIVE_OCR_CONCURRENCY` | `1` | pages OCR'd concurrently per document (ThreadPoolExecutor around the blocking Chandra call). Default 1 = sequential. WARNING: local vision LLM = GPU bottleneck; >1 only piles competing requests onto the same GPU (higher per-page latency, timeout/OOM risk). Raise gradually, watch GPU. |
@@ -445,6 +445,16 @@ Secrets (already defined in `paperless-lxc/docker-compose.yml`): `chandra_api_ke
   indicates the model looping on a bad/empty page — effectively a failed OCR. Pipeline should
   detect this (client callback / output repetition heuristic) and mark `-failure` instead of
   writing garbage content. Deferred until observed on more documents.
+- ✅ **Resolved** — inconsistent failure semantics: DB errors were retried at some call sites
+  (`fetch_archive_filename`, post-OCR fetch) but permanently failed the document at others
+  (pre-OCR checksum fetch); and a Chandra server outage failed `re-ocr-content` documents
+  (per-page catch) while `re-ocr-all` documents self-healed (document abort). DB errors now
+  always propagate (trigger kept -> retried), and `ChandraClientError` aborts content runs
+  exactly like archive runs. Permanently broken documents are handled by escalation: 3
+  consecutive failures per (doc, trigger) swap the trigger for `<trigger>-failure` + audit note.
+- ✅ **Resolved** — idle poll interval wasted half the time on large backlogs (fixed 300 s sleep
+  between cycles). Polling is now adaptive: ~10 s between cycles while draining, exponential
+  backoff on no-progress cycles, idle interval when the queue is empty.
 - ⬜ **Database access is PostgreSQL-only.** `archive/db.py` uses `psycopg`; paperless-ngx itself
   also runs on SQLite (and supported MySQL until 2.0 removed it). On a SQLite paperless,
   `re-ocr-content` works but `re-ocr-all` cannot. README documents this; either keep it pinned
