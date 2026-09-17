@@ -16,6 +16,9 @@
 #     tests/integration/check_archive_provenance.sh --doc 4221 [--doc 4222 ...]
 #     tests/integration/check_archive_provenance.sh --all [root] [--limit N]
 #
+# Bare numeric arguments are treated as document IDs; anything else is an
+# archive path (absolute, or relative to the archive root).
+#
 # Document IDs are resolved to their on-disk archive path via the
 # documents_document.archive_filename DB column (the same source the sidecar
 # itself uses), queried with docker exec against the Postgres container
@@ -81,7 +84,14 @@ while [ "$#" -gt 0 ]; do
       doc_ids+=("${1#*=}"); shift
       ;;
     *)
-      paths+=("$1"); shift
+      # Bare numeric arguments are document IDs (see usage above); anything
+      # else is a relative/absolute archive path.
+      if [[ "$1" =~ ^[0-9]+$ ]]; then
+        doc_ids+=("$1")
+      else
+        paths+=("$1")
+      fi
+      shift
       ;;
   esac
 done
