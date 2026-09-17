@@ -30,11 +30,13 @@ live with every item on this list:
 - **You have a paperless-ngx API token.** The sidecar reads documents, patches the `content`
   field, and manages tags, notes and custom fields through the REST API. Create the token in
   paperless under *Admin → Documents → Tokens*.
-- **You have direct PostgreSQL access** (needed for `re-ocr-all` only). Replacing an archive file
-  also requires updating `documents_document.archive_checksum` in the database — paperless has no
-  API for that, and the sidecar verifies the old checksum before touching anything so it never
-  races a concurrent modification. Reuse the same `PAPERLESS_DB*` credentials paperless itself
-  uses.
+- **You have direct PostgreSQL access** (needed for `re-ocr-all` only) — and your paperless runs
+  **on PostgreSQL**. The sidecar talks to the database with `psycopg` only; paperless-instances on
+  SQLite (or the removed-in-2.0 MySQL) are not supported. Replacing an archive file also requires
+  updating `documents_document.archive_checksum` in the database — paperless has no API for that,
+  and the sidecar verifies the old checksum before touching anything so it never races a
+  concurrent modification. Reuse the same `PAPERLESS_DB*` credentials paperless itself uses.
+  (Content-only re-OCR does not need the database.)
 - **You have a running Chandra OCR server with an OpenAI-compatible API.** All inference happens
   there (typically [paperless-chandra](https://github.com/flobernd/paperless-chandra)'s server on
   a GPU box, e.g. `http://ai:8110/v1`). The sidecar container itself is CPU-only; it drives
@@ -179,19 +181,20 @@ cd /opt/paperless            # wherever your paperless-ngx docker-compose.yml li
 git clone https://github.com/<you>/paperless-rearchive.git
 ```
 
-### 2. Put the API token in `.env.paperless-rearchive`
+### 2. Provide the API token
+
+Simplest option: a dedicated env file read via compose's `env_file:`:
 
 ```bash
 # .env.paperless-rearchive  (next to docker-compose.yml)
 PAPERLESS_API_TOKEN=paste-your-paperless-api-token-here
 ```
 
-The service reads this file via compose's `env_file:` (step 3), so the token never appears in the
-YAML. Note that `env_file` variables go **directly into the container** — they are *not* available
-for `${…}` interpolation elsewhere in the compose file, which is exactly why the token is consumed
-this way while the other two secrets (Chandra API key, database password) are passed as docker
-secret files below. See [Secrets](#secrets) for all options, including a docker-secrets-only
-setup.
+`env_file` values are injected straight into the container's environment. Note that **every
+credential in this project can alternatively use the `_FILE` secret-file mechanism — including
+the token** (`PAPERLESS_API_TOKEN_FILE`); the env file is a convenience, not a requirement. See
+[Secrets](#secrets) for all options. The examples below use the env file for the token and docker
+secret files for the other two credentials, but you can mix and match per credential.
 
 ### 3. Add the service to `docker-compose.yml`
 
@@ -253,9 +256,16 @@ services:
 
   # ─── paperless-ngx (abbreviated — keep your existing settings) ─────────────
   paperless:
-    image: ghcr.io/paperless-ngx/paperless-ngx:latest
-    # Chandra at ingest: build paperless-chandra's example Dockerfile instead
-    # (context: ../paperless-chandra/examples, dockerfile: Dockerfile).
+    # paperless-ngx with the Chandra OCR plugin wired in at ingest, built from
+    # paperless-chandra's example Dockerfile. (With the stock paperless-ngx
+    # image the PAPERLESS_CHANDRA_* options below would be ignored.)
+    build:
+      context: ../paperless-chandra/examples
+      dockerfile: Dockerfile
+      args:
+        PLUGIN_REF: ${PLUGIN_REF:-master}     # paperless-chandra plugin ref
+        PAPERLESS_TAG: ${PAPERLESS_TAG:-3.1.3}
+    image: paperless
     container_name: paperless
     restart: unless-stopped
     networks: [frontend, backend]
@@ -277,7 +287,7 @@ services:
       PAPERLESS_TIKA_ENABLED: "1"
       PAPERLESS_TIKA_ENDPOINT: http://tika:9998
       PAPERLESS_TIKA_GOTENBERG_ENDPOINT: http://gotenberg:3000
-      # Chandra at ingest (paperless-chandra build only):
+      # Chandra at ingest (requires the paperless-chandra build above):
       PAPERLESS_CHANDRA_SERVER_URL: http://ai:8110/v1
       PAPERLESS_CHANDRA_MODEL_NAME: chandra-ocr-2-q8
       PAPERLESS_CHANDRA_API_KEY_FILE: /run/secrets/chandra_api_key
@@ -394,18 +404,19 @@ Three values are sensitive: the paperless API token, the Chandra API key, and th
 password (plus, optionally, the database user). Each can be supplied in two ways — per
 credential, mix and match:
 
-**1. `env_file` (shown above).** The service reads `.env.paperless-rearchive` via compose's
-`env_file:`; every `KEY=value` in it is injected straight into the container's environment. The
-API token lives there, so it never appears in the YAML. If you prefer, you can put *any* plain
-variable there too and drop it from the `environment:` block.
+**1. `env_file`.** The service reads `.env.paperless-rearchive` via compose's `env_file:`; every
+`KEY=value` in it is injected straight into the container's environment. Any of the credentials
+can live there — as can any other plain variable.
 
-> ⚠️ Compose interpolation `${…}` in the YAML is resolved from the project's root `.env` (or the
-> shell) **before** `env_file:` files are read — so `${PAPERLESS_API_TOKEN}` would *not* pick up
-> a value from `.env.paperless-rearchive`. That is why the example uses `env_file` for the token
-> and `environment:` for everything else, with no `${…}` cross-references between them.
+> ℹ️ Compose interpolation `${…}` in the YAML is resolved from the project's root `.env` (or the
+> shell) **before** `env_file:` files are read — so you cannot `${…}`-reference a value that
+> lives in `.env.paperless-rearchive`. That is why the example passes the token via `env_file`
+> and the other secrets via `secrets:` instead of trying to interpolate them. This split is
+> convention for readability, **not** a technical constraint.
 
 **2. Secret files (paperless-ngx convention).** For every credential `NAME`, the sidecar
-understands a `NAME_FILE` environment variable pointing at a file whose content is the secret:
+understands a `NAME_FILE` environment variable pointing at a file whose content is the secret.
+This works for **all four** credentials, API token included:
 
 | Plain variable | File variant | Used for |
 | --- | --- | --- |
@@ -501,7 +512,9 @@ block; the compose example above already lists all of them with defaults.
 
 ### Database (re-ocr-all only)
 
-Copy the values from paperless's own environment.
+**PostgreSQL only** (the sidecar uses `psycopg`). paperless-ngx also runs on SQLite out of the
+box; if yours does, `re-ocr-content` still works but `re-ocr-all` cannot. Copy the values from
+paperless's own environment.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |

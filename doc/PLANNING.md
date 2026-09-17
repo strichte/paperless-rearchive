@@ -444,6 +444,10 @@ Secrets (already defined in `paperless-lxc/docker-compose.yml`): `chandra_api_ke
   indicates the model looping on a bad/empty page — effectively a failed OCR. Pipeline should
   detect this (client callback / output repetition heuristic) and mark `-failure` instead of
   writing garbage content. Deferred until observed on more documents.
+- ⬜ **Database access is PostgreSQL-only.** `archive/db.py` uses `psycopg`; paperless-ngx itself
+  also runs on SQLite (and supported MySQL until 2.0 removed it). On a SQLite paperless,
+  `re-ocr-content` works but `re-ocr-all` cannot. README documents this; either keep it pinned
+  (fine) or add a SQLite reader for `archive_checksum`/`archive_filename` updates later.
 - ⬜ **`REARCHIVE_ARCHIVE_FOR_IMAGES` is parsed but not implemented**: `Settings.from_env()` reads
   it, but `pipeline.py` never consults it — non-PDF originals (JPEG/TIFF/PNG scans) are *always*
   routed to content-only mode, so images can never get an archive version regenerated. Either
