@@ -92,6 +92,18 @@ The original file is immutable; it is only downloaded via the API and used as OC
   `Detected repeat token, retrying generation (attempt N)` and the GPU spins up, the model is
   looping on a bad/empty page. Such runs are effectively failed scans — quality is garbage even
   though the pipeline completes. Detection/handling is deferred — see Risks.
+- **Re-OCR wall-time breakdown (measured 2026-09-17, doc 4221, 8 pages)**: `re-ocr-content`
+  finished in 98.4 s (8 Chandra POSTs, zero repeat-token retries) while `re-ocr-all` took 307.8 s.
+  Phase timing from the logs: setup ~2 s; per-page rasterize + Tesseract OSD + **inference**
+  03:14:21→03:19:26 ≈ 304 s for **11 generations** (8 pages + 3 repeat-token retry generations);
+  graft (HocrParser) + Ghostscript PDF/A + image optimize ≈ **1.3 s** — *not* the ~190 s an
+  earlier analysis guessed (that "assembly" time was itself repeat-token retries, as was the
+  P1-era 191 s assembly). Inference is therefore comparable between the paths *when no page
+  loops*; the entire delta in this run was ~200 s of repeat-token retry inference on 2 of 8
+  pages. Root cause of the divergence: the two paths feed **different rasterized images** to the
+  same deterministic decode (temperature 0.0 / top_p 0.1) — the content path renders with
+  PyMuPDF @300 dpi RGB, the archive path rasterizes via ocrmypdf/Ghostscript at the page's
+  effective DPI — and borderline pages flip into/out of repetition loops depending on the pixels.
 - **Base image**: paperless-ngx now ships `python:3.14-slim` (Debian 13 *trixie*) and this
   sidecar uses the same base. `jbig2` (bilevel compression for ocrmypdf) is available as an apt
   package in trixie and is installed directly; together with `pngquant` it saved ~15-19% on a
@@ -445,6 +457,14 @@ Secrets (already defined in `paperless-lxc/docker-compose.yml`): `chandra_api_ke
   indicates the model looping on a bad/empty page — effectively a failed OCR. Pipeline should
   detect this (client callback / output repetition heuristic) and mark `-failure` instead of
   writing garbage content. Deferred until observed on more documents.
+  **Measured 2026-09-17 (doc 4221)**: 2 of 8 pages looped *only* in the `re-ocr-all` path
+  (different rasterized input than the content path — see Research notes); the temperature
+  retry ladder recovered both (8/8 ok) at a cost of ~200 s wall time (3 extra 45–56 s
+  generations). Candidate follow-ups: (a) log a per-run retry summary (retried pages +
+  generations) into the audit note/provenance for visibility; (b) investigate rasterization
+  parity between the two paths (PyMuPDF vs ocrmypdf/Ghostscript) to reduce loop divergence;
+  (c) `MAX_VLLM_RETRIES` tuning trades wall time vs success rate. Quality on the recovered
+  pages was acceptable here — the "failed scan" outcome is not automatic.
 - ✅ **Resolved** — inconsistent failure semantics: DB errors were retried at some call sites
   (`fetch_archive_filename`, post-OCR fetch) but permanently failed the document at others
   (pre-OCR checksum fetch); and a Chandra server outage failed `re-ocr-content` documents
