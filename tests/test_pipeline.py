@@ -60,9 +60,9 @@ def test_db_checksum_error_propagates_trigger_kept(tmp_path: Path) -> None:
             side_effect=RuntimeError("db connection lost"),
         ),
         patch("paperless_rearchive.pipeline._finish", side_effect=lambda *a, **kw: finishes.append(kw)),
+        pytest.raises(RuntimeError, match="db connection lost"),
     ):
-        with pytest.raises(RuntimeError, match="db connection lost"):
-            process_document(settings, _FakeAPI(), None, _ctx())
+        process_document(settings, _FakeAPI(), None, _ctx())
     assert finishes == []
 
 

@@ -467,9 +467,9 @@ class ChandraOcrEngine:
 
         from paperless_rearchive.ocr.ingest_args import (
             build_ocrmypdf_args,
+            extract_pdf_text,
             pdf_born_digital_text,
             post_process_text,
-            extract_pdf_text,
             resolve_mode,
             sidecar_content,
         )

@@ -13,7 +13,6 @@ but PDF/A assembly only happens for re-ocr-all to avoid wasting CPU.
 from __future__ import annotations
 
 import logging
-import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
@@ -276,7 +275,7 @@ def process_document(
             )
             # Get original archive size before replacement
             old_size = archive_path.stat().st_size if archive_path.exists() else 0
-            
+
             checksum = replace_archive(
                 archive_path,
                 result.pdf_path,
@@ -288,10 +287,10 @@ def process_document(
                 ctx.doc_id,
                 checksum,
             )
-            
+
             # Get new archive size after replacement
             new_size = result.pdf_path.stat().st_size
-            
+
             # Ratio + pct for concise logging, e.g. 624.5 KB to 625.1 KB (1.001x, +0.1%)
             size_diff = new_size - old_size
             if old_size > 0:
@@ -311,24 +310,23 @@ def process_document(
             )
 
             # Check for drastic size changes
-            if old_size > 0:
-                if abs(size_change_pct) > 50:
-                    direction = "increased" if size_diff > 0 else "decreased"
+            if old_size > 0 and abs(size_change_pct) > 50:
+                direction = "increased" if size_diff > 0 else "decreased"
+                log.warning(
+                    "Document %d: archive size %s by %.1f%% (%.3fx, %s → %s)",
+                    ctx.doc_id,
+                    direction,
+                    abs(size_change_pct),
+                    size_ratio if size_ratio is not None else float("inf"),
+                    _format_size(old_size),
+                    _format_size(new_size),
+                )
+                if size_diff > 0:
                     log.warning(
-                        "Document %d: archive size %s by %.1f%% (%.3fx, %s → %s)",
+                        "Document %d: significant size increase may indicate fallback to force_ocr or other issues",
                         ctx.doc_id,
-                        direction,
-                        abs(size_change_pct),
-                        size_ratio if size_ratio is not None else float("inf"),
-                        _format_size(old_size),
-                        _format_size(new_size),
                     )
-                    if size_diff > 0:
-                        log.warning(
-                            "Document %d: significant size increase may indicate fallback to force_ocr or other issues",
-                            ctx.doc_id,
-                        )
-            
+
             update_archive_checksum(settings.db, ctx.doc_id, checksum)
             log.info(
                 "Document %d: updated documents_document.archive_checksum to %s",

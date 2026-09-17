@@ -12,7 +12,6 @@ from paperless_rearchive.config import Settings
 from paperless_rearchive.paperless_api import PaperlessError
 from paperless_rearchive.poller import (
     _ACTIVE_POLL_INTERVAL_S,
-    _MAX_CONSECUTIVE_FAILURES,
     _FAILURE_ATTEMPTS,
     _next_wait,
     _sleep_or_immediate,

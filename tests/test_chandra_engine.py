@@ -9,7 +9,6 @@ errors and fail the document with a partial result.
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 from paperless_chandra.engine.client import ChandraClientError
