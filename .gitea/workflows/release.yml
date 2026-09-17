@@ -1,0 +1,82 @@
+# Gitea Actions release workflow: runs when a `v*` tag is pushed.
+#
+# Runs the test suite, guards tag/pyproject agreement, builds the container
+# image (paperless-chandra pinned via the CHANDRA_REF build-arg) and pushes
+# it to the instance container registry, then creates a Gitea release whose
+# body is the matching CHANGELOG.md section.
+#
+# Prerequisites: an act_runner with docker available; repo secrets
+#   REGISTRY_USER / REGISTRY_TOKEN (Gitea account with package:write)
+#   RELEASE_TOKEN (Gitea token with repo write, for the release API call).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install
+        run: python -m pip install -e ".[chandra,db,dev]"
+
+      - name: Unit tests
+        run: python -m pytest tests/ -q
+
+      - name: Guard: tag matches pyproject version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          pyproject="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          [ "$version" = "$pyproject" ] || { echo "tag v$version != pyproject $pyproject" >&2; exit 1; }
+
+      - name: Build image
+        run: |
+          docker build \
+            --build-arg CHANDRA_REF="${CHANDRA_REF:-master}" \
+            -t "git.zsh.nz/steffen/paperless-rearchive:${GITHUB_REF_NAME}" \
+            -t "git.zsh.nz/steffen/paperless-rearchive:latest" \
+            .
+
+      - name: Push image
+        env:
+          REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          echo "$REGISTRY_TOKEN" | docker login git.zsh.nz -u "$REGISTRY_USER" --password-stdin
+          docker push "git.zsh.nz/steffen/paperless-rearchive:${GITHUB_REF_NAME}"
+          docker push "git.zsh.nz/steffen/paperless-rearchive:latest"
+
+      - name: Create Gitea release
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          version = tag.removeprefix("v")
+          body = ""
+          current = None
+          for line in open("CHANGELOG.md", encoding="utf-8"):
+              if line.startswith("## "):
+                  if current is not None:
+                      break
+                  current = line[3:].strip().split(" — ")[0]
+                  continue
+              if current == version:
+                  body += line
+          payload = json.dumps({"tag_name": tag, "name": tag, "body": body}).encode()
+          req = urllib.request.Request(
+              "https://git.zsh.nz/api/v1/repos/steffen/paperless-rearchive/releases",
+              data=payload,
+              headers={"Content-Type": "application/json", "Authorization": "token " + os.environ["RELEASE_TOKEN"]},
+          )
+          urllib.request.urlopen(req)
+          PY

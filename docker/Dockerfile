@@ -37,7 +37,13 @@ WORKDIR /app
 # Dependency layer: paperless-chandra plugin + runtime deps.
 COPY pyproject.toml README.md LICENSE ./
 COPY paperless_rearchive ./paperless_rearchive
-RUN pip install --no-cache-dir ".[chandra,db]"
+# Dependency layer. paperless-chandra (the ocrmypdf plugin + engine wrapper)
+# is installed from upstream git — pin CHANDRA_REF (branch, tag or commit
+# SHA) for reproducible release builds; the default tracks upstream master.
+ARG CHANDRA_REF=master
+RUN pip install --no-cache-dir \
+      "paperless-chandra @ git+https://github.com/flobernd/paperless-chandra.git@${CHANDRA_REF}"
+RUN pip install --no-cache-dir ".[db]"
 
 # Run as the same UID/GID as the paperless container so it can replace
 # archive files on the bind mount.

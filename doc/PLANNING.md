@@ -271,11 +271,18 @@ Key changes from previous architecture:
 ```
 paperless-rearchive/
 ├── README.md                  # living overview + status
+├── CHANGELOG.md               # Keep-a-Changelog style release notes
 ├── doc/
 │   ├── PLANNING.md            # this file
-│   └── deploy/compose-snippet.yml
+│   ├── RELEASING.md           # release runbook (versioning rhythm, CI, rollback)
+│   ├── OCR_STRATEGY.md
+│   └── deploy/
+│       ├── compose-snippet.yml
+│       └── env.example
+├── scripts/release-check.sh   # release guard (versions, changelog, tests)
+├── .gitea/workflows/          # Gitea Actions: ci.yml (tests), release.yml (image + release)
 ├── paperless_rearchive/
-│   ├── __init__.py
+│   ├── __init__.py            # __version__ from installed package metadata
 │   ├── config.py              # env-driven Settings
 │   ├── logging_setup.py       # shared logging config (poll + containers)
 │   ├── secrets.py             # *_FILE secret resolution (paperless-ngx convention)
@@ -286,15 +293,17 @@ paperless-rearchive/
 │   │   ├── __init__.py
 │   │   ├── base.py            # OcrProviderPlugin ABC + registry
 │   │   ├── chandra.py         # Chandra provider
-│   │   └── runner.py          # Django-free ocrmypdf argument builder + image helpers
+│   │   ├── chandra_engine.py  # unified engine: per-page Chandra + ingest-parity ocrmypdf pass
+│   │   ├── ingest_args.py     # ingest-parity ocrmypdf argument builder + text semantics
+│   │   └── runner.py          # legacy builder, retained for the integration harness
 │   └── archive/
 │       ├── __init__.py
 │       ├── db.py              # psycopg checksum/archive reads + UPDATE
 │       └── replacer.py        # backup + atomic replace + sha256
-├── docker/Dockerfile
+├── docker/Dockerfile          # CHANDRA_REF build-arg pins paperless-chandra
 ├── pyproject.toml
 └── tests/
-    ├── test_*.py              # pytest unit tests (70 passing)
+    ├── test_*.py              # pytest unit tests (113 passing)
     └── integration/           # live-stack harness (see its README)
 ```
 
@@ -504,3 +513,16 @@ Secrets (already defined in `paperless-lxc/docker-compose.yml`): `chandra_api_ke
   **mandatory** setting — the legacy next-to-archive fallback was removed entirely, backups are
   unconditional (no skip option), and the replacer has a runtime backstop that refuses any backup
   destination resolving inside the archive directory.
+
+### Phase 6 — Release engineering ✅
+
+- ✅ `CHANGELOG.md` (Keep a Changelog) seeded with the 0.1.0 release notes.
+- ✅ Version single-sourced: `__version__` reads `importlib.metadata` (pyproject remains the
+  source of truth); regression-tested; poller startup log shows the version.
+- ✅ `doc/RELEASING.md` runbook (versioning rhythm, runbook, hotfix/rollback) and
+  `scripts/release-check.sh` guard (clean tree, tag free, version/changelog agreement, tests).
+- ✅ Gitea Actions: `.gitea/workflows/ci.yml` (tests + ruff on push/PR) and `release.yml`
+  (tag → tests → image build with pinned `CHANDRA_REF` → registry push → release page).
+  Requires repo secrets `REGISTRY_USER` / `REGISTRY_TOKEN` / `RELEASE_TOKEN` and an act_runner.
+- ✅ `docker/Dockerfile`: `CHANDRA_REF` build-arg pins the paperless-chandra ref (closes the
+  reproducibility risk above for release artifacts).

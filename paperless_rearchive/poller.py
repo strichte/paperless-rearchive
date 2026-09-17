@@ -22,6 +22,7 @@ import threading
 import time
 from dataclasses import dataclass
 
+from paperless_rearchive import __version__
 from paperless_rearchive.config import Settings
 from paperless_rearchive.logging_setup import configure_logging
 from paperless_rearchive.ocr.base import get_provider
@@ -292,8 +293,9 @@ def main() -> None:
 
     api = PaperlessAPI(settings.paperless_url, settings.api_token)
     log.info(
-        "paperless-rearchive starting — paperless=%s provider=%s dry_run=%s "
+        "paperless-rearchive %s starting — paperless=%s provider=%s dry_run=%s "
         "poll=%ss idle (~%ss while draining) batch=%d",
+        __version__,
         settings.paperless_url,
         settings.provider_name,
         settings.dry_run,

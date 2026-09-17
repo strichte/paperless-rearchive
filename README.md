@@ -10,7 +10,7 @@ Tag a document `re-ocr-content` to replace its `content` field with fresh OCR ma
 `re-ocr-all` to additionally replace its archive file. The sidecar polls paperless for these tags
 and processes tagged documents in the background.
 
-> **This is the first public release (v1.0).** Both trigger paths have been verified end-to-end
+> **This is release v0.1.0** (first public release). Both trigger paths have been verified end-to-end
 > against a live instance. Design notes and the engineering log live in
 > [`doc/PLANNING.md`](doc/PLANNING.md) and [`doc/OCR_STRATEGY.md`](doc/OCR_STRATEGY.md).
 
@@ -294,10 +294,15 @@ services:
 
   # ─── paperless-rearchive — tag-driven re-OCR sidecar ───────────────────────
   paperless-rearchive:
-    build:
-      context: ./paperless-rearchive
-      dockerfile: docker/Dockerfile
-    image: paperless-rearchive:latest
+    # Released image from the Gitea container registry (recommended — pinned
+    # to a release tag). Alternative: build from a source checkout by
+    # uncommenting the build block (see doc/RELEASING.md for releases).
+    image: git.zsh.nz/steffen/paperless-rearchive:v0.1.0
+    # build:
+    #   context: ./paperless-rearchive
+    #   dockerfile: docker/Dockerfile
+    #   args:
+    #     CHANDRA_REF: master   # pin a paperless-chandra SHA for reproducibility
     container_name: paperless-rearchive
     restart: unless-stopped
     # MUST match the UID:GID that owns the files in paperless's archive
@@ -641,7 +646,19 @@ check reports every backup in the media directory as an orphaned file:
 | Failed-scan detection (Chandra repeat-loop heuristics) | ⬜ open — see PLANNING Risks |
 | Bulk re-OCR rehearsal guidance before mass use | ⬜ open |
 
-## Development & design docs
+## Development & releases
+
+- **Development** happens on `main`. After tagging a release, bump
+  `pyproject.toml` to the next `.dev0` version and open a fresh `## Unreleased`
+  section in `CHANGELOG.md` — see [`doc/RELEASING.md`](doc/RELEASING.md) for
+  the full versioning rhythm, release runbook and rollback notes.
+- **Releases** are cut by running `scripts/release-check.sh <version>`, then
+  tagging `v<version>` and pushing — Gitea Actions (`.gitea/workflows/`) runs
+  the tests, builds the container image and publishes it to the instance
+  container registry with a release page. Secrets needed there:
+  `REGISTRY_USER`, `REGISTRY_TOKEN`, `RELEASE_TOKEN`.
+
+### Design docs
 
 - [`doc/PLANNING.md`](doc/PLANNING.md) — phased engineering plan, research notes, config table, risks.
 - [`doc/OCR_STRATEGY.md`](doc/OCR_STRATEGY.md) — how the sidecar's OCR relates to paperless ingest,

@@ -12,7 +12,11 @@
     build:
       context: ../paperless-rearchive
       dockerfile: docker/Dockerfile
-    image: paperless-rearchive:latest
+      # Pin paperless-chandra for reproducible builds (release practice);
+      # default: master.
+      args:
+        CHANDRA_REF: master
+    image: git.zsh.nz/steffen/paperless-rearchive:v0.1.0
     container_name: paperless-rearchive
     restart: unless-stopped
     user: "1001:1001"
