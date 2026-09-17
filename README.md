@@ -71,8 +71,7 @@ For `re-ocr-all` the sidecar drives **one `ocrmypdf` pass** — the same invocat
 `paperless_chandra` plugin that paperless-chandra's ingest parser drives — producing the PDF/A
 archive *and* the markdown `content` from a single OCR run, so a re-OCR'd document is
 indistinguishable from a freshly ingested one. The OCR source is always the **immutable original**,
-fetched with the API's `?original=true` parameter (the download endpoint without it returns the
-*archive*).
+fetched with the `paperless-ngx` API.
 
 ## Usage: trigger tags
 
@@ -91,13 +90,12 @@ After processing, the trigger tag is removed and replaced with an outcome tag:
 A trigger tag is only replaced when the pipeline reached a decision; transient upstream errors
 (OCR server unreachable, network hiccup) leave the trigger tag in place for the next poll cycle.
 
-**No manual tag creation needed.** The sidecar creates both trigger tags automatically on every
-poll cycle if they don't exist. Tag a document and wait for the next cycle (or [nudge the
+**No manual tag creation needed.** The sidecar creates both trigger tags automatically if they don't exist. Tag a document and wait for the next cycle (or [nudge the
 poller](#manual-trigger-sighup)).
 
 ## Guarantees
 
-- **The original file is immutable.** It is only ever downloaded via the API into a scratch
+- **The original file is immutable.** It is only ever downloaded via the `paperless-ngx` API into a scratch
   directory and used as the OCR source. Nothing ever writes to `media/documents/originals/`.
 - Archive files are replaced **atomically** (write temp file → `os.replace`) and the previous
   archive version is kept as a `.bak-<timestamp>` file. By default that backup sits next to the
@@ -116,7 +114,7 @@ poller](#manual-trigger-sighup)).
 key concept here is the **OCR mode**, which decides what to do with a PDF that *already* has a
 text layer (e.g. from a previous OCR run): re-OCR it, leave it alone, or rip the pages apart and
 start over. These modes — `--skip-text`, `--redo-ocr`, `--force-ocr` — are ocrmypdf's, not ours;
-paperless-ngx wraps them in its own `PAPERLESS_OCR_MODE` setting
+`paperless-ngx` wraps them in its own `PAPERLESS_OCR_MODE` setting
 ([docs](https://docs.paperless-ngx.com/configuration/#ocr-settings)), and `REARCHIVE_OCR_MODE`
 uses the same vocabulary. Read the
 [ocrmypdf cookbook](https://ocrmypdf.readthedocs.io/en/latest/cookbook.html#redo-existing-ocr)
@@ -145,7 +143,10 @@ paperless-ngx additionally defines `auto` (pick skip/redo sensibly per page) and
 OCR quality knobs (mirroring paperless's own settings):
 
 - **`REARCHIVE_OCR_ROTATE_PAGES`** (default on): fixes 90/180/270° page orientation before OCR.
-  Available in every mode — it runs via the Chandra engine's orientation detection.
+  Available in every mode. Orientation detection is provided by the Chandra engine plugin — since
+  the LLM has no orientation classifier of its own, the plugin shells out to a **local Tesseract
+  OSD probe** (`tesseract --psm 0`, no GPU involved) whenever ocrmypdf asks for a page's
+  orientation.
 - **`REARCHIVE_OCR_DESKEW`** (default on): fixes small (< 45°) crooked-scan skew. **ocrmypdf
   forbids deskew together with `--redo-ocr`** (it won't rasterise the page images deskew would
   need), so under the default `redo` mode deskew is silently skipped — the same limitation
@@ -178,26 +179,114 @@ cd /opt/paperless            # wherever your paperless-ngx docker-compose.yml li
 git clone https://github.com/<you>/paperless-rearchive.git
 ```
 
-### 2. Put the secrets in `.env`
-
-Compose automatically reads a `.env` file next to `docker-compose.yml` and substitutes
-`${VARIABLE}` references. Keep **only secrets** in it (see
-[Secrets](#secrets) for alternatives, including docker secret files):
+### 2. Put the API token in `.env.paperless-rearchive`
 
 ```bash
-# .env  (next to docker-compose.yml)
+# .env.paperless-rearchive  (next to docker-compose.yml)
 PAPERLESS_API_TOKEN=paste-your-paperless-api-token-here
-PAPERLESS_CHANDRA_API_KEY=paste-your-chandra-api-key-here   # omit line if server needs no auth
-PAPERLESS_DBPASS=your-postgres-password-for-paperless
 ```
+
+The service reads this file via compose's `env_file:` (step 3), so the token never appears in the
+YAML. Note that `env_file` variables go **directly into the container** — they are *not* available
+for `${…}` interpolation elsewhere in the compose file, which is exactly why the token is consumed
+this way while the other two secrets (Chandra API key, database password) are passed as docker
+secret files below. See [Secrets](#secrets) for all options, including a docker-secrets-only
+setup.
 
 ### 3. Add the service to `docker-compose.yml`
 
-Paste this into the `services:` section (same file as `paperless`, `postgres`, `broker`, …).
-Every environment variable the sidecar understands is listed with its default — trim what you
-don't need, but the first block is required:
+The sidecar belongs in the same compose file as paperless. Here is an abbreviated but complete
+typical setup — paperless-ngx with its supporting services (postgres, valkey or redis, tika,
+gotenberg) plus `paperless-rearchive`. Host paths use `/data/paperless/...` and UID/GID `1000`
+as placeholders — match your existing paperless service. The Chandra inference server is
+*not* part of this compose file; it runs elsewhere (here: `http://ai:8110/v1`).
 
 ```yaml
+networks:
+  frontend:
+  backend:
+
+secrets:
+  paperless_db_paperless_passwd:
+    file: ./secrets/paperless_db_paperless_passwd   # same file paperless uses
+  paperless_secret_key:
+    file: ./secrets/paperless_secret_key
+  chandra_api_key:
+    file: ./secrets/chandra_api_key                 # omit if server needs no auth
+
+services:
+  # ─── PostgreSQL ────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:17
+    container_name: postgres
+    restart: unless-stopped
+    networks: [backend]
+    volumes:
+      - /data/paperless/pgdata:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: paperless
+      POSTGRES_USER: paperless
+      POSTGRES_PASSWORD_FILE: /run/secrets/paperless_db_paperless_passwd
+    secrets: [paperless_db_paperless_passwd]
+
+  # ─── Valkey (or redis) — paperless task queue / broker ─────────────────────
+  valkey:
+    image: valkey/valkey:8
+    container_name: valkey
+    restart: unless-stopped
+    networks: [backend]
+
+  # ─── Gotenberg — PDF/A conversion, office→PDF for paperless ────────────────
+  gotenberg:
+    image: gotenberg/gotenberg:8
+    container_name: gotenberg
+    restart: unless-stopped
+    networks: [backend]
+    command: ["gotenberg", "--chromium-disable-javascript=true"]
+
+  # ─── Tika — text/metadata extraction for non-PDF documents ─────────────────
+  tika:
+    image: apache/tika:latest
+    container_name: tika
+    restart: unless-stopped
+    networks: [backend]
+
+  # ─── paperless-ngx (abbreviated — keep your existing settings) ─────────────
+  paperless:
+    image: ghcr.io/paperless-ngx/paperless-ngx:latest
+    # Chandra at ingest: build paperless-chandra's example Dockerfile instead
+    # (context: ../paperless-chandra/examples, dockerfile: Dockerfile).
+    container_name: paperless
+    restart: unless-stopped
+    networks: [frontend, backend]
+    ports: ["8000:8000"]
+    depends_on: [postgres, valkey, gotenberg, tika]
+    volumes:
+      - /data/paperless/data:/usr/src/paperless/data
+      - /data/paperless/media:/usr/src/paperless/media
+      - /data/paperless/consume:/usr/src/paperless/consume
+    environment:
+      USERMAP_UID: "1000"                # must match paperless-rearchive's user:
+      USERMAP_GID: "1000"
+      PAPERLESS_REDIS: redis://valkey:6379
+      PAPERLESS_DBHOST: postgres
+      PAPERLESS_DBNAME: paperless
+      PAPERLESS_DBUSER: paperless
+      PAPERLESS_DBPASS_FILE: /run/secrets/paperless_db_paperless_passwd
+      PAPERLESS_SECRET_KEY_FILE: /run/secrets/paperless_secret_key
+      PAPERLESS_TIKA_ENABLED: "1"
+      PAPERLESS_TIKA_ENDPOINT: http://tika:9998
+      PAPERLESS_TIKA_GOTENBERG_ENDPOINT: http://gotenberg:3000
+      # Chandra at ingest (paperless-chandra build only):
+      PAPERLESS_CHANDRA_SERVER_URL: http://ai:8110/v1
+      PAPERLESS_CHANDRA_MODEL_NAME: chandra-ocr-2-q8
+      PAPERLESS_CHANDRA_API_KEY_FILE: /run/secrets/chandra_api_key
+    secrets:
+      - paperless_db_paperless_passwd
+      - paperless_secret_key
+      - chandra_api_key
+
+  # ─── paperless-rearchive — tag-driven re-OCR sidecar ───────────────────────
   paperless-rearchive:
     build:
       context: ./paperless-rearchive
@@ -206,31 +295,33 @@ don't need, but the first block is required:
     container_name: paperless-rearchive
     restart: unless-stopped
     # MUST match the UID:GID that owns the files in paperless's archive
-    # directory (often paperless-webserver's PUID:PGID, frequently 1000:1000;
-    # the image's built-in default is 1001:1001).
+    # directory — i.e. the same value as paperless's USERMAP_UID/GID.
     user: "1000:1000"
-    networks:
-      - backend                      # same network paperless & postgres are on
+    networks: [backend]
     depends_on:
       - paperless
-    # ---- required: where to find things ------------------------------------
+    env_file:
+      # Contains only the API token (step 2):
+      #   PAPERLESS_API_TOKEN=...
+      - .env.paperless-rearchive
     environment:
+      # ---- required: where to find things -----------------------------------
       PAPERLESS_BASE_URL: "http://paperless:8000"     # paperless web UI/API
-      PAPERLESS_API_TOKEN: "${PAPERLESS_API_TOKEN}"   # from .env
+      # PAPERLESS_API_TOKEN comes from .env.paperless-rearchive (env_file).
       # Chandra inference server (OpenAI-compatible /v1 API):
       PAPERLESS_CHANDRA_SERVER_URL: "http://ai:8110/v1"
       PAPERLESS_CHANDRA_MODEL_NAME: "chandra-ocr-2-q8"
-      PAPERLESS_CHANDRA_API_KEY: "${PAPERLESS_CHANDRA_API_KEY}"
+      PAPERLESS_CHANDRA_API_KEY_FILE: /run/secrets/chandra_api_key
       # Database (re-ocr-all only) - copy from paperless's own environment:
       PAPERLESS_DBHOST: "postgres"
       PAPERLESS_DBPORT: "5432"
       PAPERLESS_DBNAME: "paperless"
       PAPERLESS_DBUSER: "paperless"
-      PAPERLESS_DBPASS: "${PAPERLESS_DBPASS}"
-      # ---- required: paths inside THIS container ---------------------------
+      PAPERLESS_DBPASS_FILE: /run/secrets/paperless_db_paperless_passwd
+      # ---- required: paths inside THIS container ----------------------------
       REARCHIVE_ARCHIVE_DIR: "/archives"   # mount point of paperless's
                                            # media/documents/archive (below)
-      # ---- optional, safe defaults shown; details in the reference below ---
+      # ---- optional, safe defaults shown; details in the reference below ----
       REARCHIVE_PROVIDER: "chandra"
       REARCHIVE_TRIGGER_TAG_CONTENT: "re-ocr-content"
       REARCHIVE_TRIGGER_TAG_ALL: "re-ocr-all"
@@ -244,7 +335,7 @@ don't need, but the first block is required:
       REARCHIVE_LOG_LEVEL: "INFO"
       REARCHIVE_MAX_PAGES: "0"             # 0 = all pages
       REARCHIVE_OCR_CONCURRENCY: "1"       # parallel pages (see reference)
-      # --- OCR behaviour (mirrors PAPERLESS_OCR_*; see "OCR strategy") ------
+      # --- OCR behaviour (mirrors PAPERLESS_OCR_*; see "OCR strategy") -------
       REARCHIVE_OCR_MODE: "redo"           # redo | auto | force | off
       REARCHIVE_OCR_CLEAN: "clean"         # clean | final | none
       REARCHIVE_OCR_DESKEW: "true"
@@ -261,9 +352,12 @@ don't need, but the first block is required:
     volumes:
       # Read-write: archive files are replaced here. Use the SAME host path
       # your paperless container mounts at media/documents/archive.
-      - /opt/paperless/media/documents/archive:/archives
+      - /data/paperless/media/documents/archive:/archives
       # Optional separate backup location (recommended; see Backup directory):
-      # - /opt/paperless/archive-backups:/archive-backups
+      # - /data/paperless/archive-backups:/archive-backups
+    secrets:
+      - chandra_api_key
+      - paperless_db_paperless_passwd
     logging:
       driver: "json-file"
       options:
@@ -274,6 +368,7 @@ don't need, but the first block is required:
 > **Find your archive path:** in paperless's compose service it is the volume mounted at
 > `/usr/src/paperless/media` — the archive directory is `…/media/documents/archive` on the host.
 > Mount exactly that directory (not its parent) read-write.
+
 
 ### 4. Build and start
 
@@ -299,10 +394,15 @@ Three values are sensitive: the paperless API token, the Chandra API key, and th
 password (plus, optionally, the database user). Each can be supplied in two ways — per
 credential, mix and match:
 
-**1. Compose interpolation from `.env`** (shown above). Compose reads `.env` next to
-`docker-compose.yml`; the service's `environment:` entries pull `${PAPERLESS_API_TOKEN}` etc.
-from it. Only the compose file ever references the variable by name; the value never appears in
-the YAML.
+**1. `env_file` (shown above).** The service reads `.env.paperless-rearchive` via compose's
+`env_file:`; every `KEY=value` in it is injected straight into the container's environment. The
+API token lives there, so it never appears in the YAML. If you prefer, you can put *any* plain
+variable there too and drop it from the `environment:` block.
+
+> ⚠️ Compose interpolation `${…}` in the YAML is resolved from the project's root `.env` (or the
+> shell) **before** `env_file:` files are read — so `${PAPERLESS_API_TOKEN}` would *not* pick up
+> a value from `.env.paperless-rearchive`. That is why the example uses `env_file` for the token
+> and `environment:` for everything else, with no `${…}` cross-references between them.
 
 **2. Secret files (paperless-ngx convention).** For every credential `NAME`, the sidecar
 understands a `NAME_FILE` environment variable pointing at a file whose content is the secret:
@@ -372,7 +472,7 @@ block; the compose example above already lists all of them with defaults.
 | `REARCHIVE_OCR_MODE` | `redo` | How existing text layers are treated — see [OCR strategy](#ocr-strategy-what-happens-to-pdfs-that-already-have-text). Values: `redo`, `auto`, `force`, `off` (legacy `skip`/`skip_noarchive` accepted as `auto`). |
 | `REARCHIVE_OCR_CLEAN` | `clean` | unpaper image cleaning before OCR: `clean` (pre-OCR), `final` (post-OCR; becomes pre-OCR under `redo`, as at ingest), `none`. |
 | `REARCHIVE_OCR_DESKEW` | `true` | Fix small skew (< 45°) before OCR. Silently skipped under `redo` mode (ocrmypdf constraint, same as paperless). |
-| `REARCHIVE_OCR_ROTATE_PAGES` | `true` | Fix 90/180/270° page orientation before OCR (orientation detection via the Chandra engine). |
+| `REARCHIVE_OCR_ROTATE_PAGES` | `true` | Fix 90/180/270° page orientation before OCR. Detection: Tesseract OSD, run locally by the Chandra engine plugin (ocrmypdf asks its OCR engine for orientation). |
 | `REARCHIVE_OCR_ROTATE_PAGES_THRESHOLD` | `12.0` | Confidence threshold for rotation; lower = more aggressive (same meaning as paperless's `PAPERLESS_OCR_ROTATE_PAGES_THRESHOLD`). |
 | `REARCHIVE_OCR_OUTPUT_TYPE` | `pdfa` | Output format of the regenerated archive (`pdfa`, `pdfa-1`, `pdfa-2`, `pdfa-3`, `pdf`), like `PAPERLESS_OCR_OUTPUT_TYPE`. |
 | `REARCHIVE_OCR_LANGUAGE` | `eng` | Language label passed through to ocrmypdf (e.g. `eng+deu`). Chandra itself is language-agnostic; this mainly labels the text layer. |

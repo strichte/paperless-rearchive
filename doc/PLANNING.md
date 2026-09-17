@@ -444,6 +444,12 @@ Secrets (already defined in `paperless-lxc/docker-compose.yml`): `chandra_api_ke
   indicates the model looping on a bad/empty page — effectively a failed OCR. Pipeline should
   detect this (client callback / output repetition heuristic) and mark `-failure` instead of
   writing garbage content. Deferred until observed on more documents.
+- ⬜ **`REARCHIVE_ARCHIVE_FOR_IMAGES` is parsed but not implemented**: `Settings.from_env()` reads
+  it, but `pipeline.py` never consults it — non-PDF originals (JPEG/TIFF/PNG scans) are *always*
+  routed to content-only mode, so images can never get an archive version regenerated. Either
+  implement it (feed images through the ingest-style ocrmypdf path with img2pdf + image_dpi
+  handling, like `paperless_chandra.parser` does) or remove the knob. Discovered 2026-09-17 while
+  writing the README configuration reference.
 - ⬜ paperless-chandra is installed from git `master` (no release tags published upstream yet);
   pin a tag once available for reproducible builds.
 - ⬜ `REARCHIVE_OCR_MODE=force` should only be used knowingly: it is the only mode that changes
