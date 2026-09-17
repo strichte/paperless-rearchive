@@ -294,15 +294,15 @@ services:
 
   # ─── paperless-rearchive — tag-driven re-OCR sidecar ───────────────────────
   paperless-rearchive:
-    # Released image from the Gitea container registry (recommended — pinned
-    # to a release tag). Alternative: build from a source checkout by
-    # uncommenting the build block (see doc/RELEASING.md for releases).
-    image: git.zsh.nz/steffen/paperless-rearchive:v0.1.0
-    # build:
-    #   context: ./paperless-rearchive
-    #   dockerfile: docker/Dockerfile
-    #   args:
-    #     CHANDRA_REF: master   # pin a paperless-chandra SHA for reproducibility
+    # Built from the checked-out source (the repo this compose file lives in).
+    # The version-pinned image tag makes rollback to a previous release a
+    # re-tag + `up -d` away.
+    build:
+      context: ./paperless-rearchive
+      dockerfile: docker/Dockerfile
+      args:
+        CHANDRA_REF: master   # pin a paperless-chandra SHA for reproducibility
+    image: paperless-rearchive:v0.1.0
     container_name: paperless-rearchive
     restart: unless-stopped
     # MUST match the UID:GID that owns the files in paperless's archive
@@ -652,11 +652,10 @@ check reports every backup in the media directory as an orphaned file:
   `pyproject.toml` to the next `.dev0` version and open a fresh `## Unreleased`
   section in `CHANGELOG.md` — see [`doc/RELEASING.md`](doc/RELEASING.md) for
   the full versioning rhythm, release runbook and rollback notes.
-- **Releases** are cut by running `scripts/release-check.sh <version>`, then
-  tagging `v<version>` and pushing — Gitea Actions (`.gitea/workflows/`) runs
-  the tests, builds the container image and publishes it to the instance
-  container registry with a release page. Secrets needed there:
-  `REGISTRY_USER`, `REGISTRY_TOKEN`, `RELEASE_TOKEN`.
+- **Releases** are source tags: run `scripts/release-check.sh <version>`, tag
+  `v<version>`, push, then deploy by checking the tag out and rebuilding the
+  image with docker compose (see [`doc/RELEASING.md`](doc/RELEASING.md)). No
+  CI, no registry — the compose build is the distribution.
 
 ### Design docs
 

@@ -280,7 +280,6 @@ paperless-rearchive/
 │       ├── compose-snippet.yml
 │       └── env.example
 ├── scripts/release-check.sh   # release guard (versions, changelog, tests)
-├── .gitea/workflows/          # Gitea Actions: ci.yml (tests), release.yml (image + release)
 ├── paperless_rearchive/
 │   ├── __init__.py            # __version__ from installed package metadata
 │   ├── config.py              # env-driven Settings
@@ -521,8 +520,12 @@ Secrets (already defined in `paperless-lxc/docker-compose.yml`): `chandra_api_ke
   source of truth); regression-tested; poller startup log shows the version.
 - ✅ `doc/RELEASING.md` runbook (versioning rhythm, runbook, hotfix/rollback) and
   `scripts/release-check.sh` guard (clean tree, tag free, version/changelog agreement, tests).
-- ✅ Gitea Actions: `.gitea/workflows/ci.yml` (tests + ruff on push/PR) and `release.yml`
-  (tag → tests → image build with pinned `CHANDRA_REF` → registry push → release page).
-  Requires repo secrets `REGISTRY_USER` / `REGISTRY_TOKEN` / `RELEASE_TOKEN` and an act_runner.
+- ✅ Release decision (2026-09-17): **no CI, no registry, no prebuilt images** — releases are
+  source tags built locally with docker compose (seconds, cached layers). Gitea Actions workflows
+  were prototyped and dropped: for a single-operator project the local `release-check.sh` guard
+  provides the same quality gate, and the runner/registry stack (act_runner, job image, registry
+  secrets) added infrastructure with no offsetting benefit. A BuildKit pip hang discovered during
+  the CI job-image build (worked around via a commit-a-container build) sealed the decision; the
+  parked runner setup remains at `/home/paperless/act-runner/` (not registered, not running).
 - ✅ `docker/Dockerfile`: `CHANDRA_REF` build-arg pins the paperless-chandra ref (closes the
   reproducibility risk above for release artifacts).

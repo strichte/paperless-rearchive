@@ -9,14 +9,15 @@
 # secret next to the others in the top-level `secrets:` section).
 
   paperless-rearchive:
+    # Built from the checked-out source. The version-pinned image tag makes
+    # rollback to a previous release a re-tag + `up -d` away. Pin
+    # CHANDRA_REF (a paperless-chandra SHA) for reproducible release builds.
     build:
       context: ../paperless-rearchive
       dockerfile: docker/Dockerfile
-      # Pin paperless-chandra for reproducible builds (release practice);
-      # default: master.
       args:
         CHANDRA_REF: master
-    image: git.zsh.nz/steffen/paperless-rearchive:v0.1.0
+    image: paperless-rearchive:v0.1.0
     container_name: paperless-rearchive
     restart: unless-stopped
     user: "1001:1001"
