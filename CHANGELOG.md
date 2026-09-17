@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project versions with SemVer (pre-1.0: features bump the minor, fixes the
 patch).
 
+## Unreleased
+
 ## 0.1.0 — 2026-09-17
 
 First public release. Tag-driven re-OCR sidecar for paperless-ngx: re-OCR
