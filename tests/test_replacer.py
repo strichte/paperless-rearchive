@@ -41,15 +41,18 @@ def test_verify_checksum_mismatch(tmp_path: Path) -> None:
 def test_replace_archive_atomic_and_backup(tmp_path: Path) -> None:
     old = _write(tmp_path / "0000123.pdf", b"old-archive-bytes")
     new = _write(tmp_path / "new.pdf", b"new-archive-bytes")
+    backup_dir = tmp_path / "backups"
 
-    checksum = replace_archive(old, new, keep_backup=True)
+    checksum = replace_archive(old, new, keep_backup=True, backup_dir=backup_dir)
 
     assert old.read_bytes() == b"new-archive-bytes"
     assert checksum_of_file(old) == checksum
     assert checksum == checksum_of_file(new)
-    backups = list(tmp_path.glob("0000123.pdf.bak-*"))
+    backups = list(backup_dir.glob("0000123.pdf.bak-*"))
     assert len(backups) == 1
     assert backups[0].read_bytes() == b"old-archive-bytes"
+    # no backup next to the archive (no orphaned file in the media dir)
+    assert not list(tmp_path.glob("0000123.pdf.bak-*"))
     # no stray staging files
     assert not list(tmp_path.glob(".0000123.pdf.rearch-tmp"))
 
@@ -57,7 +60,9 @@ def test_replace_archive_atomic_and_backup(tmp_path: Path) -> None:
 def test_replace_archive_no_backup(tmp_path: Path) -> None:
     old = _write(tmp_path / "0000123.pdf", b"old")
     new = _write(tmp_path / "new.pdf", b"new")
-    replace_archive(old, new, keep_backup=False)
+    backup_dir = tmp_path / "backups"
+    replace_archive(old, new, keep_backup=False, backup_dir=backup_dir)
+    assert not list(backup_dir.glob("*.bak-*"))
     assert not list(tmp_path.glob("*.bak-*"))
 
 
@@ -109,10 +114,11 @@ def test_replace_archive_backup_dir_created_on_demand(tmp_path: Path) -> None:
     assert len(list(backup_dir.glob("a.pdf.bak-*"))) == 1
 
 
-def test_backup_destination_legacy_keeps_backup_next_to_archive(tmp_path: Path) -> None:
+def test_backup_destination_flat_when_no_archive_dir(tmp_path: Path) -> None:
     from paperless_rearchive.archive.replacer import backup_destination
 
     archive = _write(tmp_path / "a.pdf", b"x")
-    dest = backup_destination(archive)
-    assert dest.parent == tmp_path
+    backup_dir = tmp_path / "backups"
+    dest = backup_destination(archive, backup_dir=backup_dir)
+    assert dest.parent == backup_dir
     assert dest.name.startswith("a.pdf.bak-")

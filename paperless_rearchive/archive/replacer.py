@@ -59,20 +59,16 @@ def verify_current_checksum(archive_path: Path, expected: str | None) -> None:
 def backup_destination(
     archive_path: Path,
     *,
-    backup_dir: Path | None = None,
+    backup_dir: Path,
     archive_dir: Path | None = None,
 ) -> Path:
     """Return the ``<name>.bak-<timestamp>`` path for ``archive_path``.
 
-    * ``backup_dir`` unset — the backup stays next to the archive (legacy
-      behaviour).
-    * ``backup_dir`` set — the archive's path relative to ``archive_dir`` is
-      recreated below it, so template sub-directories are preserved. An
-      archive that cannot be related to ``archive_dir`` is stored flat.
+    The archive's path relative to ``archive_dir`` is recreated below
+    ``backup_dir``, so template sub-directories are preserved. An archive
+    that cannot be related to ``archive_dir`` is stored flat.
     """
     name = f"{archive_path.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
-    if backup_dir is None:
-        return archive_path.with_name(name)
     rel: Path | None = None
     if archive_dir is not None:
         try:
@@ -93,18 +89,17 @@ def replace_archive(
     new_pdf: Path,
     *,
     keep_backup: bool = True,
-    backup_dir: Path | None = None,
+    backup_dir: Path,
     archive_dir: Path | None = None,
 ) -> str:
     """Atomically replace ``archive_path`` with ``new_pdf``.
 
     Returns the SHA-256 checksum of the newly written file. The previous
-    archive version is preserved as ``<name>.bak-<timestamp>`` — next to the
-    archive, or below ``backup_dir`` when that is set (see
-    :func:`backup_destination`). The backup is *copied*, so ``backup_dir`` may
-    live on a different filesystem/disk; keeping it outside the media
-    directory is what stops paperless-ngx's health check from reporting the
-    backups as orphaned files.
+    archive version is preserved as ``<name>.bak-<timestamp>`` below the
+    required ``backup_dir`` (see :func:`backup_destination`). The backup is
+    *copied*, so ``backup_dir`` may live on a different filesystem/disk;
+    keeping it outside the media directory is what stops paperless-ngx's
+    health check from reporting the backups as orphaned files.
     """
     if keep_backup:
         backup_path = backup_destination(

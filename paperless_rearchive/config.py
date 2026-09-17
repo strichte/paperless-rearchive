@@ -69,9 +69,10 @@ class Settings:
     paperless_url: str
     api_token: str
     archive_dir: Path
-    #: Where replaced archives are backed up. ``None`` keeps the legacy
-    #: behaviour (``<archive>.bak-<ts>`` next to the archive itself).
-    backup_dir: Path | None
+    #: Where replaced archives are backed up. Required: backups must live
+    #: outside the archive tree (enforced by :meth:`validate`), never next to
+    #: the archives in paperless's media directory.
+    backup_dir: Path
 
     trigger_tag_content: str
     trigger_tag_all: str
@@ -111,17 +112,16 @@ class Settings:
     def validate(self) -> None:
         """Refuse obviously unsafe configurations (called once at startup).
 
-        Only ``REARCHIVE_BACKUP_DIRECTORY`` is checked today. paperless-ngx's
-        health check (``sanity_checker``) walks ``PAPERLESS_MEDIA_ROOT`` and
-        cannot tell sidecar backups apart from orphaned files, so backups
-        written into the archive tree produce warnings like::
+        ``REARCHIVE_BACKUP_DIRECTORY`` must not be at or below the archive
+        directory: paperless-ngx's health check (``sanity_checker``) walks
+        ``PAPERLESS_MEDIA_ROOT`` and cannot tell sidecar backups apart from
+        orphaned files, so backups written into the archive tree produce
+        warnings like::
 
             Orphaned file in media dir: .../documents/archive/....pdf.bak-...
 
         Anything at or below the archive directory is therefore rejected.
         """
-        if self.backup_dir is None:
-            return
         if _is_within(self.backup_dir, self.archive_dir):
             raise ValueError(
                 "REARCHIVE_BACKUP_DIRECTORY resolves to the archive directory "
@@ -130,10 +130,7 @@ class Settings:
                 "reports every backup as an orphaned file in the media "
                 "directory. Point REARCHIVE_BACKUP_DIRECTORY at a directory "
                 "outside the archive tree - typically a separate bind mount, "
-                "possibly another disk. If you really want the backups next "
-                "to the archives, omit REARCHIVE_BACKUP_DIRECTORY (the legacy "
-                "behaviour) - but note that it still triggers the "
-                "orphaned-file warning; we do not recommend it."
+                "possibly another disk."
             )
         if self.backup_dir.exists() and not self.backup_dir.is_dir():
             raise ValueError(
@@ -148,8 +145,6 @@ class Settings:
         OCR work rather than at the first archive replacement. Dry runs never
         write, so in dry-run mode a missing directory is only reported.
         """
-        if self.backup_dir is None:
-            return
         if not self.backup_dir.exists():
             if self.dry_run:
                 log.warning(
@@ -175,8 +170,6 @@ class Settings:
 
     def _log_backup_filesystem(self) -> None:
         """Report whether backups cross a filesystem boundary (different disk)."""
-        if self.backup_dir is None:
-            return
         try:
             backup_dev = os.stat(self.backup_dir).st_dev
             archive_dev = os.stat(self.archive_dir).st_dev
@@ -209,6 +202,15 @@ class Settings:
         if not isinstance(user_args, dict):
             raise ValueError("REARCHIVE_OCR_USER_ARGS must decode to a JSON object")
         backup_raw = _env("REARCHIVE_BACKUP_DIRECTORY", "")
+        if not backup_raw:
+            raise ValueError(
+                "REARCHIVE_BACKUP_DIRECTORY is required: replaced archives are "
+                "backed up there before the new file is put in place. Point it "
+                "at a directory OUTSIDE the archive tree (REARCHIVE_ARCHIVE_DIR) "
+                "- typically a separate bind mount, possibly another disk - so "
+                "paperless-ngx's health check does not report the backups as "
+                "orphaned files in the media directory."
+            )
         return cls(
             paperless_url=_env("PAPERLESS_BASE_URL", "http://paperless:8000").rstrip("/"),
             api_token=secret("PAPERLESS_API_TOKEN"),

@@ -16,7 +16,10 @@ from paperless_rearchive.config import Settings
 
 
 def _settings(**env: str) -> Settings:
-    base = {"PAPERLESS_API_TOKEN": "t"}
+    base = {
+        "PAPERLESS_API_TOKEN": "t",
+        "REARCHIVE_BACKUP_DIRECTORY": "/archive-backups",
+    }
     base.update(env)
     # clear=True keeps these tests deterministic regardless of the caller's
     # environment (e.g. an integration shell exporting REARCHIVE_DRY_RUN).
@@ -24,8 +27,9 @@ def _settings(**env: str) -> Settings:
         return Settings.from_env()
 
 
-def test_backup_dir_unset_by_default() -> None:
-    assert _settings().backup_dir is None
+def test_backup_dir_required() -> None:
+    with pytest.raises(ValueError, match="REARCHIVE_BACKUP_DIRECTORY"):
+        _settings(REARCHIVE_BACKUP_DIRECTORY="")
 
 
 def test_backup_dir_from_env() -> None:
@@ -93,8 +97,8 @@ def test_prepare_backup_dir_creates_and_is_idempotent(tmp_path: Path) -> None:
     s.prepare_backup_dir()  # second call must not fail
 
 
-def test_prepare_backup_dir_noop_when_unset() -> None:
-    _settings().prepare_backup_dir()  # no raise
+def test_prepare_backup_dir_run_does_not_raise(tmp_path: Path) -> None:
+    _settings(REARCHIVE_BACKUP_DIRECTORY=str(tmp_path / "backups")).prepare_backup_dir()
 
 
 def test_prepare_backup_dir_dry_run_does_not_create(tmp_path: Path) -> None:

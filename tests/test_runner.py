@@ -21,6 +21,7 @@ def _settings(**env: str) -> Settings:
     base = {
         "PAPERLESS_API_TOKEN": "t",
         "PAPERLESS_CHANDRA_SERVER_URL": "http://ai:8110/v1",
+        "REARCHIVE_BACKUP_DIRECTORY": "/archive-backups",
         "REARCHIVE_OCR_USER_ARGS": json.dumps({"invalidate_digital_signatures": True}),
     }
     base.update(env)

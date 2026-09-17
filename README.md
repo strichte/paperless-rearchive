@@ -47,6 +47,10 @@ live with every item on this list:
   are recorded (audit note per run, provenance custom fields, `.bak` backups of replaced
   archives), but there is no undo button. Start with `REARCHIVE_DRY_RUN=true` and one test
   document.
+- **You can provide a backup directory outside the archive tree** (mandatory). Before an archive
+  is replaced, the old version is copied to `REARCHIVE_BACKUP_DIRECTORY` — the sidecar refuses to
+  run without it, and refuses to run if it points into the archive tree. Ideally a separate bind
+  mount (it may even be another disk; backups are *copied*).
 
 If you just want Chandra OCR for **new** documents at ingest, you don't need this project — run
 [paperless-chandra](https://github.com/flobernd/paperless-chandra) directly. paperless-rearchive
@@ -101,9 +105,9 @@ poller](#manual-trigger-sighup)).
 - **The original file is immutable.** It is only ever downloaded via the `paperless-ngx` API into a scratch
   directory and used as the OCR source. Nothing ever writes to `media/documents/originals/`.
 - Archive files are replaced **atomically** (write temp file → `os.replace`) and the previous
-  archive version is kept as a `.bak-<timestamp>` file. By default that backup sits next to the
-  archive; set `REARCHIVE_BACKUP_DIRECTORY` to keep it outside the media directory instead — see
-  [Backup directory](#backup-directory).
+  archive version is kept as a `.bak-<timestamp>` file in `REARCHIVE_BACKUP_DIRECTORY` — a
+  mandatory setting, outside the media directory (see
+  [Backup directory](#backup-directory)).
 - The archive is only replaced after verifying that the on-disk archive checksum still matches
   `documents_document.archive_checksum` (no concurrent modification).
 - Born-digital PDFs without an archive version, and non-PDF originals (images), are handled in
@@ -342,13 +346,15 @@ services:
       # REARCHIVE_ARCHIVE_FOR_IMAGES: "false"   # reserved; images are content-only today
       PAPERLESS_CHANDRA_CONTENT_FORMAT: "markdown"
       PAPERLESS_CHANDRA_MAX_OUTPUT_TOKENS: "12384"
-      # REARCHIVE_BACKUP_DIRECTORY: "/archive-backups"   # see Backup directory
+      # ---- required: backup location (must NOT be inside /archives) --------
+      REARCHIVE_BACKUP_DIRECTORY: "/archive-backups"   # see Backup directory
     volumes:
       # Read-write: archive files are replaced here. Use the SAME host path
       # your paperless container mounts at media/documents/archive.
       - /data/paperless/media/documents/archive:/archives
-      # Optional separate backup location (recommended; see Backup directory):
-      # - /data/paperless/archive-backups:/archive-backups
+      # Required: where .bak backups of replaced archives are kept. May be a
+      # different disk than the archive mount (backups are copied).
+      - /data/paperless/archive-backups:/archive-backups
     secrets:
       - chandra_api_key
       - paperless_db_paperless_passwd
@@ -527,7 +533,7 @@ block; the compose example above already lists all of them with defaults.
 | `REARCHIVE_POLL_INTERVAL` | `300` | Seconds between poll cycles. |
 | `REARCHIVE_BATCH_LIMIT` | `5` | Maximum documents processed per cycle (more stay tagged for the next cycle). |
 | `REARCHIVE_ARCHIVE_DIR` | `/archives` | Inside the container: where paperless's archive directory is mounted. Must match the `volumes:` entry. |
-| `REARCHIVE_BACKUP_DIRECTORY` | *(unset)* | Where `.bak-<timestamp>` backups of replaced archives are kept. Unset = next to the archive (triggers paperless health-check warnings) — see [Backup directory](#backup-directory). |
+| `REARCHIVE_BACKUP_DIRECTORY` | *(required)* | Where `.bak-<timestamp>` backups of replaced archives are kept. Must be outside the archive tree (the sidecar refuses to start otherwise) — see [Backup directory](#backup-directory). |
 | `REARCHIVE_WRITE_PROVENANCE` | `true` | Write provenance custom fields (`OCR engine`, `OCR date`, `OCR pages`, `OCR archive ratio`) and append an audit note per run. Skipped in dry-run. |
 | `REARCHIVE_DRY_RUN` | `false` | Full OCR run, but nothing is written: no content PATCH, no archive replacement, no DB update, no tag changes (trigger tags must already exist). |
 | `REARCHIVE_RUN_ONCE` | `false` | Exit after one poll cycle (useful for cron-style or CI usage). |
@@ -580,15 +586,10 @@ already running* is honoured immediately after that cycle finishes (it is not sw
 
 ## Backup directory
 
-By default the previous archive version is kept next to the archive as `<name>.bak-<timestamp>`.
-paperless-ngx's **health check** walks `PAPERLESS_MEDIA_ROOT` and cannot tell those backups apart
-from orphaned files, so it logs warnings such as:
-
-> `[WARNING] [paperless.sanity_checker] Orphaned file in media dir: …/documents/archive/….pdf.bak-…`
-
-Set `REARCHIVE_BACKUP_DIRECTORY` to move the backups out of the media directory. It must be a
-**different directory than `REARCHIVE_ARCHIVE_DIR`** — ideally a **separate bind mount**, which
-may even be a different disk (backups are *copied*, not moved):
+`REARCHIVE_BACKUP_DIRECTORY` is a **mandatory setting**: before an archive is replaced, the
+current version is copied there as `<name>.bak-<timestamp>`. It must be a **different directory
+than `REARCHIVE_ARCHIVE_DIR`** — ideally a **separate bind mount**, which may even be a different
+disk (backups are *copied*, not moved):
 
 ```yaml
 services:
@@ -602,12 +603,16 @@ services:
       REARCHIVE_BACKUP_DIRECTORY: "/archive-backups"
 ```
 
-The archive's sub-directory layout is mirrored below the backup directory. At startup the sidecar
-creates the directory if needed, verifies it is writable, and **refuses to run** when
-`REARCHIVE_BACKUP_DIRECTORY` resolves to the archive directory or a sub-directory of it (symlinks
-included). If backups next to the archives are really what you want, omit the variable — that is
-the default — but expect the health-check warnings. Existing `.bak-*` files in the archive
-directory can be moved to the backup directory (or deleted) to clear those warnings.
+The archive's sub-directory layout is mirrored below the backup directory. The sidecar **refuses
+to start** without the setting, when it resolves to the archive directory or a sub-directory of it
+(symlinks included), when the path exists but is not a directory, or when it is not writable — it
+creates the directory on startup if needed. Without this safeguard, paperless-ngx's health check
+reports every backup in the media directory as an orphaned file:
+
+> `[WARNING] [paperless.sanity_checker] Orphaned file in media dir: …/documents/archive/….pdf.bak-…`
+
+Existing `.bak-*` files in the archive directory (from earlier versions) can be moved to the
+backup directory (or deleted) to clear those warnings.
 
 ## Status
 

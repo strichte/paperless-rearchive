@@ -332,7 +332,8 @@ paperless-rearchive/
 ### Phase 4 — Archive replacement ✅
 - ✅ `archive/db.py` (psycopg; fetch + update archive_checksum)
 - ✅ `archive/replacer.py` (verify checksum, backup, atomic replace, sha256; backup destination
-  configurable via `REARCHIVE_BACKUP_DIRECTORY` — legacy next-to-archive when unset)
+  below the mandatory `REARCHIVE_BACKUP_DIRECTORY` — the legacy next-to-archive fallback was
+  removed)
 - ✅ DB password from secret file `paperless_db_paperless_passwd`
 
 ### Phase 5 — Deployment & tests 🔧
@@ -385,7 +386,7 @@ token, the Chandra key, and the database user/password.
 | `REARCHIVE_SUCCESS_SUFFIX` | `-success` | success tag suffix |
 | `REARCHIVE_FAILURE_SUFFIX` | `-failure` | failure tag suffix |
 | `REARCHIVE_ARCHIVE_DIR` | `/archives` | bind-mounted `media/documents/archive` |
-| `REARCHIVE_BACKUP_DIRECTORY` | *(unset)* | directory for the `.bak-<timestamp>` archive backups. Unset = next to the archive (legacy behaviour; paperless-ngx's health check then reports each backup as an orphaned file in the media dir). Set it to a directory **outside** the archive tree - typically a separate bind mount, possibly another disk (the backup is *copied*). Created/verified at startup; startup **refuses to run** when it resolves to the archive dir or a subdirectory of it (symlinks included). |
+| `REARCHIVE_BACKUP_DIRECTORY` | *(required)* | directory for the `.bak-<timestamp>` archive backups. Must be a directory **outside** the archive tree - typically a separate bind mount, possibly another disk (the backup is *copied*). Created/verified at startup; startup **refuses to run** when unset, when it resolves to the archive dir or a subdirectory of it (symlinks included), or when it is not writable. |
 | `REARCHIVE_PROVIDER` | `chandra` | OCR provider plugin |
 | `PAPERLESS_CHANDRA_SERVER_URL` | *(required)* | e.g. `http://ai:8110/v1` |
 | `PAPERLESS_CHANDRA_MODEL_NAME` | `chandra` | e.g. `chandra-ocr-2-q8` |
@@ -459,6 +460,7 @@ Secrets (already defined in `paperless-lxc/docker-compose.yml`): `chandra_api_ke
 - ⬜ `REARCHIVE_OCR_MODE=force` should only be used knowingly: it is the only mode that changes
   archive size dramatically.
 - ✅ **Resolved** — `.bak` files inside `media/documents/archive/` tripped paperless-ngx's
-  orphaned-file health check. `REARCHIVE_BACKUP_DIRECTORY` now relocates the backups outside the
+  orphaned-file health check. `REARCHIVE_BACKUP_DIRECTORY` relocates the backups outside the
   media dir (cross-disk safe: they are copied), mirrors the archive's sub-directory layout, is
-  created/verified at startup, and is refused at/below the archive directory.
+  created/verified at startup, and is refused at/below the archive directory. It is now a
+  **mandatory** setting — the legacy next-to-archive fallback was removed entirely.
