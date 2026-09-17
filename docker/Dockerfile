@@ -46,8 +46,16 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir ".[db]"
 
 # Run as the same UID/GID as the paperless container so it can replace
-# archive files on the bind mount.
-RUN useradd --uid 1001 --user-group --no-create-home rearchive || true
-USER 1001
+# archive files on the bind mount. UID/GID are build args — set them in the
+# compose build block to match the paperless service's USERMAP_UID/GID (the
+# runtime `user:` in compose must be the same pair). The passwd entry is
+# cosmetic for tools doing name lookups; the numeric runtime user works
+# regardless.
+ARG UID=1001
+ARG GID=1001
+RUN groupadd --gid "${GID}" rearchive \
+    && useradd --uid "${UID}" --gid "${GID}" --no-create-home rearchive \
+    || true
+USER "${UID}:${GID}"
 
 ENTRYPOINT ["python", "-m", "paperless_rearchive.poller"]

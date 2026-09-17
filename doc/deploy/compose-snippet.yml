@@ -11,12 +11,16 @@
   paperless-rearchive:
     # Built from the checked-out source. The version-pinned image tag makes
     # rollback to a previous release a re-tag + `up -d` away. Pin
-    # CHANDRA_REF (a paperless-chandra SHA) for reproducible release builds.
+    # CHANDRA_REF (a paperless-chandra SHA) for reproducible release builds;
+    # UID/GID create the image's rearchive user — same pair as the runtime
+    # `user:` (must match paperless's USERMAP_UID/GID).
     build:
       context: ../paperless-rearchive
       dockerfile: docker/Dockerfile
       args:
         CHANDRA_REF: master
+        UID: "1001"
+        GID: "1001"
     image: paperless-rearchive:v0.1.0
     container_name: paperless-rearchive
     restart: unless-stopped

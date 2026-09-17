@@ -302,11 +302,15 @@ services:
       dockerfile: docker/Dockerfile
       args:
         CHANDRA_REF: master   # pin a paperless-chandra SHA for reproducibility
+        UID: "1000"           # create the image's rearchive user with this
+        GID: "1000"           # UID/GID — same pair as user: below and
+                              # paperless's USERMAP_UID/GID
     image: paperless-rearchive:v0.1.0
     container_name: paperless-rearchive
     restart: unless-stopped
-    # MUST match the UID:GID that owns the files in paperless's archive
-    # directory — i.e. the same value as paperless's USERMAP_UID/GID.
+    # MUST match the build args above and the UID:GID that owns the files in
+    # paperless's archive directory — i.e. the same value as paperless's
+    # USERMAP_UID/GID.
     user: "1000:1000"
     networks: [backend]
     depends_on:
