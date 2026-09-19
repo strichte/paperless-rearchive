@@ -362,6 +362,81 @@ def restore_content(
     return True
 
 
+def clear_provenance_fields(api: PaperlessAPI, doc_id: int) -> int:
+    """Clear the sidecar's OCR provenance custom fields on ``doc_id``.
+
+    After a restore the recorded provenance (engine/date/pages/ratio) no
+    longer describes the document, so every field the sidecar manages is
+    emptied (``value: None`` removes the field instance). Fields that do not
+    exist or that the document never carried are skipped silently.
+
+    Returns the number of fields cleared.
+    """
+    values = []
+    for name, _data_type in PaperlessAPI.PROVENANCE_FIELDS:
+        field_id = api.custom_field_id(name)
+        if field_id is not None:
+            values.append({"field": field_id, "value": None})
+    api.set_custom_fields(doc_id, values)
+    return len(values)
+
+
+def clear_reocr_tags(api: PaperlessAPI, settings: Settings, doc_id: int) -> list[str]:
+    """Remove all re-OCR tags from ``doc_id``; returns the removed names.
+
+    A restored document must not look re-OCR'd: triggers (`re-ocr-content`,
+    `re-ocr-all`), the force modifier, the preserved tag, and the outcome
+    tags (`<trigger><success/failure suffix>`) are all stale after a restore.
+    Tag names come from the settings, so custom tag names are honoured.
+    """
+    triggers = [settings.trigger_tag_content, settings.trigger_tag_all]
+    candidates = [
+        *triggers,
+        *[trigger + settings.success_suffix for trigger in triggers],
+        *[trigger + settings.failure_suffix for trigger in triggers],
+        settings.force_tag,
+        settings.preserved_tag,
+    ]
+    candidates = [name for name in candidates if name]
+    current = api.document(doc_id).get("tags", [])
+    removed: list[str] = []
+    to_remove: list[int] = []
+    for name in candidates:
+        tag_id = api.tag_id(name)
+        if tag_id is not None and tag_id in current:
+            to_remove.append(tag_id)
+            removed.append(name)
+    if to_remove:
+        api.set_tags(doc_id, remove=to_remove, add=[], current_tags=list(current))
+    return removed
+
+
+def restore_audit_note(
+    plan: RestorePlan, *, archive_done: bool, content_done: bool, removed_tags: list[str]
+) -> str:
+    """Compose the audit note describing one document's restore."""
+    what = " and ".join(
+        part
+        for part, done in (("archive file", archive_done), ("content field", content_done))
+        if done
+    )
+    lines = [
+        f"Restore from backup ({what}): {plan.backup.name}",
+        f"Backup path: {plan.backup}",
+        (
+            "Content was re-extracted from the backup with pdftotext "
+            "(-q -layout -enc UTF-8) — it may differ from the original "
+            "content field, depending on how OCR was configured in "
+            "paperless-ngx at ingestion time."
+        )
+        if content_done
+        else "Content field not restored.",
+        "OCR provenance custom fields cleared (stale after restore).",
+        "Re-OCR tags removed." if removed_tags else "No re-OCR tags present.",
+    ]
+    return "\n".join(lines)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="restore_backup",
@@ -461,12 +536,42 @@ def main(argv: list[str] | None = None) -> int:
 
     failures = 0
     for operand in args.operands:
+        archive_done = False
+        content_done = False
         try:
             plan = _plan_for_operand(operand, settings)
             if restore_archive_part:
-                restore_archive(plan, settings, force=args.force)
+                archive_done = restore_archive(plan, settings, force=args.force)
             if restore_content_part:
-                restore_content(plan, api, force=args.force)
+                content_done = restore_content(plan, api, force=args.force)
+            if archive_done or content_done:
+                # Best-effort bookkeeping: a note must never fail the restore.
+                try:
+                    removed_tags = clear_reocr_tags(api, settings, plan.doc_id)
+                    api.add_note(
+                        plan.doc_id,
+                        restore_audit_note(
+                            plan,
+                            archive_done=archive_done,
+                            content_done=content_done,
+                            removed_tags=removed_tags,
+                        ),
+                    )
+                    cleared = clear_provenance_fields(api, plan.doc_id)
+                    log.info(
+                        "Document %d: audit note written, %d provenance field(s) "
+                        "cleared, %d re-OCR tag(s) removed",
+                        plan.doc_id,
+                        cleared,
+                        len(removed_tags),
+                    )
+                except PaperlessError:
+                    log.exception(
+                        "Document %d: could not write restore note / clear "
+                        "provenance fields / remove re-OCR tags (restore itself "
+                        "succeeded)",
+                        plan.doc_id,
+                    )
         except (RuntimeError, PaperlessError, OSError) as e:
             print(f"error: {operand!r}: {e}", file=sys.stderr)
             failures += 1
