@@ -19,14 +19,15 @@ The original file is immutable; it is only downloaded via the API and used as OC
 
 ## 2. Research notes (confirmed against paperless-ngx source / docs)
 
-- **Unified OCR architecture** (Phase 3b, in progress): The OCR engine now uses a single Chandra pass
-  that produces both markdown content and hOCR structures. For `re-ocr-content`, only the markdown is
-  used (no PDF/A generated). For `re-ocr-all`, the hOCR is passed to ocrmypdf's sandwich pipeline
-  to produce the searchable PDF/A from the original scan images. This avoids wasting CPU on PDF/A
-  generation for content-only mode. The branching decision is made after OCR completion based on the
-  trigger tag. Implemented in `paperless_rearchive/ocr/chandra_engine.py` (ChandraOcrEngine class).
-  PDF/A assembly always uses ocrmypdf's sandwich pipeline for maximum compatibility and PDF/A compliance.
-  `documents.utils.compute_checksum` — **SHA-256** of the file bytes (verified live: the
+- **Unified OCR architecture** (Phase 3b ✅ done): a single Chandra pass produces both
+  markdown content and hOCR structures (`paperless_rearchive/ocr/chandra_engine.py`,
+  `ChandraOcrEngine`). For `re-ocr-content`, only the markdown is used (no PDF/A generated).
+  For `re-ocr-all`, the hOCR is passed to ocrmypdf's sandwich pipeline to produce the
+  searchable PDF/A from the original scan images. This avoids wasting CPU on PDF/A
+  generation for content-only mode. The branching decision is made after OCR completion
+  based on the trigger tag. PDF/A assembly always uses ocrmypdf's sandwich pipeline for
+  maximum compatibility and PDF/A compliance.
+- **Archive checksum**: `documents.utils.compute_checksum` — **SHA-256** of the file bytes (verified live: the
   on-disk file's SHA-256 matches the DB value exactly; earlier paperless releases used MD5)
   when the archive is moved into `settings.ARCHIVE_DIR`. Correct update statement:
   `UPDATE documents_document SET archive_checksum = '<sha256>' WHERE id = <id>;`
@@ -52,10 +53,10 @@ The original file is immutable; it is only downloaded via the API and used as OC
   (`skip_text`, `pdf_born_digital_text`); `PAPERLESS_ARCHIVE_FILE_GENERATION`
   (`never`/`only`/`always`) decides whether an archive file is produced at all. Documents
   without an archive file ⇒ content-only mode in this sidecar.
-- **Non-PDF originals** (jpg/png/tiff/…): paperless converts them to a PDF during consumption
-  (`PAPERLESS_OCR_IMAGE_DPI`, A4 DPI fallback). The sidecar runs the same conversion via
-  ocrmypdf but cannot regenerate an *existing* archive file (none exists) ⇒ content-only by
-  default; `REARCHIVE_ARCHIVE_FOR_IMAGES=true` later opts into creating one (experimental).
+- **Non-PDF originals** (jpg/png/tiff/…): content-only by design — no archive file
+  exists to regenerate, and `REARCHIVE_ARCHIVE_FOR_IMAGES` is a reserved knob parsed in
+  `Settings.from_env()` but never consulted by `pipeline.py` (see §7). Non-PDF `re-ocr-all`
+  requests fall through to content-only mode.
 - **API limits**: there is no endpoint to upload/replace the archive version of an existing
   document, and the document upload endpoint only creates *new* documents — hence the
   bind-mount + direct DB update approach used here.
@@ -63,12 +64,6 @@ The original file is immutable; it is only downloaded via the API and used as OC
   by default. The immutable original requires the query parameter `?original=true` (verified
   live — without it the sidecar re-OCR'd an archive it had itself just written). The sidecar
   always passes `original=true` and works in a scratch directory; nothing writes to
-- **Unified OCR architecture** (Phase 3 refactor): The OCR engine now uses a single Chandra pass
-  that produces both markdown content and hOCR structures. For `re-ocr-content`, only the markdown
-  is used (no PDF/A generated). For `re-ocr-all`, the hOCR is passed to ocrmypdf's sandwich pipeline
-  to produce the searchable PDF/A from the original scan images. This avoids wasting CPU on PDF/A
-  generation for content-only mode. The branching decision is made after OCR completion based on the
-  trigger tag. See `paperless_rearchive/ocr/chandra_engine.py` for the unified implementation.
   `media/documents/originals/`.
 - **Tag lookup**: `/api/tags/` silently ignores `?name=` and `?name__exact=`; `?name__iexact=`
   works. `?name__icontains=` is a trap — `re-ocr-all` also matches `re-ocr-all-success`. The
@@ -84,14 +79,20 @@ The original file is immutable; it is only downloaded via the API and used as OC
   `--redo-ocr` combined with `--deskew`/`--clean-final`/`--remove-background`, so the runner
   must drop deskew rather than fall through to `force_ocr` (a silent fallback here would have
   inflated every archive).
-- **`skip_text` sidecar hazard**: with `skip_text`, ocrmypdf's sidecar contains only
-  `[OCR skipped on page(s) …]`. Writing that to `content` destroys the existing text, so the
-  runner treats an all-placeholder sidecar as a hard failure (`ocr_skipped_all`) instead of a
-  result.
-- **Chandra repeat-loop = failed scan**: when the vLLM/Chandra server logs
-  `Detected repeat token, retrying generation (attempt N)` and the GPU spins up, the model is
-  looping on a bad/empty page. Such runs are effectively failed scans — quality is garbage even
-  though the pipeline completes. Detection/handling is deferred — see Risks.
+- **`skip_text` sidecar hazard (legacy `ocr/runner.py` path)**: with `skip_text`, ocrmypdf's
+  sidecar contains only `[OCR skipped on page(s) …]`. The legacy runner treated an
+  all-placeholder sidecar as a hard failure (`ocr_skipped_all`) instead of a result so it
+  could never be written to `content`. `ocr/runner.py` is superseded by
+  `ocr/ingest_args.py` + `ocr/chandra_engine.py` and kept only for the integration harness
+  (`diag_original.py`, `check_download.py`, `size_compare.py`); it is not wired into the
+  pipeline.
+- **Chandra repeat-token retries (handled)**: when the vLLM/Chandra server logs
+  `Detected repeat token, retrying generation (attempt N)`, the model is looping on a
+  bad/empty page. `ChandraOcrEngine` relies on the upstream temperature retry ladder
+  (`chandra.settings.MAX_VLLM_RETRIES`, base temperature 0.0 / top_p 0.1, retries at
+  `min(base+0.2*N, 0.8)` / top_p 0.95) plus a post-hoc `detect_repeat_token` check —
+  recovered pages are kept, unrecoverable pages land in `error_pages` and surface via the
+  `re-ocr-page-errors` tag (see Risks for the measured case).
 - **Re-OCR wall-time breakdown (measured 2026-09-17, doc 4221, 8 pages)**: `re-ocr-content`
   finished in 98.4 s (8 Chandra POSTs, zero repeat-token retries) while `re-ocr-all` took 307.8 s.
   Phase timing from the logs: setup ~2 s; per-page rasterize + Tesseract OSD + **inference**
@@ -122,27 +123,28 @@ The original file is immutable; it is only downloaded via the API and used as OC
 ```mermaid
 flowchart TB
     subgraph container["paperless-rearchive container"]
-        MAIN["poller.py (main loop)<br/>POLL_INTERVAL / SIGHUP / RUN_ONCE"]
+        MAIN["poller.py (main loop)<br/>POLL_INTERVAL / SIGHUP / RUN_ONCE<br/>3-strikes escalation to -failure"]
         PIPE["pipeline.py<br/>process_document()"]
         API["paperless_api.py<br/>(requests.Session, Token auth)"]
         ENGINE["ocr/chandra_engine.py<br/>Unified Chandra OCR engine<br/>(ChandraOcrEngine)"]
-        PDF["ocr/runner.py<br/>ocrmypdf sandwich pipeline<br/>(for PDF/A assembly only)"]
-        PROV["ocr/base.py: OcrProviderPlugin ABC"]
+        INGEST["ocr/ingest_args.py<br/>ingest-parity ocrmypdf args<br/>(mode mapping + fallback)"]
+        PROV["ocr/provenance.py<br/>pdf-inspector born-digital gate<br/>(layer 1 of OCR strategy)"]
         CHAN["ocr/chandra.py: ChandraProvider"]
         REP["archive/replacer.py<br/>backup (REARCHIVE_BACKUP_DIRECTORY) + os.replace + sha256"]
-        DBM["archive/db.py<br/>psycopg UPDATE archive_checksum"]
+        DBM["archive/db.py<br/>psycopg fetch + UPDATE archive_checksum"]
         CFG["config.py (Settings.from_env)"]
         MAIN --> CFG
         MAIN --> PIPE
         PIPE --> API
         PIPE --> ENGINE
+        PIPE --> PROV
+        ENGINE --> INGEST
         ENGINE --> CHAN
         CHAN -- "chat/completions" --> LLM["Chandra server ai:8110/v1"]
         PIPE --> REP
-        REP --> DBM
+        PIPE --> DBM
         PIPE --> CFG
-        PIPE --> PDF
-        PDF -- "hOCR + original<br/>images" --> REP
+        INGEST -- "hOCR + original<br/>images" --> REP
     end
     API -- "HTTP :8000" --> PLX["paperless-ngx"]
     REP -- "bind mount rw" --> ARC["archives/*.pdf"]
@@ -155,62 +157,15 @@ The `ChandraOcrEngine` class in `ocr/chandra_engine.py` provides a unified OCR p
 
 ```python
 class ChandraOcrEngine:
-    def ocr_document(self, pdf_path, *, produce_pdf=False, output_pdf_path=None):
-        # 1. Render PDF pages to images (PyMuPDF)
+    def ocr_document(self, pdf_path, *, produce_pdf=False, output_pdf_path=None,
+                     settings=None, provenance=None, force=False):
+        # 1. Render PDF pages to images (PyMuPDF, REARCHIVE_OCR_DPI)
         # 2. For each page: call Chandra → markdown + hOCR
-        # 3. Combine all page markdown
-        # 4. IF produce_pdf: assemble PDF/A via ocrmypdf sandwich
-        # RETURN: OcrResult(markdown, pdf_path, page_count, errors)
-```
-
-**Branching logic:**
-- `re-ocr-content`: `produce_pdf=False` → markdown only, no PDF/A assembly
-- `re-ocr-all`: `produce_pdf=True` → markdown + hOCR → ocrmypdf sandwich → PDF/A
-
-**Page-level error handling:**
-- OCR errors on individual pages are collected in `result.errors`
-- If some pages succeed and some fail, add `re-ocr-page-errors` tag alongside outcome tag
-- This allows operators to identify documents with partial OCR for future fine-tuning
-
-### Per-document flow
-
-```mermaid
-flowchart TD
-    START([document with trigger tag]) --> DL["download original via API<br/>(temp dir, never modified)"]
-    DL --> OCR["Unified Chandra OCR engine<br/>render pages → LLM OCR per page<br/>→ markdown + hOCR structures"]
-    OCR -- "error (transient)" --> KEEP["keep trigger tag<br/>(retry next cycle)"]
-    OCR -- "error (permanent)" --> FAIL
-    OCR -- "ok" --> PAGECHECK{"any pages failed?"}
-    PAGECHECK -- "yes" --> TAGERR["add re-ocr-page-errors tag"]
-    PAGECHECK -- "no" --> NODDR
-    OCR -- "ok" --> DRY{"DRY_RUN?"}
-    DRY -- "yes" --> REPORT["log what would be written<br/>+ keep trigger tag"]
-    DRY -- "no" --> PATCH["PATCH content (markdown)"]
-    PATCH --> MODE{"re-ocr-all?"}
-    MODE -- "no" --> TAGS["remove trigger tag<br/>add ...-success"]
-    MODE -- "yes" --> ASSEMBLE["ocrmypdf sandwich pipeline:<br/>hOCR + original images → PDF/A"]
-    ASSEMBLE --> REPL["backup old archive to .bak<br/>atomic os.replace(new, archive_path)<br/>sha256 then UPDATE documents_document"]
-    REPL --> TAGS
-    TAGERR --> TAGS
-    TAGS --> DONE([done])
-    FAIL --> TAGSF["remove trigger tag<br/>add ...-failure"]
-    TAGSF --> DONE
-    REPORT --> DONE
-    KEEP --> DONE
-    NODDR --> TAGS
-```
-
-### Unified OCR engine architecture
-
-The `ChandraOcrEngine` class in `ocr/chandra_engine.py` provides a unified OCR pipeline:
-
-```python
-class ChandraOcrEngine:
-    def ocr_document(self, pdf_path, *, produce_pdf=False, output_pdf_path=None, dpi=300):
-        # 1. Render PDF pages to images (PyMuPDF)
-        # 2. For each page: call Chandra → markdown + hOCR
-        # 3. Combine all page markdown
-        # 4. IF produce_pdf: assemble PDF/A via ocrmypdf sandwich
+        #    (content path OCRs only provenance.pages_needing_ocr;
+        #     native pages keep pdf-inspector markdown)
+        # 3. Combine page markdown in page order
+        # 4. IF produce_pdf: assemble PDF/A via ingest-parity ocrmypdf
+        #    sandwich (mode from _resolve_ingest_mode)
         # RETURN: OcrResult(markdown, pdf_path, page_count, error_pages, errors)
 ```
 
@@ -220,51 +175,63 @@ class ChandraOcrEngine:
 
 **Page-level error handling:**
 - OCR errors on individual pages are collected in `result.error_pages` and `result.errors`
-- If some pages succeed and some fail, add `re-ocr-page-errors` tag alongside outcome tag
-- This allows operators to identify documents with partial OCR for future fine-tuning
+  (Chandra errors, empty results, `REARCHIVE_MAX_PAGES` skips)
+- If some pages succeed and some fail, `re-ocr-page-errors` is added alongside the outcome
+  tag; error page numbers are recorded in the audit note/provenance
 - Error information includes page numbers and error messages for debugging
 
-### Per-document flow (unified OCR engine)
+### Per-document flow
 
 ```mermaid
 flowchart TD
     START([document with trigger tag]) --> DL["download original via API<br/>(temp dir, never modified)"]
-    DL --> CHK{\" archive mode? \"}
-    CHK -- \"re-ocr-all\" --> CHKARCH{"has archive file AND is PDF?"}
-    CHKARCH -- \"no\" --> CHKIMG{"is image?"}
-    CHKIMG -- \"yes\" --> COIMG[\"content-only for image<br/>(no archive to replace)\"]
-    CHKIMG -- \"no\" --> COBD[\"content-only for born-digital<br/>(archive replaced in place)\"]
-    CHKARCH -- \"yes\" --> CK{\"on-disk archive sha256 == DB archive_checksum?\"}
-    CK -- \"no\" --> FAIL[\"failure tag<br/>(archive changed underneath us)\"]
-    CK -- \"yes\" --> OCR
-    CHK -- \"re-ocr-content\" --> OCR
-    OCR[\"Unified Chandra OCR engine<br/>render pages → LLM OCR per page<br/>→ markdown + hOCR structures\"]
-    OCR -- \"error (transient)\" --> KEEP[\"keep trigger tag<br/>(retry next cycle)\"]
-    OCR -- \"error (permanent)\" --> FAIL
-    OCR -- \"ok\" --> DRY{\"DRY_RUN?\"}
-    DRY -- \"yes\" --> REPORT[\"log what would be written<br/>+ keep trigger tag\"]
-    DRY -- \"no\" --> PATCH[\"PATCH content (markdown)\"]
-    PATCH --> MODE{\"re-ocr-all?\"}
-    MODE -- \"no\" --> PAGECHK{\"any pages failed?\"}
-    PAGECHK -- \"yes\" --> TAGERR[\"add re-ocr-page-errors tag<br/>+ success/failure tag\"]
-    PAGECHK -- \"no\" --> TAGS[\"remove trigger tag<br/>add ...-success\"]
-    MODE -- \"yes\" --> ASSEMBLE[\"ocrmypdf sandwich pipeline:<br/>hOCR + original images → PDF/A\"]
-    ASSEMBLE --> REPL[\"backup old archive to .bak<br/>atomic os.replace(new, archive_path)<br/>sha256 then UPDATE documents_document\"]
-    REPL --> PAGECHK
-    TAGS --> DONE([done])
-    TAGERR --> DONE
-    FAIL --> TAGSF[\"remove trigger tag<br/>add ...-failure\"]
+    DL --> PROV{"PDF original +<br/>provenance=auto?"}
+    PROV -- "no (non-PDF / off)" --> PREARCH
+    PROV -- "yes: classify_pdf()" --> GATE{"verdict?"}
+    GATE -- "text_based,<br/>skip_born_digital" --> PRESERVE["preserve native text<br/>-success + re-ocr-preserved + note<br/>(no PATCH, no DB, no archive)"]
+    GATE -- "unknown" --> WARN["warn + re-ocr-detection-unknown<br/>mode-driven fallback"]
+    WARN --> PREARCH
+    GATE -- "scanned / mixed<br/>(or force bypass)" --> PREARCH["re-ocr-all?<br/>(archive pre-checks)"]
+    PRESERVE --> DONE([done])
+    PREARCH -- "re-ocr-content" --> OCR
+    PREARCH -- "re-ocr-all" --> CHKARCH{"DB archive_filename?<br/>PDF original?"}
+    CHKARCH -- "no: no archive / non-PDF" --> COONLY["content-only fall-through<br/>(no archive to replace)"]
+    COONLY --> OCR
+    CHKARCH -- "yes" --> CK{"on-disk sha256 ==<br/>DB archive_checksum?"}
+    CK -- "yes" --> OCR
+    CK -- "no: drift" --> REPAIR{"repair possible?<br/>(file present, checksum known,<br/>not dry-run)"}
+    REPAIR -- "yes: adopt on-disk bytes<br/>UPDATE archive_checksum" --> OCR
+    REPAIR -- "no" --> FAIL["failure tag + audit note<br/>(poller escalates after 3)"]
+    OCR["Unified Chandra OCR engine<br/>render pages → LLM OCR per page<br/>→ markdown + hOCR structures"]
+    OCR -- "DB error: propagate<br/>(trigger kept, retry next cycle)" --> KEEP["keep trigger tag<br/>(retry next cycle)"]
+    OCR -- "ok" --> EMPTY{"content empty?"}
+    EMPTY -- "yes (all pages failed/empty)" --> FAIL
+    EMPTY -- "no" --> DRY{"DRY_RUN?"}
+    DRY -- "yes: log what would be written<br/>trigger tag kept, no tags touched" --> DONE
+    DRY -- "no" --> PATCH["PATCH content (markdown)<br/>collect extra_tags<br/>(page-errors, detection-unknown)"]
+    PATCH --> MODE{"archive PDF produced?<br/>(re-ocr-all)"}
+    MODE -- "no" --> PROVWRITE
+    MODE -- "yes" --> REPL["backup old archive to REARCHIVE_BACKUP_DIRECTORY<br/>atomic os.replace(new, archive_path)<br/>sha256 then UPDATE documents_document"]
+    REPL --> PROVWRITE["write provenance<br/>(custom fields + audit note)"]
+    PROVWRITE --> TAGSWAP{"tag swap<br/>(trigger → -success / -failure<br/>+ extra_tags)"}
+    TAGSWAP -- "ok" --> DONE
+    TAGSWAP -- "API error" --> KEEP
+    FAIL --> TAGSF["remove trigger tag<br/>add ...-failure + audit note"]
     TAGSF --> DONE
-    REPORT --> DONE
     KEEP --> DONE
-    COIMG --> OCR
-    COBD --> OCR
 ```
 
-Key changes from previous architecture:
-- **Unified OCR engine** (`ocr/chandra_engine.py`): single Chandra pass produces markdown + hOCR
-- **Branching after OCR**: PDF/A assembly only for `re-ocr-all` via ocrmypdf's sandwich pipeline
-- **Page-level error tracking**: partial failures add `re-ocr-page-errors` tag for future analysis
+Key points the chart encodes (matching `pipeline.py`):
+- **Provenance gate runs before anything else** (`classify_pdf` on PDF originals only;
+  `re-ocr-force` bypasses it; `unknown` warns and falls back to mode-driven behaviour).
+- **Archive pre-checks can demote `re-ocr-all` to content-only** (no `archive_filename` in
+  the DB, or a non-PDF original) — never an error.
+- **Checksum drift is repaired, not fatal**: on-disk bytes are adopted via
+  `_repair_checksum_drift()`; only unrepairable drift fails the document.
+- **`extra_tags` are collected right after PATCH** and applied at the final tag swap, which
+  is also where a tag-API hiccup keeps the trigger (`TAGSWAP -- API error --> KEEP`).
+- **Failure escalation lives in the poller** (3 consecutive failures per doc+trigger), not
+  in `process_document`; DB errors propagate so the trigger is kept and retried.
 
 ## 4. Repository layout
 
@@ -275,7 +242,6 @@ paperless-rearchive/
 ├── doc/
 │   ├── PLANNING.md            # this file
 │   ├── RELEASING.md           # release runbook (versioning rhythm, CI, rollback)
-│   ├── OCR_STRATEGY.md
 │   └── deploy/
 │       ├── compose-snippet.yml
 │       └── env.example
@@ -288,13 +254,15 @@ paperless-rearchive/
 │   ├── paperless_api.py       # REST client (tag lookup, original download, PATCH, tag swap)
 │   ├── pipeline.py            # per-document orchestration
 │   ├── poller.py              # main loop (entry point)
+│   ├── restore.py             # restore_backup CLI (archive/content restore from .bak)
 │   ├── ocr/
 │   │   ├── __init__.py
 │   │   ├── base.py            # OcrProviderPlugin ABC + registry
 │   │   ├── chandra.py         # Chandra provider
 │   │   ├── chandra_engine.py  # unified engine: per-page Chandra + ingest-parity ocrmypdf pass
 │   │   ├── ingest_args.py     # ingest-parity ocrmypdf argument builder + text semantics
-│   │   └── runner.py          # legacy builder, retained for the integration harness
+│   │   ├── provenance.py      # pdf-inspector born-digital gate (layer 1 of OCR strategy)
+│   │   └── runner.py          # legacy builder, integration-harness only (not in pipeline)
 │   └── archive/
 │       ├── __init__.py
 │       ├── db.py              # psycopg checksum/archive reads + UPDATE
@@ -302,7 +270,7 @@ paperless-rearchive/
 ├── docker/Dockerfile          # CHANDRA_REF build-arg pins paperless-chandra
 ├── pyproject.toml
 └── tests/
-    ├── test_*.py              # pytest unit tests (113 passing)
+    ├── test_*.py              # pytest unit tests (157 passing)
     └── integration/           # live-stack harness (see its README)
 ```
 
@@ -319,57 +287,42 @@ paperless-rearchive/
 
 ### Phase 3 — OCR pipeline ✅
 - ✅ `ocr/chandra.py` provider (wraps paperless-chandra ocrmypdf plugin)
-- ✅ `ocr/runner.py` (mode selection `redo_ocr`/`skip_text`/`force_ocr`, pdfa, deskew/clean with
-  the redo-incompatibility guard, image DPI/alpha handling, `ocr_skipped_all` guard, fallback retry)
+- ✅ `ocr/ingest_args.py` (ingest-parity mode selection `auto`/`redo`/`skip`/`force`/`off`,
+  `pdfa`, deskew/clean with the redo-incompatibility guard, image DPI/alpha handling,
+  fallback retry) — supersedes `ocr/runner.py`, which is retained for the integration
+  harness only and is not wired into the pipeline
 - ✅ `pipeline.py` orchestration incl. dry-run + tag lifecycle
+
 ### Phase 3b — Unified OCR engine ✅
 
-> **Status: ⬜ todo** — Refactor to unified Chandra OCR engine that produces markdown + hOCR
-> in a single pass, with PDF/A assembly only for `re-ocr-all`.
-
-### Phase 3b — Unified OCR engine 🔧
-
-> **Status: ✅ done** — Implemented unified Chandra OCR engine (ChandraOcrEngine) in ocr/chandra_engine.py
-> in a single pass, with PDF/A assembly only for `re-ocr-all` via ocrmypdf's sandwich pipeline.
-
-- ✅ Created `ocr/chandra_engine.py`: unified engine that renders PDF pages (PyMuPDF), calls Chandra
-  once per page, produces both markdown and hOCR structures
+- ✅ `ocr/chandra_engine.py`: unified `ChandraOcrEngine` — renders PDF pages (PyMuPDF),
+  calls Chandra once per page, produces both markdown and hOCR structures
 - ✅ Branch after OCR: `re-ocr-content` uses markdown only; `re-ocr-all` uses hOCR + ocrmypdf
-  sandwich pipeline for PDF/A assembly (via `ocr/runner.py`)
-- ✅ Add page-level error tracking: collect per-page failures (Chandra errors, empty results, etc.),
-  add `re-ocr-page-errors` tag when some pages succeed and some fail
-- ✅ Updated `pipeline.py` to use unified engine and branch based on archive_mode
-- ✅ Added `PyMuPDF` (fitz) to dependencies for PDF page rendering
-- ✅ Updated `pyproject.toml` with PyMuPDF dependency
-- ⬜ Verify markdown output matches between old and new paths for same document (TODO: test)
-- ✅ Updated README.md to reflect unified architecture
-
-### Phase 4 — Archive replacement ✅
-- ⬜ Create `ocr/chandra_engine.py`: unified engine that renders PDF pages, calls Chandra once per
-  page, produces both markdown and hOCR structures
-- ⬜ Branch after OCR: `re-ocr-content` uses markdown only; `re-ocr-all` uses hOCR + ocrmypdf
   sandwich pipeline for PDF/A assembly
-- ⬜ Add page-level error tracking: collect per-page failures, add `re-ocr-page-errors` tag when
-  some pages succeed and some fail
-- ⬜ Update `pipeline.py` to use unified engine and branch based on archive_mode
-- ⬜ Add `PyMuPDF` (fitz) to dependencies for PDF page rendering
-- ✅ Updated `pyproject.toml` with PyMuPDF dependency
-- ⬜ Verify markdown output matches between old and new paths for same document (TODO: test)
-- ✅ Updated README.md to reflect unified architecture
+- ✅ Page-level error tracking: collect per-page failures (Chandra errors, empty results,
+  `REARCHIVE_MAX_PAGES` skips), add `re-ocr-page-errors` tag when some pages succeed and
+  some fail
+- ✅ `pipeline.py` uses the unified engine and branches on archive_mode
+- ✅ `PyMuPDF` (fitz) dependency for PDF page rendering
+- ✅ README.md reflects the unified architecture
 
 ### Phase 4 — Archive replacement ✅
 - ✅ `archive/db.py` (psycopg; fetch + update archive_checksum)
-- ✅ `archive/replacer.py` (verify checksum, backup, atomic replace, sha256; backup destination
-  below the mandatory `REARCHIVE_BACKUP_DIRECTORY` — the legacy next-to-archive fallback was
-  removed)
+- ✅ `archive/replacer.py` (verify checksum + checksum-drift repair, backup below the
+  mandatory `REARCHIVE_BACKUP_DIRECTORY`, atomic replace, sha256 — the legacy
+  next-to-archive fallback was removed)
 - ✅ DB password from secret file `paperless_db_paperless_passwd`
+- ✅ `restore.py` (`restore_backup` CLI): restore archive and/or `content` from
+  `.bak-<timestamp>` backups, with audit note + provenance/tag cleanup
 
-### Phase 5 — Deployment & tests 🔧
+### Phase 5 — Deployment & tests ✅
 - ✅ Dockerfile (python:3.14-slim/trixie + ghostscript/tesseract/qpdf/pngquant/jbig2/poppler +
-  ocrmypdf + paperless-chandra from git master; image builds and all deps import on 3.14)
+  ocrmypdf + paperless-chandra from git `CHANDRA_REF` (default `master`); image builds and all
+  deps import on 3.14)
 - ✅ compose snippet + `.env.example`
-- ✅ unit tests (70 passing: replacer, runner args/mode selection, API tag lookup, custom
-  fields/notes, config + backup-directory validation)
+- ✅ unit tests (157 passing: replacer, ingest/runner args/mode selection, provenance,
+  chandra engine, API tag lookup, custom fields/notes, pipeline, poller, restore, config +
+  backup-directory validation)
 - ✅ live smoke test (2026-09-15): dry-run cycle against the running instance
   (`http://localhost:8001`) — document 5488 tagged `re-ocr-content` + `re-ocr-all` was OCR'd
   end-to-end via the live Chandra server (~30k chars markdown sidecar produced, nothing
@@ -384,16 +337,23 @@ paperless-rearchive/
     `re-ocr-all-success` → **original byte-identical** (`31feb5e0…`, mtime unchanged).
   - `re-ocr-content`: content PATCHed to freshly OCR'd markdown → archive file **untouched**
     (byte-identical) → tag swapped to `re-ocr-content-success`.
-  - harness: `tests/run_poller_e2e.sh`, `tests/run_content_e2e.sh`, `tests/verify_state.sh`,
-    `tests/reset_baseline.sh` (env-driven, run against the live stack).
+  - harness: `tests/integration/{run_poller_e2e,run_content_e2e,verify_state,reset_baseline}.sh`
+    (env-driven, run against the live stack).
 - ✅ API correctness fixes found by e2e: `?original=true` on the download endpoint,
   `?name__iexact=` for tag lookup.
 - ✅ archive size root cause identified and fixed: the silent `redo_ocr` → `force_ocr` fallback
   triggered by the (unsupported) `redo_ocr` + `deskew` combination. See Research notes / Risks.
-- ⬜ repeat-loop detection: treat documents whose Chandra logs show repeated
-  `Detected repeat token, retrying generation` as failed scans (tag `-failure` / investigate).
-- ⬜ bulk-run procedural safeguards: confirm search index reflects PATCHed content on a real
-  doc, and rehearse a small `re-ocr-all` batch before mass re-OCR.
+- ✅ repeat-token handling: the upstream temperature retry ladder (`MAX_VLLM_RETRIES`) recovers
+  looped pages (measured 2026-09-17, doc 4221: 8/8 ok after 3 extra generations); unrecoverable
+  pages land in `error_pages` and surface via the `re-ocr-page-errors` tag. Per-run retry
+  visibility (retried pages + generations in the audit note/provenance) and
+  rasterization-parity investigation remain open — see §7.
+- ⬜ bulk-run procedural safeguards: (a) confirm search index reflects PATCHed content on a
+  real doc — PATCH a unique probe token (e.g. `REARCHIVE-PROBE-<ts>`) via the sidecar path,
+  then `GET /api/search/?query=<token>` must hit and a removed distinctive token must not;
+  repeat for a `re-ocr-all` doc and a tags-only PATCH (mechanism already verified upstream —
+  `DocumentViewSet.update()` reindexes synchronously via `get_backend().add_or_update()`;
+  see §7); (b) rehearse a small `re-ocr-all` batch before mass re-OCR.
 
 ## 6. Configuration
 
@@ -422,7 +382,7 @@ token, the Chandra key, and the database user/password.
 | `PAPERLESS_CHANDRA_CONTENT_FORMAT` | `markdown` | `markdown` or `text` |
 | `PAPERLESS_CHANDRA_MAX_OUTPUT_TOKENS` | `12384` | per-page token budget |
 | `REARCHIVE_OCR_LANGUAGE` | `eng` | passed through to ocrmypdf (labels hOCR) |
-| `REARCHIVE_OCR_MODE` | `redo` | `redo` (default): strip the existing invisible text layer and re-OCR, page images untouched; `auto`: like ingest — `skip_text` on textless PDFs, but **upgrades to `redo` when a text layer is present** (deviation from ingest, where `auto` would just do a PDF/A conversion); `force`: always rasterise + re-OCR (much larger archive); `off`: PDF/A conversion only, no OCR |
+| `REARCHIVE_OCR_MODE` | `redo` | Layer 2 of the OCR strategy (§8.4): how an existing text layer on OCR candidates is treated. `redo`: strip + re-OCR (page images untouched); `skip`: `--skip-text` (OCR textless pages only, native text kept); `auto`: ocrmypdf default (like ingest); `force`: always rasterise + re-OCR (much larger archive, bypasses the provenance gate); `off`: PDF/A conversion only, no OCR (bypasses the gate) |
 | `REARCHIVE_OCR_CLEAN` | `clean` | image cleaning before OCR (`final` maps to `clean` under `redo`, as at ingest); `none` disables |
 | `REARCHIVE_OCR_DESKEW` | `true` | deskew pages before OCR (ocrmypdf forbids deskew with `redo`; dropped automatically, as paperless does) |
 | `REARCHIVE_OCR_ROTATE_PAGES` | `true` | 90/180/270 orientation fix before OCR (via the Chandra engine's OSD) |
@@ -430,7 +390,7 @@ token, the Chandra key, and the database user/password.
 | `REARCHIVE_OCR_DPI` | `300` | render DPI for the **content-only** fast path (PyMuPDF render before the Chandra call). `re-ocr-all` runs rasterise inside ocrmypdf, so this does not affect archive production |
 | `REARCHIVE_OCR_OUTPUT_TYPE` | `pdfa` | archive PDF/A flavour |
 | `REARCHIVE_OCR_USER_ARGS` | *(unset)* | extra ocrmypdf kwargs (JSON), e.g. paperless `PAPERLESS_OCR_USER_ARGS` |
-| `REARCHIVE_ARCHIVE_FOR_IMAGES` | `false` | experimental: create archive for non-PDF originals |
+| `REARCHIVE_ARCHIVE_FOR_IMAGES` | `false` | Reserved: parsed but not consulted by `pipeline.py` — non-PDF originals are always content-only today (see §7). |
 | `REARCHIVE_POLL_INTERVAL` | `300` | seconds between polls **when idle**. Adaptive draining: while a backlog exists (or a cycle made progress), cycles run ~10 s apart (fixed `_ACTIVE_POLL_INTERVAL_S`); no-progress cycles back off exponentially to the idle interval. Each cycle logs docs/min + backlog ETA and recommends batch/poll values |
 | `REARCHIVE_BATCH_LIMIT` | `5` | max documents per cycle |
 | `REARCHIVE_WRITE_PROVENANCE` | `true` | write OCR run provenance to custom fields (`OCR engine`, `OCR date`, `OCR pages`, `OCR archive ratio` for re-ocr-all) and append an audit note per run (`POST /api/documents/{id}/notes/`, also on failure); definitions auto-created once via API, skipped in dry-run |
@@ -461,12 +421,28 @@ Secrets (already defined in `paperless-lxc/docker-compose.yml`): `chandra_api_ke
   now installed in the image (`docker/Dockerfile`).
 - ✅ **Resolved** — `archived_file_name` is *not* a path; the on-disk archive path is read from
   the DB column `documents_document.archive_filename` (see Research notes).
-- ⬜ Full-text index / search index is updated by paperless on content PATCH (serializers post
-  save) — confirm search reflects new content after a real PATCH.
-- ⬜ Thumbnails are not regenerated (archive pixel content is unchanged in `redo_ocr`, so the
-  existing thumbnail stays valid). `force_ocr` re-rasterises pixels, so previews may drift.
-- ⬜ Concurrency with paperless workers: the checksum-verify-before-replace step is the only
-  guard against concurrent modification — acceptable for a single-operator instance.
+- ✅ **Resolved (mechanism verified 2026-09-19, live round-trip still open)** — search index
+  on content PATCH. `DocumentViewSet.update()` (`src/documents/views.py`) calls
+  `get_backend().add_or_update(refreshed_doc)` synchronously in the request after
+  `perform_update()`, then sends `document_updated` (workflows/websockets/LLM-vector index;
+  the main Tantivy index update is the explicit `add_or_update()` call, not the signal).
+  What is indexed is the effective content, so versioned documents are covered. Lock
+  contention is retried/deferred via `batch_update()` / celery `index_document`, not lost.
+  Remaining work is the live verification procedure, tracked under Phase 5 bulk-run
+  safeguards below — not a code task.
+- ✅ **Accepted (2026-09-19) — thumbnails are consume-time artifacts, never refreshed on
+  PATCH.** Stored at `THUMBNAIL_DIR/<pk:07>.webp` (`Document.thumbnail_path`), written only
+  during consume (`consumer.py`: `parser.get_thumbnail()` → `_write(thumbnail, …)`) and the
+  internal re-parse task; `DocumentViewSet.update()` does not touch them and a missing thumb
+  is `Http404` (no lazy regeneration). For `redo`/`skip` the archive pixels are unchanged, so
+  the existing thumbnail stays pixel-accurate — no action. After `force` (re-rasterised
+  pixels) the stored preview shows the old rendering indefinitely: a known, `force`-only
+  limitation. Not worth a sidecar renderer (new `THUMBNAIL_DIR` bind-mount, format/sizing
+  parity, etag behavior); revisit only on a user complaint, e.g. as an opt-in thumbnail
+  refresh gated to `force` runs.
+- ⬜ Concurrency with paperless workers: the checksum-verify-before-replace step (plus
+  checksum-drift repair of interrupted runs) is the only guard against concurrent
+  modification — acceptable for a single-operator instance.
 - ✅ **Resolved** — `invalidate_digital_signatures: true` (paperless `PAPERLESS_OCR_USER_ARGS`)
   is mirrored via `REARCHIVE_OCR_USER_ARGS` in the sidecar runs.
 - ✅ **Resolved** — archive size regression: the cause was a *silent fallback*, not
@@ -475,18 +451,13 @@ Secrets (already defined in `paperless-lxc/docker-compose.yml`): `chandra_api_ke
   (measured 616 KiB → 4.6 MiB on a 72 dpi scan; doc 3723 112 KiB → 900 KiB). The runner now
   drops deskew when it selects `redo_ocr` (mirrors paperless-chandra `parser.py:395`) and logs
   a warning instead of silently inflating archives. `auto` never rasterises.
-- ⬜ **Failed-scan detection**: Chandra `Detected repeat token, retrying generation` + GPU spin
-  indicates the model looping on a bad/empty page — effectively a failed OCR. Pipeline should
-  detect this (client callback / output repetition heuristic) and mark `-failure` instead of
-  writing garbage content. Deferred until observed on more documents.
-  **Measured 2026-09-17 (doc 4221)**: 2 of 8 pages looped *only* in the `re-ocr-all` path
-  (different rasterized input than the content path — see Research notes); the temperature
-  retry ladder recovered both (8/8 ok) at a cost of ~200 s wall time (3 extra 45–56 s
-  generations). Candidate follow-ups: (a) log a per-run retry summary (retried pages +
-  generations) into the audit note/provenance for visibility; (b) investigate rasterization
-  parity between the two paths (PyMuPDF vs ocrmypdf/Ghostscript) to reduce loop divergence;
-  (c) `MAX_VLLM_RETRIES` tuning trades wall time vs success rate. Quality on the recovered
-  pages was acceptable here — the "failed scan" outcome is not automatic.
+- ⬜ **Repeat-token retry visibility + rasterization parity**: the retry ladder already
+  recovers looped pages (see Research notes for the doc 4221 measurement: 8/8 ok at a cost
+  of ~200 s wall time for 3 extra generations). Open follow-ups: (a) log a per-run retry
+  summary (retried pages + generations) into the audit note/provenance for visibility;
+  (b) investigate rasterization parity between the two paths (PyMuPDF @300 dpi RGB vs
+  ocrmypdf/Ghostscript at effective DPI) to reduce loop divergence; (c) `MAX_VLLM_RETRIES`
+  tuning trades wall time vs success rate.
 - ✅ **Resolved** — inconsistent failure semantics: DB errors were retried at some call sites
   (`fetch_archive_filename`, post-OCR fetch) but permanently failed the document at others
   (pre-OCR checksum fetch); and a Chandra server outage failed `re-ocr-content` documents
@@ -497,20 +468,24 @@ Secrets (already defined in `paperless-lxc/docker-compose.yml`): `chandra_api_ke
 - ✅ **Resolved** — idle poll interval wasted half the time on large backlogs (fixed 300 s sleep
   between cycles). Polling is now adaptive: ~10 s between cycles while draining, exponential
   backoff on no-progress cycles, idle interval when the queue is empty.
-- ⬜ **Database access is PostgreSQL-only.** `archive/db.py` uses `psycopg`; paperless-ngx itself
-  also runs on SQLite (and supported MySQL until 2.0 removed it). On a SQLite paperless,
-  `re-ocr-content` works but `re-ocr-all` cannot. README documents this; either keep it pinned
-  (fine) or add a SQLite reader for `archive_checksum`/`archive_filename` updates later.
+- ✅ **Decision (2026-09-18) — PostgreSQL-only, no DB abstraction layer.** `archive/db.py`
+  uses `psycopg`; paperless-ngx itself supports `sqlite` / `postgresql` / `mariadb` via
+  `PAPERLESS_DBENGINE`, but this sidecar stays Postgres-only. Rationale and analysis are
+  recorded in §9 (Django cache safety, DB-agnostic cost, deployment split, SQLite locking).
+  On a SQLite/MariaDB paperless, `re-ocr-content` works but `re-ocr-all` cannot. README
+  documents this. Revisit only if a non-Postgres user with a real large library asks.
 - ⬜ **`REARCHIVE_ARCHIVE_FOR_IMAGES` is parsed but not implemented**: `Settings.from_env()` reads
   it, but `pipeline.py` never consults it — non-PDF originals (JPEG/TIFF/PNG scans) are *always*
-  routed to content-only mode, so images can never get an archive version regenerated. Either
-  implement it (feed images through the ingest-style ocrmypdf path with img2pdf + image_dpi
-  handling, like `paperless_chandra.parser` does) or remove the knob. Discovered 2026-09-17 while
-  writing the README configuration reference.
-- ⬜ paperless-chandra is installed from git `master` (no release tags published upstream yet);
-  pin a tag once available for reproducible builds.
+  routed to content-only mode (see Research notes), so images can never get an archive version
+  regenerated. Either implement it (feed images through the ingest-style ocrmypdf path with
+  img2pdf + image_dpi handling, like `paperless_chandra.parser` does) or remove the knob and
+  document content-only as the design. Discovered 2026-09-17 while writing the README
+  configuration reference; README now marks it Reserved.
+- ⬜ paperless-chandra is installed from git `CHANDRA_REF` (default `master`; no release tags
+  published upstream yet). `docker/Dockerfile` accepts the ref as a build-arg for reproducible
+  release builds — pin a tag there (and record it here) once available.
 - ⬜ `REARCHIVE_OCR_MODE=force` should only be used knowingly: it is the only mode that changes
-  archive size dramatically.
+  archive size dramatically, and it bypasses the provenance gate.
 - ✅ **Resolved** — `.bak` files inside `media/documents/archive/` tripped paperless-ngx's
   orphaned-file health check. `REARCHIVE_BACKUP_DIRECTORY` relocates the backups outside the
   media dir (cross-disk safe: they are copied), mirrors the archive's sub-directory layout, is
@@ -527,8 +502,10 @@ Secrets (already defined in `paperless-lxc/docker-compose.yml`): `chandra_api_ke
   OCR layer is therefore left as-is (pdf-inspector can flag it while ocrmypdf considers it
   text-bearing). Mitigations: `re-ocr-force` modifier, or future split/redo/merge. See §8.9.
 - ⬜ **pdf-inspector dependency**: a ~15 MB `cp38-abi3-manylinux_2_17_x86_64` wheel (no build
-  toolchain, installs on `python:3.14-slim`); `classify_pdf` never raises and falls back to the
-  legacy heuristics if it is missing, but the fallback cannot see per-page detail.
+  toolchain, installs on `python:3.14-slim`); `classify_pdf` never raises — on missing
+  pdf-inspector or detection error it falls back to the document-level heuristics and then to
+  `unknown` (mode-driven behaviour + `re-ocr-detection-unknown` tag). The fallback cannot see
+  per-page detail.
 
 ### Phase 6 — Release engineering ✅
 
@@ -545,7 +522,7 @@ Secrets (already defined in `paperless-lxc/docker-compose.yml`): `chandra_api_ke
   the CI job-image build (worked around via a commit-a-container build) sealed the decision; the
   parked runner setup remains at `/home/paperless/act-runner/` (not registered, not running).
 - ✅ `docker/Dockerfile`: `CHANDRA_REF` build-arg pins the paperless-chandra ref (closes the
-  reproducibility risk above for release artifacts).
+  reproducibility risk above for release artifacts — pass a tag/SHA at release-build time).
 
 ## 8. Born-digital provenance gate (pdf-inspector)
 
@@ -654,7 +631,7 @@ and mangling the native pages of a mixed document. Upstream
 dropped that parameter. The new explicit `skip` mode closes the gap, and provenance-driven
 runs never emit bare `auto` for a text-bearing PDF (mixed → `skip`).
 
-### 8.8 Implementation (Phase 7)
+### 8.8 Implementation (Phase 7) ✅
 
 - ✅ `pyproject.toml`: `pdf-inspector>=1.20` as a core dependency (abi3 wheel; no build
   toolchain; installs on `python:3.14-slim`).
@@ -663,9 +640,10 @@ runs never emit bare `auto` for a text-bearing PDF (mixed → `skip`).
 - ✅ `ocr/chandra_engine.py`: `ocr_document(..., provenance=, force=)`;
   `_ocr_document_pages()` (content path OCRs only `pages_needing_ocr`, native pages keep
   pdf-inspector markdown); `_resolve_ingest_mode()` (archive path).
-- ✅ `pipeline.py`: provenance gate after download; `_preserve_born_digital()` (born-digital
-  short-circuit before any DB/archive work); provenance added to the audit note;
-  `_finish()` now actually adds `extra_tags` (latent bug fixed).
+- ✅ `pipeline.py`: provenance gate after download (PDF originals only; non-PDF originals skip
+  classification); `_preserve_born_digital()` (born-digital short-circuit before any
+  DB/archive work); provenance added to the audit note; `_finish()` now actually adds
+  `extra_tags` (latent bug fixed).
 - ✅ `poller.py`: resolves the `re-ocr-force` modifier tag per cycle.
 - ✅ `config.py`: the six new settings (validated).
 - ✅ `tests/`: `test_provenance.py` (synthetic born-digital / scan / scan+invisible-overlay /
@@ -677,15 +655,15 @@ runs never emit bare `auto` for a text-bearing PDF (mixed → `skip`).
   modifier, new settings, updated guarantees/status.
 - ✅ Dry-run on doc 3452 (2026-09-18): `provenance=text_based` → preserved, no writes; live
   `--decide` verified on 3452 (PRESERVE) and 4221 (OCR every page).
-- ⬜ A real **mixed** document still needs a dry run before mass use.
 
 ### 8.9 Risks / open questions
 
-- ⬜ **Real mixed-provenance sample** still to be dry-run; the per-page rule is verified on
-  synthetic cases and the two known documents only.
-- ⬜ **Mixed archive divergence** (see §7): `--skip-text` leaves untrusted OCR layers on
-  scan pages untouched. Mitigation today: `re-ocr-force`. Future: split the original into
-  native and scan PDFs, `redo` the latter, merge with pikepdf.
+- ⬜ **Real mixed-provenance sample** still to be dry-run before mass use; the per-page rule
+  is verified on synthetic cases and the two known documents only.
+- ⬜ **Mixed-provenance archive divergence**: ocrmypdf applies one mode per file, so a mixed
+  document is archived with `--skip-text`; a "scanned" page that already carries an *untrusted*
+  OCR layer is therefore left as-is (pdf-inspector can flag it while ocrmypdf considers it
+  text-bearing). Mitigations: `re-ocr-force` modifier, or future split/redo/merge. See §7.
 - ⬜ **Native markdown fidelity**: for mixed content runs, native pages are re-serialised
   from pdf-inspector's markdown, which may differ from what paperless ingest stored.
 - ⬜ **Pre-OCR'd scan originals** (uploaded already OCR'd) are detected as `scanned` by the
@@ -693,3 +671,69 @@ runs never emit bare `auto` for a text-bearing PDF (mixed → `skip`).
   watching on real documents.
 - ⬜ **Blank pages**: `_render_pdf_pages`/`_render_page_image` skip blank pages; the
   provenance path iterates real page numbers so OCR-page selection cannot shift.
+
+## 9. Database research conclusions (2026-09-18)
+
+Session research into the direct-DB `UPDATE documents_document SET archive_checksum` path.
+Decision: **stay PostgreSQL-only** (`archive/db.py` + `psycopg`); no DB-agnostic layer.
+
+### 9.1 Django cache is not a risk for the direct Postgres UPDATE
+
+- `CACHES["default"]` is Redis (`PAPERLESS_REDIS`), but paperless-ngx uses it only for
+  narrow key families in `src/documents/caching.py` — classifier suggestions
+  (`doc_{id}_suggest` + classifier version/hash), LLM suggestions (`llm_*`), extracted
+  PDF metadata (`doc_{id}_metadata` → `MetadataCacheData(original_checksum,
+  original_metadata, archive_checksum, archive_metadata)`), thumbnail timestamps. There
+  is **no ORM second-level / query cache** in front of `Document` rows or file responses.
+- `get_metadata_cache()` re-reads `checksum`/`archive_checksum` from Postgres on every hit
+  and drops the cached entry on mismatch (`cache.delete`), so a sidecar `UPDATE` can at
+  worst cause one wasted metadata re-extraction, never a stale serve.
+- `GET /api/documents/<id>/`, `download/?original=true`, and `serve_file(use_archive=…)`
+  all do a fresh `Document.objects.get()`.
+- Postgres `READ COMMITTED` makes the sidecar's `conn.commit()` in `archive/db.py`
+  immediately visible to Django. `content`/tags/custom-fields/notes stay on REST `PATCH`
+  so signals, search index, and audit log still fire; only `archive_checksum` (no API
+  field) goes direct. Real risks are elsewhere: bypassed `post_save` for archive bytes
+  (harmless — thumbnails derive from the original, `content` is PATCHed separately) and
+  concurrent writers (covered by `verify_current_checksum()` + `_repair_checksum_drift()`).
+  No `FLUSHDB` / `clear_document_caches()` needed from the sidecar.
+
+### 9.2 A DB-agnostic layer would be cheap SQL, expensive everything else
+
+- Query surface is two shapes (`SELECT <allowlisted col> ... WHERE id = %s`, `UPDATE ...
+  SET archive_checksum = %s WHERE id = %s` on nullable `TEXT`) — a `Protocol` + factory
+  is ~100 lines, no SQLAlchemy/Django ORM needed.
+- Costs that kill it: (1) a third driver — stdlib `sqlite3` is free but MariaDB needs a
+  new dep (`PyMySQL` preferred over heavy/C-ext alternatives: image size + CVE surface
+  for the smallest user base); (2) config/detection — `DbSettings` would grow
+  `engine=PAPERLESS_DBENGINE` (`sqlite|postgresql|mariadb`), per-engine port defaults
+  (`5432|3306`), and `PAPERLESS_DATA_DIR → <dir>/db.sqlite3`; (3) paramstyle/rowcount
+  isolation (`%s` vs `?`, MariaDB rowcount `0` on unchanged value); (4) testing ×3
+  (sqlite fixture + MariaDB container in CI). Recommendation if ever revisited:
+  `sqlite|postgres` only, `mariadb → RuntimeError("not yet supported")`, ~½ day.
+
+### 9.3 No authoritative deployment split exists
+
+- paperless-ngx has **no telemetry**, so no `sqlite/postgres/mariadb` percentages exist;
+  any quoted split is anecdote. Verifiable proxies: `PAPERLESS_DBENGINE` default is
+  `sqlite`, but the official install script defaults to `postgres` ("Use PostgreSQL if
+  unsure … use SQLite to save resources [on Pi]") and every large-library report
+  (>50k–400k docs, Discussions #11561/#10712/#6165/#4922) mentions Postgres. MariaDB is
+  explicitly second-class upstream ("comes with some caveats", listed third). Working
+  assumption: `sqlite` = plurality of small instances, `postgres` = all serious/multi-user
+  instances (where bulk re-OCR matters), `mariadb` = negligible.
+
+### 9.4 SQLite locking is why we defer (not just low ROI)
+
+- SQLite = one file-level writer: `webserver` + task workers + sidecar collide on
+  `data/db.sqlite3` → `OperationalError: database is locked`. Sidecar cannot control the
+  PRAGMAs (`journal_mode`/`busy_timeout` owned by paperless/Django); needs `timeout=30` +
+  retry-on-busy and still fails flakily under `REARCHIVE_OCR_CONCURRENCY`/`BATCH_LIMIT`.
+- Deployment gets worse: new bind-mount of the live `db.sqlite3` (perms/UID drift,
+  read-only breakage, NFS `fcntl()` breakage, corruption risk on OOM-kill mid-UPDATE)
+  vs Postgres = TCP + already-held secret.
+- Operator does not run SQLite → supporting it means standing up
+  `docker-compose.sqlite.yml`, stuffing documents, and simulating consume-while-rearchive
+  — a full extra CI matrix + `TIMEOUT/BUSY` support threads for the segment least likely
+  to run an ocrmypdf/GPU re-OCR sidecar. Deferred until a SQLite user with a real large
+  library asks; even then a 5-doc instance + concurrent-UPDATE loop reproduces the lock.
