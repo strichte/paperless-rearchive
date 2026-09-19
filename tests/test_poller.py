@@ -60,7 +60,6 @@ def test_signal_during_wait_returns_promptly() -> None:
 def _settings(**env: str) -> Settings:
     base = {
         "PAPERLESS_API_TOKEN": "t",
-        "REARCHIVE_BACKUP_DIRECTORY": "/archive-backups",
     }
     base.update(env)
     with patch.dict("os.environ", base, clear=True):

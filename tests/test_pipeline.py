@@ -7,6 +7,7 @@ unrepairable checksum drift reaches ``_finish(success=False)``.
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -28,10 +29,14 @@ def _settings(tmp_path: Path) -> Settings:
     base = {
         "PAPERLESS_API_TOKEN": "t",
         "REARCHIVE_ARCHIVE_DIR": str(tmp_path / "archive"),
-        "REARCHIVE_BACKUP_DIRECTORY": str(tmp_path / "backups"),
     }
     with patch.dict("os.environ", base, clear=True):
-        return Settings.from_env()
+        settings = Settings.from_env()
+    return dataclasses.replace(
+        settings,
+        archive_dir=tmp_path / "archive",
+        backup_dir=tmp_path / "backups",
+    )
 
 
 class _FakeAPI:

@@ -1,167 +1,155 @@
 # paperless-rearchive
 
 A tag-driven sidecar for [paperless-ngx](https://docs.paperless-ngx.com) that **re-OCRs documents
-that are already in your library** with [Chandra](https://github.com/datalab-to/chandra), an LLM
-vision OCR model — and optionally regenerates the document's *archive* (searchable PDF/A) version
-with the exact same `ocrmypdf` pipeline paperless-ngx uses at ingest. Something the paperless-ngx
-API deliberately does not let you do.
+already in your library** with [Chandra](https://github.com/datalab-to/chandra), an LLM vision
+OCR model — and optionally regenerates the *archive* (searchable PDF/A) the same way
+paperless-ngx does at ingest. Something the paperless-ngx API deliberately does not let you do.
 
-Tag a document `re-ocr-content` to replace its `content` field with fresh OCR markdown, or
-`re-ocr-all` to additionally replace its archive file. The sidecar polls paperless for these tags
-and processes tagged documents in the background.
+- Tag a document `re-ocr-content` → its `content` field is replaced with fresh OCR markdown.
+- Tag it `re-ocr-all` → content **plus** the archive file is regenerated.
+- The sidecar polls paperless for these tags and processes tagged documents in the background.
 
-> **This is release v0.1.0** (first public release). Both trigger paths have been verified end-to-end
-> against a live instance. Design notes and the engineering log live in
-> [`doc/PLANNING.md`](doc/PLANNING.md) and [`doc/OCR_STRATEGY.md`](doc/OCR_STRATEGY.md).
+> Design notes and the engineering log live in [`doc/PLANNING.md`](doc/PLANNING.md).
+
+## Quickstart
+
+Minimal service for the paperless-ngx compose wizards. Only required settings — everything else
+runs on defaults (see [Configuration reference](#configuration-reference)).
+
+```yaml
+services:
+  paperless-rearchive:
+    build:
+      context: ./paperless-rearchive
+      dockerfile: docker/Dockerfile
+    image: paperless-rearchive:v0.1.0
+    user: "1000:1000"   # UID:GID that owns the archive files (same as paperless USERMAP_UID/GID)
+    environment:
+      PAPERLESS_API_TOKEN: "<paperless-api-token>"          # Admin -> Documents -> Tokens
+      PAPERLESS_CHANDRA_SERVER_URL: "http://chandra-server:8000"  # see Chandra server below
+      PAPERLESS_DBPASS: "<postgres-password>"               # re-ocr-all only; omit for content-only
+    volumes:
+      - /data/paperless/media/documents/archive:/archive         # read-write
+      - /data/paperless/archive-backups:/archive-backups         # required, outside the archive tree
+```
+
+Steps:
+
+- Clone the repo next to your compose file: `git clone https://github.com/<you>/paperless-rearchive.git`
+- Adjust the three placeholders above (token, server URL, DB password) and the two host paths.
+- `docker compose build paperless-rearchive && docker compose up -d paperless-rearchive`
+- Tag one disposable test document `re-ocr-content`, wait a cycle, check for
+  `re-ocr-content-success`. For an immediate cycle: `docker kill -s HUP paperless-rearchive`.
+- Start real runs with `REARCHIVE_DRY_RUN: "true"` first for a no-write rehearsal.
+
+## Chandra server setup
+
+All inference happens on a self-hosted OpenAI-compatible server. The sidecar itself is CPU-only.
+Any server exposing `/v1/chat/completions` works; [vLLM](https://github.com/vllm-project/vllm) is
+the reference. Same server you (would) use for
+[paperless-chandra](https://github.com/flobernd/paperless-chandra) ingest works as-is.
+
+Minimal server next to paperless (from
+[paperless-chandra's example](https://github.com/flobernd/paperless-chandra/blob/master/examples/docker-compose.vllm.yml)):
+
+```yaml
+services:
+  chandra-server:
+    image: vllm/vllm-openai:v0.17.0
+    command:
+      - --model=datalab-to/chandra-ocr-2
+      - --served-model-name=chandra
+      - --api-key=${CHANDRA_API_KEY:?missing CHANDRA_API_KEY in .env}
+      - --dtype=bfloat16
+      - --max-model-len=18000
+      - --max-num-seqs=16
+      - --max-num-batched-tokens=2048
+      - --gpu-memory-utilization=0.85
+      - --enable-prefix-caching
+      - --no-enforce-eager
+      - --mm-processor-kwargs={"min_pixels":3136,"max_pixels":6291456}
+    expose: ["8000"]
+    ipc: host
+    volumes: [hf_cache:/root/.cache/huggingface]   # ~10 GB model weights, persist between restarts
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, capabilities: [gpu], count: 1}]
+
+volumes:
+  hf_cache:
+```
+
+Notes:
+
+- GPU: ~24 GB class (L4, RTX 4090) for full-precision bf16 at 1–2 pages/sec. Smaller GPUs via
+  quantized GGUF take tens of seconds per page; CPU-only takes minutes per page.
+- Point the sidecar at it: `PAPERLESS_CHANDRA_SERVER_URL: "http://chandra-server:8000"` (same
+  compose) or `http://ai:8110/v1` (remote GPU box).
+- `PAPERLESS_CHANDRA_MODEL_NAME` must equal `--served-model-name` (`chandra` above).
+- `PAPERLESS_CHANDRA_API_KEY` must equal `CHANDRA_API_KEY` — omit both if the server needs no auth.
+- Check it: `curl http://chandra-server:8000/v1/models` should list your model.
+- Commercial self-hosting needs a [license](https://datalab.to/pricing) (weights are modified
+  OpenRAIL-M; the plugin code is MIT).
 
 ## Is this tool for you?
 
-Re-OCR of an existing library is an invasive operation — it rewrites the `content` field and
-*replaces archive files in paperless's media directory*. Before installing, check that you can
-live with every item on this list:
+Re-OCR rewrites `content` and *replaces archive files*. Check every item:
 
-- **You run paperless-ngx under docker compose.** The sidecar is a normal compose service next to
-  `paperless`, `postgres`, and your OCR server. There is no bare-metal mode.
-- **You have write access to paperless's archive directory.** The sidecar bind-mounts
-  `media/documents/archive/` read-write and atomically replaces archive files in place. It must
-  run as a user that may write those files (set the container's `user:` to the UID/GID that owns
-  the archive files). Originals in `media/documents/originals/` are **never** touched — they are
-  only downloaded read-only via the API.
-- **You have a paperless-ngx API token.** The sidecar reads documents, patches the `content`
-  field, and manages tags, notes and custom fields through the REST API. Create the token in
-  paperless under *Admin → Documents → Tokens*.
-- **You have direct PostgreSQL access** (needed for `re-ocr-all` only) — and your paperless runs
-  **on PostgreSQL**. The sidecar talks to the database with `psycopg` only; paperless instances on
-  SQLite (or the removed-in-2.0 MySQL) are not supported. The archive flow (`re-ocr-all`) reads
-  the archive file's on-disk path and expected checksum from the database, re-verifies the
-  checksum just before replacing the file (so it never races a concurrent modification), and
-  updates the stored checksum afterwards — none of that has an API equivalent. **`re-ocr-content`
-  runs never open a database connection.** Reuse the same `PAPERLESS_DB*` credentials paperless
-  itself uses.
-- **You have a running Chandra OCR server with an OpenAI-compatible API.** All inference happens
-  there (typically [paperless-chandra](https://github.com/flobernd/paperless-chandra)'s server on
-  a GPU box, e.g. `http://ai:8110/v1`). The sidecar container itself is CPU-only; it drives
-  ocrmypdf with the Chandra plugin and talks to the server over `chat/completions`. The same
-  server you (would) use for paperless-chandra ingest works as-is.
-- **You are comfortable with the sidecar writing to your library.** Content and archive changes
-  are recorded (audit note per run, provenance custom fields, `.bak` backups of replaced
-  archives), but there is no undo button. Start with `REARCHIVE_DRY_RUN=true` and one test
-  document.
-- **You must provide a backup directory outside the archive tree.** Before an archive
-  is replaced, the old version is copied to `REARCHIVE_BACKUP_DIRECTORY` — the sidecar refuses to
-  run without it, and refuses to run if it points into the archive tree. Ideally a separate bind
-  mount (it may even be another disk; backups are *copied*).
+- **Docker compose paperless.** The sidecar is a compose service next to `paperless` + `postgres`.
+- **Write access to the archive dir.** Mount `media/documents/archive/` at `/archive`
+  read-write; run as the UID:GID that owns the files. Originals are never touched (API
+  download only).
+- **API token.** Paperless *Admin → Documents → Tokens*.
+- **PostgreSQL** (`re-ocr-all` only). SQLite/MariaDB: `re-ocr-content` works, `re-ocr-all`
+  cannot. Reuse paperless's `PAPERLESS_DB*` credentials. Content-only runs never open a DB
+  connection.
+- **Chandra server** (above). Same server as paperless-chandra ingest.
+- **Backup mount.** Every replaced archive is copied to `/archive-backups` first. Mount it
+  outside the archive tree (separate bind mount, may be another disk) or paperless flags the
+  backups as orphaned files.
+- **No undo button.** Changes are recorded (audit note, provenance fields, `.bak` copies) — still,
+  start with `REARCHIVE_DRY_RUN=true` and one test doc.
 
-If you just want Chandra OCR for **new** documents at ingest, you don't need this project — run
-[paperless-chandra](https://github.com/flobernd/paperless-chandra) directly. paperless-rearchive
-exists for the documents already in your library.
+Only need Chandra for **new** documents? Run
+[paperless-chandra](https://github.com/flobernd/paperless-chandra) directly — this project is for
+what's already in your library.
 
-## How it works
-
-```mermaid
-flowchart LR
-    subgraph sidecar["paperless-rearchive sidecar"]
-        P[poller<br/>tag polling loop] --> PIPE[pipeline<br/>per-document orchestration]
-        PIPE --> API[paperless_api<br/>REST client]
-        PIPE --> ENG[ChandraOcrEngine<br/>re-ocr-all: one ingest-parity<br/>ocrmypdf pass via the<br/>paperless_chandra plugin<br/>re-ocr-content: per-page<br/>Chandra fast path]
-        ENG --> PROV[OcrProviderPlugin<br/>e.g. ChandraProvider]
-        PIPE --> REP[archive replacer<br/>atomic replace + SHA-256]
-        REP --> DB[(Postgres<br/>archive_checksum UPDATE)]
-    end
-    API -- "GET /api/documents<br/>PATCH content<br/>tag mgmt" --> PLX[paperless-ngx API]
-    PROV -- "OpenAI-compatible<br/>chat/completions" --> LLM["Chandra inference server<br/>e.g. ai:8110/v1"]
-    REP -- "read/write archive/<br/>(bind mount)" --> MED[("/data/paperless/media/<br/>documents/archive")]
-    PIPE -- "download original<br/>(temp dir, immutable)" --> API
-```
-
-For `re-ocr-all` the sidecar drives **one `ocrmypdf` pass** — the same invocation, parameters and
-`paperless_chandra` plugin that paperless-chandra's ingest parser drives — producing the PDF/A
-archive *and* the markdown `content` from a single OCR run, so a re-OCR'd document is
-indistinguishable from a freshly ingested one. The OCR source is always the **immutable original**,
-fetched with the `paperless-ngx` API.
-
-## Usage: trigger tags
+## Trigger tags
 
 | Tag | Effect |
 | --- | --- |
-| `re-ocr-content` | Re-OCR run; the `content` field is replaced with the OCR output (markdown). No archive, no database access. Born-digital and native pages of mixed documents are left untouched (see [OCR strategy](#ocr-strategy-what-happens-to-pdfs-that-already-have-text)). |
-| `re-ocr-all` | As above, **plus** the archive version is regenerated (same ocrmypdf pipeline as paperless ingest, Chandra as the OCR engine), atomically replacing the file in `media/documents/archive/` and updating `documents_document.archive_checksum` in the database. A born-digital document is left completely untouched. |
-| `re-ocr-force` | **Modifier**, not a trigger: add it next to one of the above to bypass born-digital detection and force OCR of every page. Never auto-created. |
+| `re-ocr-content` | Replace `content` with fresh OCR markdown. No archive, no DB. |
+| `re-ocr-all` | As above, **plus** regenerate the archive (same ocrmypdf pipeline as ingest) and update `archive_checksum` in the DB. |
+| `re-ocr-force` | Modifier, not a trigger: add next to one of the above to force OCR of every page. Never auto-created. |
 
-After processing, the trigger tag is removed and replaced with an outcome tag:
+- Trigger tags are auto-created. No manual setup — tag a doc and wait (or `docker kill -s HUP
+  paperless-rearchive`).
+- After processing the trigger is swapped for `<trigger>-success` or `<trigger>-failure`.
+- Extra tags: `re-ocr-preserved` (born-digital, left untouched), `re-ocr-detection-unknown`
+  (could not classify, processed anyway), `re-ocr-page-errors` (content mode, some pages failed).
+- Transient errors (server down, network hiccup) keep the trigger tag — documents self-heal next
+  cycle. After **3 consecutive failures** a doc is escalated to `<trigger>-failure` with an audit
+  note.
 
-| Outcome | `re-ocr-content` documents | `re-ocr-all` documents |
-| --- | --- | --- |
-| Success | `re-ocr-content-success` | `re-ocr-all-success` |
-| Failure | `re-ocr-content-failure` | `re-ocr-all-failure` |
+## Safety
 
-Additional tags: a born-digital document that was preserved gets `re-ocr-preserved` alongside
-`-success`; a document whose provenance could not be determined gets `re-ocr-detection-unknown`
-and is then processed with the configured mode (never failed). Partial OCR in content mode adds
-`re-ocr-page-errors`.
+- **Originals immutable.** Downloaded via `?original=true` into a scratch dir, used as OCR source.
+- **Born-digital PDFs preserved.** Classified page by page (pdf-inspector) before any OCR run;
+  all-native docs are left completely untouched (`-success` + `re-ocr-preserved` + note).
+- **Atomic archive replace.** Temp file → `os.replace`, checksum verified before (never races a
+  concurrent write), checksum updated after. Non-PDF originals and docs without an archive fall
+  through to content-only.
+- **Backups unconditional.** Every replacement copies the old archive to `/archive-backups`
+  (layout mirrored). Startup creates the dir, verifies writability, and refuses to run when the
+  mounts overlap.
+- **Dry run.** `REARCHIVE_DRY_RUN=true` does the full OCR run, writes nothing (no PATCH, no file,
+  no DB, no tag swaps).
 
-A trigger tag is only replaced when the pipeline reached a decision; transient upstream errors
-(OCR server unreachable, network hiccup) leave the trigger tag in place for the next poll cycle —
-so those documents self-heal when the problem goes away. To keep permanently broken documents
-from retrying forever, a document that fails **3 consecutive times** is escalated: its trigger
-tag is swapped for `<trigger>-failure` and an audit note with the last error is appended.
-Counters reset on any success.
+## OCR strategy
 
-**No manual tag creation needed.** The sidecar creates both trigger tags automatically if they don't exist. Tag a document and wait for the next cycle (or [nudge the
-poller](#manual-trigger-sighup)).
-
-## Guarantees
-
-- **The original file is immutable.** It is only ever downloaded via the `paperless-ngx` API into a scratch
-  directory and used as the OCR source. Nothing ever writes to `media/documents/originals/`.
-- Archive files are replaced **atomically** (write temp file → `os.replace`) and the previous
-  archive version is kept as a `.bak-<timestamp>` file in `REARCHIVE_BACKUP_DIRECTORY` — a
-  mandatory setting, outside the media directory (see
-  [Backup directory](#backup-directory)).
-- The archive is only replaced after verifying that the on-disk archive checksum still matches
-  `documents_document.archive_checksum` (no concurrent modification).
-- **Born-digital PDFs are never re-OCR'd.** The immutable original is classified page by page
-  (pdf-inspector) before any OCR run; if every page carries native text, content and archive are
-  left exactly as they are and the document is tagged `re-ocr-preserved` for review. Mixed
-  documents are OCR'd only on the pages that actually need it.
-- Non-PDF originals (images) are handled in content-only mode — they have no archive file that
-  could be regenerated in place.
-- `REARCHIVE_DRY_RUN=true` performs the full OCR run and reports what *would* be written without
-  touching paperless, the archives directory, or the database.
-
-## OCR strategy: what happens to PDFs that already have text
-
-`ocrmypdf` is the tool that adds the invisible, searchable OCR text layer to a scanned PDF. Its
-key concept here is the **OCR mode**, which decides what to do with a PDF that *already* has a
-text layer (e.g. from a previous OCR run): re-OCR it, leave it alone, or rip the pages apart and
-start over. These modes — `--skip-text`, `--redo-ocr`, `--force-ocr` — are ocrmypdf's, not ours;
-`paperless-ngx` wraps them in its own `PAPERLESS_OCR_MODE` setting
-([docs](https://docs.paperless-ngx.com/configuration/#ocr-settings)), and `REARCHIVE_OCR_MODE`
-uses the same vocabulary. Read the
-[ocrmypdf cookbook](https://ocrmypdf.readthedocs.io/en/latest/cookbook.html#redo-existing-ocr)
-for the full story; the short version:
-
-| ocrmypdf mode | What it does to your PDF |
-| --- | --- |
-| *default / error* | Refuses to touch a PDF that already has text (this is why "which mode?" matters at all). |
-| `--skip-text` | Leaves existing text alone; only OCRs pages that have **no** text. |
-| `--redo-ocr` | **Strips the existing invisible text layer and re-OCRs**, keeping the original page images untouched. No re-rasterising, no quality loss, no bloat. |
-| `--force-ocr` | **Rasterises every page** (re-renders the pixels at OCR resolution) and OCRs that. The nuclear option: fixes even text that was "baked into" the page image, but the archive grows several-fold and pixels are resampled. |
-
-paperless-ngx additionally defines `auto` (pick skip/redo sensibly per page) and `off`
-(PDF/A conversion only, no OCR).
-
-### Layer 1: provenance first (born-digital detection)
-
-Before any OCR decision, the sidecar classifies the **immutable original** page by page with
-[pdf-inspector](https://github.com/firecrawl/pdf-inspector). Each page is either:
-
-- **native** — visible, real text drawn by the producing application (Word, wkhtmltopdf, LaTeX,
-  a bank's PDF generator…). Never OCR'd: the text *is* the content, and a vision LLM asked to
-  "read" it tends to describe the layout instead.
-- **an OCR candidate** — no text at all, or only an invisible OCR overlay on a scan.
-
-The document aggregates to `text_based`, `scanned`, or `mixed`, which decides what happens:
+`ocrmypdf` decides what happens to a PDF that already has a text layer. The sidecar adds a
+provenance gate in front:
 
 | provenance | `re-ocr-content` | `re-ocr-all` |
 | --- | --- | --- |
@@ -169,69 +157,20 @@ The document aggregates to `text_based`, `scanned`, or `mixed`, which decides wh
 | `scanned` (all pages OCR candidates) | Chandra OCRs every page | `--redo-ocr` (or `force`/`off` per mode); archive replaced |
 | `mixed` (some of each) | Chandra OCRs only the scan pages; native pages keep their own text | `--skip-text`: native pages keep their text, textless pages get OCR |
 
-A preserved document is tagged `re-ocr-preserved` (alongside `-success`) and gets an audit note,
-so you can find and review what the gate skipped. This is what protects born-digital PDFs from
-being overwritten by a Chandra description of their own layout.
+- `REARCHIVE_OCR_MODE` (default `redo`) applies only to pages routed to OCR. Mixed docs always
+  use `--skip-text` (ocrmypdf applies one mode per file; `--redo-ocr` would strip native pages).
+  `force` re-rasterises everything (much larger archives) and bypasses the gate — prefer the
+  per-doc `re-ocr-force` tag.
+- Quality knobs mirror paperless: `ROTATE_PAGES` (local Tesseract OSD, no GPU), `DESKEW`
+  (skipped under `redo`, ocrmypdf constraint), `CLEAN`, `OUTPUT_TYPE`, `OCR_USER_ARGS` (JSON,
+  merged last).
+- Archive mode fails the whole doc on an un-OCRable page; `re-ocr-page-errors` only appears on
+  content runs.
 
-### Layer 2: the ocrmypdf mode
+## Full setup (docker compose)
 
-`REARCHIVE_OCR_MODE` is now applied **only to the pages layer 1 routed to OCR** (default
-`redo` — this is a re-OCR tool, after all):
-
-| `REARCHIVE_OCR_MODE` | ocrmypdf behaviour on OCR candidates | Archive size |
-| --- | --- | --- |
-| `redo` *(default)* | `--redo-ocr`: existing text layer replaced, page images untouched. On a `mixed` document this degrades to `skip` (see below). | ≈ unchanged |
-| `auto` | Ingest semantics: `--skip-text`; pages that already have text are kept. | ≈ unchanged |
-| `force` | `--force-ocr`: every page re-rasterised (provenance ignored). Prefer the `re-ocr-force` tag per document. | **much larger** |
-| `off` | No OCR at all: PDF/A conversion only. | ≈ unchanged |
-| `skip` | `--skip-text` explicitly: OCR only pages with no text. | ≈ unchanged |
-| `skip`, `skip_noarchive` | Legacy paperless aliases; treated as `auto`. | — |
-
-**Why mixed degrades to `skip`:** ocrmypdf applies *one* mode to the whole file. `--redo-ocr`
-would strip the text layer from the born-digital pages too — exactly the bug this section fixes.
-`--skip-text` is ocrmypdf's own per-page mode (OCR textless pages, leave the rest), so it is the
-only safe choice for mixed provenance. If a mixed document's *scan* pages carry an OCR layer you
-want re-done, add the `re-ocr-force` modifier tag (below).
-
-### Force, per document
-
-`re-ocr-force` is a **modifier tag**: add it next to a trigger (`re-ocr-all` + `re-ocr-force`) to
-bypass layer 1 and force `--force-ocr` for that document only. Use it for the rare false
-negative — a scan the classifier read as native, or a mixed document whose scan pages already
-have a text layer `--skip-text` won't touch. It is removed together with the trigger. Set
-`REARCHIVE_FORCE_TAG` empty to disable the modifier.
-
-OCR quality knobs (mirroring paperless's own settings):
-
-- **`REARCHIVE_OCR_ROTATE_PAGES`** (default on): fixes 90/180/270° page orientation before OCR.
-  Available in every mode. Orientation detection is provided by the Chandra engine plugin — since
-  the LLM has no orientation classifier of its own, the plugin shells out to a **local Tesseract
-  OSD probe** (`tesseract --psm 0`, no GPU involved) whenever ocrmypdf asks for a page's
-  orientation.
-- **`REARCHIVE_OCR_DESKEW`** (default on): fixes small (< 45°) crooked-scan skew. **ocrmypdf
-  forbids deskew together with `--redo-ocr`** (it won't rasterise the page images deskew would
-  need), so under the default `redo` mode deskew is silently skipped — the same limitation
-  paperless itself has. Use `force` mode if straightening the pixels matters more than archive
-  size.
-- **`REARCHIVE_OCR_CLEAN`** (default `clean`): unpaper-based image cleaning before OCR. Under
-  `redo` a "final" clean becomes a pre-OCR clean (ocrmypdf constraint again).
-- **`REARCHIVE_OCR_OUTPUT_TYPE`** (default `pdfa`): archive flavour, exactly like
-  `PAPERLESS_OCR_OUTPUT_TYPE`.
-- **`REARCHIVE_OCR_USER_ARGS`**: a JSON escape hatch merged into the ocrmypdf arguments *last*,
-  so it can override anything above — same purpose as paperless's `PAPERLESS_OCR_USER_ARGS`
-  (e.g. `{"invalidate_digital_signatures": true, "continue_on_soft_render_error": true}`).
-
-One consequence worth knowing: with `ocrmypdf` driving, a page Chandra cannot OCR fails the whole
-document (with an ingest-style fallback retry in `force` mode) — per-page partial failures are not
-a thing in archive mode. The `re-ocr-page-errors` tag therefore only appears on `re-ocr-content`
-runs, where the sidecar's own per-page fast path is used.
-
-## Setup (docker compose)
-
-The sidecar is designed to live in the **same `docker-compose.yml` as paperless-ngx**, so it
-shares paperless's network, its PostgreSQL instance, and its archive directory. Where `paperless`
-in your compose file is `paperless`, `postgres` is `postgres`, and your Chandra server is
-reachable at `http://ai:8110/v1` (adjust all three to your setup).
+Same compose file as paperless-ngx (shared network, Postgres, archive dir). Adjust `paperless` /
+`postgres` / server URL to your setup.
 
 ### 1. Get the code next to your compose file
 
@@ -242,11 +181,10 @@ git clone https://github.com/<you>/paperless-rearchive.git
 
 ### 2. Add the service to `docker-compose.yml`
 
-The sidecar belongs in the same compose file as paperless. Here is an abbreviated but complete
-typical setup — paperless-ngx with its supporting services (postgres, valkey or redis, tika,
-gotenberg) plus `paperless-rearchive`. Host paths use `/data/paperless/...` and UID/GID `1000`
-as placeholders — match your existing paperless service. The Chandra inference server is
-*not* part of this compose file; it runs elsewhere (here: `http://ai:8110/v1`).
+Abbreviated but complete: postgres, valkey/redis, tika, gotenberg, paperless (with Chandra plugin
+for ingest) plus `paperless-rearchive`. Host paths `/data/paperless/...`, UID/GID `1000` are
+placeholders. Chandra server runs elsewhere (`http://ai:8110/v1` here) — or add
+[chandra-server](#chandra-server-setup) to the same file.
 
 ```yaml
 networks:
@@ -379,9 +317,6 @@ services:
       PAPERLESS_DBNAME: "paperless"
       PAPERLESS_DBUSER: "paperless"
       PAPERLESS_DBPASS_FILE: /run/secrets/paperless_db_paperless_passwd
-      # ---- required: paths inside THIS container ----------------------------
-      REARCHIVE_ARCHIVE_DIR: "/archives"   # mount point of paperless's
-                                           # media/documents/archive (below)
       # ---- optional, safe defaults shown; details in the reference below ----
       REARCHIVE_PROVIDER: "chandra"
       REARCHIVE_TRIGGER_TAG_CONTENT: "re-ocr-content"
@@ -414,12 +349,10 @@ services:
       # REARCHIVE_ARCHIVE_FOR_IMAGES: "false"   # reserved; images are content-only today
       PAPERLESS_CHANDRA_CONTENT_FORMAT: "markdown"
       PAPERLESS_CHANDRA_MAX_OUTPUT_TOKENS: "12384"
-      # ---- required: backup location (must NOT be inside /archives) --------
-      REARCHIVE_BACKUP_DIRECTORY: "/archive-backups"   # see Backup directory
     volumes:
       # Read-write: archive files are replaced here. Use the SAME host path
       # your paperless container mounts at media/documents/archive.
-      - /data/paperless/media/documents/archive:/archives
+      - /data/paperless/media/documents/archive:/archive
       # Required: where .bak backups of replaced archives are kept. May be a
       # different disk than the archive mount (backups are copied).
       - /data/paperless/archive-backups:/archive-backups
@@ -455,105 +388,55 @@ docker compose logs -f paperless-rearchive   # watch the first cycles
 4. Check the outcome: the document should carry `re-ocr-all-success`, its `content` field fresh
    markdown, and an audit note; the archive file's `Creator` metadata should read
    `OCRmyPDF … / Chandra …`. The old archive is kept as `.bak-<timestamp>` in
-   `REARCHIVE_BACKUP_DIRECTORY`.
+   `/archive-backups`.
 
 ## Secrets
 
-Three values are sensitive: the paperless API token, the Chandra API key, and the database
-password (plus, optionally, the database user). All of them — including the API token — can be
-supplied three different ways. Pick **one way for all of them**, or mix and match per credential;
-nothing in the sidecar cares which you choose.
+Three credentials: paperless API token, Chandra API key, DB password (optionally DB user).
+Pick one way per credential — or mix:
 
-### Way 1: plain values (`environment:` or a compose env file)
-
-The simplest option — the value sits in the compose file (or in a file referenced by `env_file:`):
+### Way 1: plain values
 
 ```yaml
 services:
   paperless-rearchive:
-    image: paperless-rearchive:latest
     environment:
-      PAPERLESS_API_TOKEN: "paste-your-paperless-api-token-here"
-      PAPERLESS_CHANDRA_API_KEY: "paste-your-chandra-api-key-here"   # omit if no auth needed
-      PAPERLESS_DBPASS: "your-postgres-password-for-paperless"
+      PAPERLESS_API_TOKEN: "paste-token-here"
+      PAPERLESS_CHANDRA_API_KEY: "paste-key-here"   # omit if no auth needed
+      PAPERLESS_DBPASS: "postgres-password"
 ```
 
-Fine for a single-operator instance where the compose file is already private. Values in a
-separate env file (referenced via `env_file:`) are equally injected into the container — see
-[`doc/deploy/env.example`](doc/deploy/env.example).
+- Simplest for single-operator instances. Also works via `env_file:` — see
+  [`doc/deploy/env.example`](doc/deploy/env.example).
 
-> ℹ️ Compose interpolation `${…}` in the YAML is resolved from the project's root `.env` (or the
-> shell) **before** any `env_file:` is read — so you cannot `${…}`-reference a value that lives
-> in an env file. If you want file-based secrets, use Way 2 or 3.
+### Way 2: `_FILE` variables
 
-### Way 2: `_FILE` variables pointing at a file
-
-For every credential `NAME`, the sidecar understands a `NAME_FILE` environment variable whose
-content is the secret. This works for **all four** credentials:
-
-| Plain variable | File variant | Used for |
-| --- | --- | --- |
-| `PAPERLESS_API_TOKEN` | `PAPERLESS_API_TOKEN_FILE` | paperless REST API token |
-| `PAPERLESS_CHANDRA_API_KEY` | `PAPERLESS_CHANDRA_API_KEY_FILE` | Chandra server API key |
-| `PAPERLESS_DBPASS` | `PAPERLESS_DBPASS_FILE` | PostgreSQL password |
-| `PAPERLESS_DBUSER` | `PAPERLESS_DBUSER_FILE` | PostgreSQL user |
-
-The file can be anywhere the container can read — e.g. a bind mount:
+- For every credential `NAME`, `NAME_FILE` points at a file whose content is the secret.
+  `_FILE` wins when both are set. Whitespace is stripped.
+- Works for all four: `PAPERLESS_API_TOKEN`, `PAPERLESS_CHANDRA_API_KEY`, `PAPERLESS_DBPASS`,
+  `PAPERLESS_DBUSER`.
 
 ```yaml
 services:
   paperless-rearchive:
-    image: paperless-rearchive:latest
-    volumes:
-      - /data/paperless/secrets:/run/secrets:ro
+    volumes: [/data/paperless/secrets:/run/secrets:ro]
     environment:
       PAPERLESS_API_TOKEN_FILE: /run/secrets/paperless_api_token
       PAPERLESS_CHANDRA_API_KEY_FILE: /run/secrets/chandra_api_key
       PAPERLESS_DBPASS_FILE: /run/secrets/paperless_db_paperless_passwd
 ```
 
-If both the plain variable and its `_FILE` variant are set, **the `_FILE` variant wins**.
+### Way 3: compose `secrets:` (paperless-ngx convention)
 
-### Way 3: docker compose `secrets:` (paperless-ngx convention)
-
-Docker's `secrets:` section mounts files at `/run/secrets/<name>` inside the container; consume
-them with the same `_FILE` variables. This is exactly how paperless-ngx itself consumes
-`PAPERLESS_DBPASS_FILE`, and it keeps secret values out of the compose file and out of
-`docker inspect` output:
-
-```yaml
-secrets:
-  paperless_api_token:
-    file: ./secrets/paperless_api_token
-  chandra_api_key:
-    file: ./secrets/chandra_api_key
-  paperless_db_paperless_passwd:
-    file: ./secrets/paperless_db_paperless_passwd
-
-services:
-  paperless-rearchive:
-    image: paperless-rearchive:latest
-    environment:
-      PAPERLESS_API_TOKEN_FILE: /run/secrets/paperless_api_token
-      PAPERLESS_CHANDRA_API_KEY_FILE: /run/secrets/chandra_api_key
-      PAPERLESS_DBPASS_FILE: /run/secrets/paperless_db_paperless_passwd
-    secrets:
-      - paperless_api_token
-      - chandra_api_key
-      - paperless_db_paperless_passwd
-```
-
-This is what the full-stack example in [Setup](#setup-docker-compose) uses.
-
-Notes: surrounding whitespace in secret files is stripped (a trailing newline from `echo` is
-fine); the database **user** name can also be file-based via `PAPERLESS_DBUSER_FILE` if you
-prefer. A runnable variant lives in
-[`doc/deploy/compose-snippet.yml`](doc/deploy/compose-snippet.yml).
+- Same `_FILE` variables, files mounted at `/run/secrets/<name>`. Keeps values out of
+  `docker inspect`. This is what [Full setup](#full-setup-docker-compose) uses — see
+  [`doc/deploy/compose-snippet.yml`](doc/deploy/compose-snippet.yml).
 
 ## Configuration reference
 
-Booleans accept `true/false/yes/on/1`. Everything below can be set in the compose `environment:`
-block; the compose example above already lists all of them with defaults.
+Booleans accept `true/false/yes/on/1`. Mounts are fixed: `/archive` (paperless
+`media/documents/archive`, read-write) and `/archive-backups` (outside the archive tree).
+`REARCHIVE_ARCHIVE_DIR` only exists to override `/archive` if the mount differs.
 
 ### Paperless connection
 
@@ -566,7 +449,7 @@ block; the compose example above already lists all of them with defaults.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `PAPERLESS_CHANDRA_SERVER_URL` | *(required)* | Base URL of an OpenAI-compatible server hosting the Chandra model, e.g. `http://ai:8110/v1`. The sidecar appends `/v1` when missing, same as paperless-chandra. |
+| `PAPERLESS_CHANDRA_SERVER_URL` | *(required)* | OpenAI-compatible server hosting Chandra, e.g. `http://chandra-server:8000` or `http://ai:8110/v1`. |
 | `PAPERLESS_CHANDRA_MODEL_NAME` | `chandra` | The model name the server advertises (`/v1/models`). |
 | `PAPERLESS_CHANDRA_API_KEY` / `…_FILE` | *(empty)* | Bearer token for the server; leave unset if the server needs no auth. |
 | `PAPERLESS_CHANDRA_CONTENT_FORMAT` | `markdown` | Format of the OCR text stored in paperless: `markdown` (recommended) or `text`. |
@@ -577,23 +460,23 @@ block; the compose example above already lists all of them with defaults.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `REARCHIVE_PROVIDER` | `chandra` | OCR provider plugin. Only `chandra` exists today. |
-| `REARCHIVE_OCR_MODE` | `redo` | How existing text layers are treated **on the pages the provenance gate routed to OCR** — see [OCR strategy](#ocr-strategy-what-happens-to-pdfs-that-already-have-text). Values: `redo`, `auto`, `force`, `off`, `skip` (legacy `skip`/`skip_noarchive` accepted as `auto`). |
-| `REARCHIVE_PDF_PROVENANCE` | `auto` | Per-page born-digital detection (pdf-inspector): `auto` classifies each PDF original and decides which pages are OCR'd; `off` keeps the legacy mode-driven behaviour. |
-| `REARCHIVE_SKIP_BORN_DIGITAL` | `true` | `true`: a born-digital original is left untouched — no content PATCH, no ocrmypdf pass, no database access; it is tagged `re-ocr-preserved`. `false`: detect and annotate only, still OCR (quality A/B). |
+| `REARCHIVE_OCR_MODE` | `redo` | How existing text on OCR-routed pages is treated — see [OCR strategy](#ocr-strategy). `redo`/`auto`/`force`/`off`/`skip` (legacy `skip`/`skip_noarchive` = `auto`). |
+| `REARCHIVE_PDF_PROVENANCE` | `auto` | Born-digital detection (pdf-inspector): `auto` classifies each original; `off` keeps mode-driven behaviour. |
+| `REARCHIVE_SKIP_BORN_DIGITAL` | `true` | `true`: born-digital docs untouched (no PATCH, no ocrmypdf, no DB); tagged `re-ocr-preserved`. |
 | `REARCHIVE_PRESERVED_TAG` | `re-ocr-preserved` | Tag added alongside `-success` when native text was preserved. Empty disables. |
-| `REARCHIVE_OCR_MIXED_MODE` | `skip` | ocrmypdf mode for mixed-provenance archive runs (`skip`/`redo`/`force`). `skip` = `--skip-text`, the only mode that keeps the native pages intact while OCR'ing the textless ones. |
+| `REARCHIVE_OCR_MIXED_MODE` | `skip` | ocrmypdf mode for mixed docs (`skip`/`redo`/`force`). `skip` = `--skip-text`, keeps native pages. |
 | `REARCHIVE_PROVENANCE_MAX_PAGES` | `0` | Pages inspected by the provenance classifier; `0` = all. |
-| `REARCHIVE_FORCE_TAG` | `re-ocr-force` | Modifier tag (never auto-created) added next to a trigger to bypass born-digital detection and force OCR of every page. Empty disables. |
-| `REARCHIVE_OCR_CLEAN` | `clean` | unpaper image cleaning before OCR: `clean` (pre-OCR), `final` (post-OCR; becomes pre-OCR under `redo`, as at ingest), `none`. |
-| `REARCHIVE_OCR_DESKEW` | `true` | Fix small skew (< 45°) before OCR. Silently skipped under `redo` mode (ocrmypdf constraint, same as paperless). |
-| `REARCHIVE_OCR_ROTATE_PAGES` | `true` | Fix 90/180/270° page orientation before OCR. Detection: Tesseract OSD, run locally by the Chandra engine plugin (ocrmypdf asks its OCR engine for orientation). |
-| `REARCHIVE_OCR_ROTATE_PAGES_THRESHOLD` | `12.0` | Confidence threshold for rotation; lower = more aggressive (same meaning as paperless's `PAPERLESS_OCR_ROTATE_PAGES_THRESHOLD`). |
-| `REARCHIVE_OCR_OUTPUT_TYPE` | `pdfa` | Output format of the regenerated archive (`pdfa`, `pdfa-1`, `pdfa-2`, `pdfa-3`, `pdf`), like `PAPERLESS_OCR_OUTPUT_TYPE`. |
-| `REARCHIVE_OCR_LANGUAGE` | `eng` | Language label passed through to ocrmypdf (e.g. `eng+deu`). Chandra itself is language-agnostic; this mainly labels the text layer. |
-| `REARCHIVE_OCR_USER_ARGS` | *(unset)* | JSON object of extra ocrmypdf kwargs, merged **last** — can override any of the above (same escape hatch as `PAPERLESS_OCR_USER_ARGS`). |
-| `REARCHIVE_OCR_DPI` | `300` | Render resolution for the **content-only** fast path (PyMuPDF renders pages before the Chandra call). Archive runs rasterise inside ocrmypdf instead. |
-| `REARCHIVE_MAX_PAGES` | `0` | `0` = OCR all pages; `N` = only the first N pages per document (archive runs get `pages=1-N`, and content then comes from the PDF text layer rather than markdown). |
-| `REARCHIVE_OCR_CONCURRENCY` | `1` | Pages sent to the Chandra server concurrently per document. ⚠️ A local vision LLM is GPU-bound: >1 does not create more GPU, it piles competing requests onto the same server (higher per-page latency, timeout/OOM risk). Raise gradually (2, then 4) and watch the GPU. |
+| `REARCHIVE_FORCE_TAG` | `re-ocr-force` | Modifier tag (never auto-created) to force OCR of every page. Empty disables. |
+| `REARCHIVE_OCR_CLEAN` | `clean` | Image cleaning: `clean` (pre-OCR), `final` (becomes pre-OCR under `redo`), `none`. |
+| `REARCHIVE_OCR_DESKEW` | `true` | Fix small skew. Silently skipped under `redo` (ocrmypdf constraint, same as paperless). |
+| `REARCHIVE_OCR_ROTATE_PAGES` | `true` | Fix page orientation. Detection: local Tesseract OSD (no GPU). |
+| `REARCHIVE_OCR_ROTATE_PAGES_THRESHOLD` | `12.0` | Rotation confidence threshold; lower = more aggressive. |
+| `REARCHIVE_OCR_OUTPUT_TYPE` | `pdfa` | Archive flavour (`pdfa`, `pdfa-1/2/3`, `pdf`), like `PAPERLESS_OCR_OUTPUT_TYPE`. |
+| `REARCHIVE_OCR_LANGUAGE` | `eng` | Label passed to ocrmypdf (e.g. `eng+deu`). Chandra is language-agnostic. |
+| `REARCHIVE_OCR_USER_ARGS` | *(unset)* | JSON ocrmypdf kwargs, merged **last** (same escape hatch as `PAPERLESS_OCR_USER_ARGS`). |
+| `REARCHIVE_OCR_DPI` | `300` | Render DPI for the content-only fast path. Archive runs rasterise inside ocrmypdf. |
+| `REARCHIVE_MAX_PAGES` | `0` | `0` = all pages; `N` = first N pages only. |
+| `REARCHIVE_OCR_CONCURRENCY` | `1` | Concurrent pages per doc. GPU-bound: raise gradually (2, 4), watch the GPU. |
 | `REARCHIVE_ARCHIVE_FOR_IMAGES` | `false` | Reserved. Non-PDF originals are always handled content-only today. |
 
 ### Tags, loop and safety
@@ -604,34 +487,30 @@ block; the compose example above already lists all of them with defaults.
 | `REARCHIVE_TRIGGER_TAG_ALL` | `re-ocr-all` | Trigger tag for content+archive runs (auto-created). |
 | `REARCHIVE_SUCCESS_SUFFIX` | `-success` | Outcome tag suffix appended to the trigger tag name on success. |
 | `REARCHIVE_FAILURE_SUFFIX` | `-failure` | Outcome tag suffix on failure. |
-| `REARCHIVE_POLL_INTERVAL` | `300` | Seconds between poll cycles **when idle**. While a backlog is draining, cycles automatically run ~10 s apart (fixed, not configurable) and back off exponentially if a cycle attempts documents without any success — so mass re-OCR wastes no time waiting and a broken OCR server never causes a retry storm. |
-| `REARCHIVE_BATCH_LIMIT` | `5` | Maximum documents processed per cycle (more stay tagged for the next cycle). |
-| `REARCHIVE_ARCHIVE_DIR` | `/archives` | Inside the container: where paperless's archive directory is mounted. Must match the `volumes:` entry. |
-| `REARCHIVE_BACKUP_DIRECTORY` | *(required)* | Where `.bak-<timestamp>` backups of replaced archives are kept. Must be outside the archive tree (the sidecar refuses to start otherwise) — see [Backup directory](#backup-directory). |
-| `REARCHIVE_WRITE_PROVENANCE` | `true` | Write provenance custom fields (`OCR engine`, `OCR date`, `OCR pages`, `OCR archive ratio`) and append an audit note per run. Skipped in dry-run. |
-| `REARCHIVE_DRY_RUN` | `false` | Full OCR run, but nothing is written: no content PATCH, no archive replacement, no DB update, no tag changes (trigger tags must already exist). |
-| `REARCHIVE_RUN_ONCE` | `false` | Exit after one poll cycle (useful for cron-style or CI usage). |
-| `REARCHIVE_LOG_LEVEL` | `INFO` | `DEBUG` shows the effective ocrmypdf arguments (API key masked). |
+| `REARCHIVE_POLL_INTERVAL` | `300` | Seconds between polls when idle. While draining, ~10 s cycles; exponential backoff on no-progress. |
+| `REARCHIVE_BATCH_LIMIT` | `5` | Docs per cycle (rest stay tagged for next cycle). |
+| `REARCHIVE_ARCHIVE_DIR` | `/archive` | Override only if the archive mount differs from `/archive`. |
+| `REARCHIVE_WRITE_PROVENANCE` | `true` | Custom fields + audit note per run. Skipped in dry-run. |
+| `REARCHIVE_DRY_RUN` | `false` | Full OCR run, nothing written (no PATCH, file, DB, or tag changes). |
+| `REARCHIVE_RUN_ONCE` | `false` | Exit after one cycle (cron/CI). |
+| `REARCHIVE_LOG_LEVEL` | `INFO` | `DEBUG` shows ocrmypdf args (key masked). |
 
 ### Database (re-ocr-all only)
 
-**PostgreSQL only** (the sidecar uses `psycopg`). paperless-ngx also runs on SQLite out of the
-box; if yours does, `re-ocr-content` still works but `re-ocr-all` cannot. Copy the values from
-paperless's own environment.
+- **PostgreSQL only.** SQLite: content-only works, `re-ocr-all` cannot. Copy from paperless's env.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `PAPERLESS_DBHOST` | `postgres` | PostgreSQL host (compose service name). |
-| `PAPERLESS_DBPORT` | `5432` | PostgreSQL port. |
-| `PAPERLESS_DBNAME` | `paperless` | Database name. |
-| `PAPERLESS_DBUSER` / `…_FILE` | `paperless` | Database user. |
-| `PAPERLESS_DBPASS` / `…_FILE` | *(required)* | Database password. |
+| `PAPERLESS_DBHOST` | `postgres` | Postgres host (compose service name). |
+| `PAPERLESS_DBPORT` | `5432` | Postgres port. |
+| `PAPERLESS_DBNAME` | `paperless` | DB name. |
+| `PAPERLESS_DBUSER` / `…_FILE` | `paperless` | DB user. |
+| `PAPERLESS_DBPASS` / `…_FILE` | *(required for re-ocr-all)* | DB password. |
 
 ## OCR provenance
 
-On every successful run the sidecar records machine-readable provenance in
-[paperless-ngx custom fields](https://docs.paperless-ngx.com/usage/#custom-fields),
-visible on the document and filterable in saved views:
+Per success the sidecar writes [custom fields](https://docs.paperless-ngx.com/usage/#custom-fields)
+(auto-created) plus an audit note:
 
 | Field | Type | Example | Written when |
 | --- | --- | --- | --- |
@@ -640,159 +519,73 @@ visible on the document and filterable in saved views:
 | `OCR pages` | string | `4/4 ok` | every success |
 | `OCR archive ratio` | float | `1.001` | `re-ocr-all` only |
 
-Field definitions are auto-created once via the API — no manual setup. Because custom fields only
-keep the latest state, every run also appends an **audit note** (`POST /api/documents/{id}/notes/`)
-with the engine, page outcome, archive size ratio and OCR duration — and a `Re-OCR failed (…)`
-note on failure. Both are skipped in dry-run mode and when `REARCHIVE_WRITE_PROVENANCE=false`;
-a provenance failure never fails the document.
+Field definitions are auto-created. Custom fields keep latest state; the audit note is
+append-only (engine, pages, archive ratio, duration; `Re-OCR failed (…)` on failure). Skipped in
+dry-run and when `REARCHIVE_WRITE_PROVENANCE=false`; provenance never fails the doc.
 
-**Baked into the archive itself:** the regenerated PDF's `Creator` metadata records the full
-provenance of the text layer — `OCRmyPDF <version> / OCRmyPDF fpdf2 + Chandra <chandra-ocr
-version>` (composed by ocrmypdf from the engine's `creator_tag`) plus the served model name,
-appended as `[model: <PAPERLESS_CHANDRA_MODEL_NAME>]`. So the exact model travels with the file
-even outside paperless (visible via `pdfinfo`, readable by any PDF tool). The provenance check
-(`tests/integration/check_archive_provenance.sh`) still matches on `Chandra`.
+- **Baked into the archive:** regenerated PDFs carry `Creator: OCRmyPDF … + Chandra … [model:
+  <name>]` (visible via `pdfinfo`). Check with
+  `tests/integration/check_archive_provenance.sh`.
 
-## Manual trigger (SIGHUP)
+## Manual trigger
 
-The polling loop runs on `REARCHIVE_POLL_INTERVAL` (default 300 s). To trigger an immediate poll:
+- Poll interval `REARCHIVE_POLL_INTERVAL` (default 300 s). Immediate cycle:
+  `docker kill -s HUP paperless-rearchive`. In-flight runs are not interrupted; a signal during a
+  cycle triggers the next one immediately after.
 
-```bash
-docker kill -s HUP paperless-rearchive
-```
+## Backups
 
-The handler is lightweight — it interrupts the sleep and runs a single poll cycle; it does not
-reset the interval timer or disrupt an in-flight OCR run. A signal arriving *while a cycle is
-already running* is honoured immediately after that cycle finishes (it is not swallowed).
-
-## Backup directory
-
-`REARCHIVE_BACKUP_DIRECTORY` is a **mandatory setting**: before an archive is replaced, the
-current version is copied there as `<name>.bak-<timestamp>`. It must be a **different directory
-than `REARCHIVE_ARCHIVE_DIR`** — ideally a **separate bind mount**, which may even be a different
-disk (backups are *copied*, not moved):
+- Before replacement the old archive is copied to `/archive-backups` as
+  `<name>.bak-<timestamp>` (sub-dir layout mirrored). Unconditional — no skip option.
+- Mount it outside the archive tree (separate bind mount, may be another disk) or paperless
+  reports backups as orphaned files:
+  `[WARNING] [paperless.sanity_checker] Orphaned file in media dir: …`.
+- Startup creates the dir, checks writability, and refuses to run when mounts overlap; the
+  replacer has the same runtime backstop.
 
 ```yaml
 services:
   paperless-rearchive:
-    image: paperless-rearchive:latest
     volumes:
-      - /opt/paperless/media/documents/archive:/archives
-      - /opt/paperless/archive-backups:/archive-backups   # different directory / disk
-    environment:
-      REARCHIVE_ARCHIVE_DIR: "/archives"
-      REARCHIVE_BACKUP_DIRECTORY: "/archive-backups"
+      - /opt/paperless/media/documents/archive:/archive
+      - /opt/paperless/archive-backups:/archive-backups
 ```
-
-The archive's sub-directory layout is mirrored below the backup directory. Backups are
-**unconditional** — every archive replacement creates one; there is no option to skip it. The
-sidecar **refuses to start** without the setting, when it resolves to the archive directory or a
-sub-directory of it (symlinks included), when the path exists but is not a directory, or when it
-is not writable — it creates the directory on startup if needed. And as a runtime backstop, the
-replacer refuses to write any backup whose destination resolves inside the archive directory, even
-if a symlink game changes the picture after startup. Without all of this, paperless-ngx's health
-check reports every backup in the media directory as an orphaned file:
-
-> `[WARNING] [paperless.sanity_checker] Orphaned file in media dir: …/documents/archive/….pdf.bak-…`
 
 ## Restoring from backups (`restore_backup`)
 
-Every archive replacement leaves a `.bak-<timestamp>` copy in `REARCHIVE_BACKUP_DIRECTORY`.
-The `restore_backup` service script restores a document's archive file and/or `content` field
-from those backups. It is packaged with the sidecar image (a `restore_backup` console script)
-and runs inside the `paperless-rearchive` container, which already has the archive mount, the
-backup mount, the API token and the database credentials:
+Every replacement leaves a `.bak-<timestamp>` copy in `/archive-backups`. Restore archive and/or
+`content` from inside the container (has both mounts + credentials):
 
 ```bash
 docker exec -it paperless-rearchive restore_backup [-a] [-c] [-f] [-v] DOC_ID|BACKUP [...]
 ```
 
-| Flag | Effect |
-| --- | --- |
-| (none) | Restore **both** the archive file and the `content` field. |
-| `-a`, `--archive-only` | Restore only the archive file. |
-| `-c`, `--content-only` | Restore only the `content` field. |
-| `-f`, `--force` | Overwrite without asking for confirmation. |
-| `-v`, `--version` | Show paperless-rearchive's version and exit. |
-| `-h`, `--help` | Show help and exit. |
-
-Operands are one or more numeric document IDs or backup file names (basename,
-`<name>.pdf.bak-<stamp>`, or glob, matched recursively below
-`REARCHIVE_BACKUP_DIRECTORY`). The document is matched via the paperless database
-(`id` / `archive_filename`):
-
-```bash
-# restore both archive and content for document 3452
-docker exec -it paperless-rearchive restore_backup 3452
-
-# restore only the content field from an explicit backup version
-docker exec -it paperless-rearchive restore_backup -c \
-  '2024-12-14_Bali Ubud Villa Lora Confirmation_for_Booking_ID__1274639717.pdf.bak-20260917-080951'
-```
-
-If more than one backup exists for a document you are asked which version to use.
-Overwriting an archive file or a `content` field always asks for confirmation first,
-unless `-f` is given.
-
-How each part is restored:
-
-- **Archive:** the backup is copied over the live file under `/archives/<archive_filename>`
-  (staged + atomic replace), then `documents_document.archive_checksum` is updated to the
-  restored file's SHA-256 (the REST API cannot do either step).
-- **Content:** text is re-extracted from the *backed-up* archive with
-  `pdftotext -q -layout -enc UTF-8`, cleaned with the same `post_process_text()` normalisation
-  the paperless-ngx parser applies, and written back via `PATCH /api/documents/<id>/`.
-  Caveat: the restored content may still differ from the original `content` field, depending on
-  how OCR was configured in paperless-ngx at the time of ingestion.
+- Flags: none = both; `-a` archive only; `-c` content only; `-f` no confirm; `-v` version.
+- Operands: doc IDs or backup names/globs (matched recursively below `/archive-backups`).
+  Multiple matches ask which version.
+- Archive: copied over `/archive/<archive_filename>` (atomic), checksum updated in DB.
+- Content: re-extracted from the backup via `pdftotext`, normalised like paperless ingest, PATCHed
+  back (may differ from the pre-re-OCR text depending on ingest settings).
 
 ## Status
 
-| Component | State |
-| --- | --- |
-| Tag poller (SIGHUP wake, batching, error isolation) | ✅ done + verified live |
-| `paperless_api` client (original download, content PATCH, tag swap, notes, custom fields) | ✅ done + verified live |
-| Ingest-parity OCR: one ocrmypdf pass via the `paperless_chandra` plugin (archive + content) | ✅ done + verified live |
-| Born-digital provenance gate (pdf-inspector, per page) | ✅ done — unit-tested; live `--decide` verified (3452 preserved, 4221 OCR'd) |
-| Content-only fast path (per-page Chandra, `re-ocr-page-errors` tracking) | ✅ done + verified live |
-| Archive replacer (checksum verify, `.bak` backups, atomic replace, DB checksum update) | ✅ done + verified live |
-| Dockerfile (CPU-only; ghostscript/tesseract/unpaper/jbig2/pngquant) | ✅ done |
-| Adaptive polling (drain backlog at ~10 s cycles, exponential backoff on no-progress) | ✅ done |
-| Failure escalation (3 consecutive failures per document → `-failure` + audit note) | ✅ done |
-| Unit tests | ✅ 109 passing |
-| Failed-scan detection (Chandra repeat-loop heuristics) | ⬜ open — see PLANNING Risks |
-| Bulk re-OCR rehearsal guidance before mass use | ⬜ open |
+- ✅ Both trigger paths verified live (content PATCH, archive replace + checksum UPDATE).
+- ✅ Born-digital gate, per-page content path (`re-ocr-page-errors`), adaptive polling (~10 s
+  drain, backoff), 3-strikes escalation, `.bak` backups + `restore_backup`, provenance fields +
+  audit notes, `Creator [model: …]` stamp.
+- ⬜ Open (see PLANNING Risks): repeat-retry visibility + raster parity, mixed-archive divergence,
+  `ARCHIVE_FOR_IMAGES` reserved, bulk-run rehearsal.
 
 ## Development & releases
 
-- **Development** happens on `main`. After tagging a release, bump
-  `pyproject.toml` to the next `.dev0` version and open a fresh `## Unreleased`
-  section in `CHANGELOG.md` — see [`doc/RELEASING.md`](doc/RELEASING.md) for
-  the full versioning rhythm, release runbook and rollback notes.
-- **Releases** are source tags: run `scripts/release-check.sh <version>`, tag
-  `v<version>`, push, then deploy by checking the tag out and rebuilding the
-  image with docker compose (see [`doc/RELEASING.md`](doc/RELEASING.md)). No
-  CI, no registry — the compose build is the distribution.
-
-### Design docs
-
-- [`doc/PLANNING.md`](doc/PLANNING.md) — phased engineering plan, research notes, config table, risks.
-- [`doc/OCR_STRATEGY.md`](doc/OCR_STRATEGY.md) — how the sidecar's OCR relates to paperless ingest,
-  and how parity was established and verified.
-- `tests/` — unit tests (`pytest`); `tests/integration/` — live-instance helpers, including
-  `check_archive_provenance.sh`, which reports which OCR engine produced each archive's text layer
-  (exit 0 = every checked archive is Chandra).
-
-The OCR engine is pluggable (`OcrProviderPlugin`): `ChandraProvider` wraps paperless-chandra's
-ocrmypdf plugin today; further LLM providers (own OCR output → text layer + content) can be added
-behind the same interface.
+- `main` is dev; releases are source tags built with compose — see
+  [`doc/RELEASING.md`](doc/RELEASING.md) (versioning, `scripts/release-check.sh`, rollback).
+- [`doc/PLANNING.md`](doc/PLANNING.md) — plan, research, config, risks.
+- `tests/` — unit tests (`pytest`); `tests/integration/` — live helpers
+  (`check_archive_provenance.sh`: exit 0 = all archives Chandra).
+- OCR engine is pluggable (`OcrProviderPlugin`); `ChandraProvider` wraps paperless-chandra today.
 
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
-
-
-
-
-
-
 

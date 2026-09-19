@@ -70,7 +70,7 @@ Record the ref used in the release notes when it matters.
      `CHANDRA`, and the archive's `Creator` carries the
      `[model: …]` provenance stamp.
    - Run one smoke document through `re-ocr-all` (audit note + custom fields
-     written, backup created in `REARCHIVE_BACKUP_DIRECTORY`).
+     written, backup created in `/archive-backups`).
 7. **Open the next cycle**: bump `pyproject.toml` to the next `.dev0`
    version, open a fresh `## Unreleased` changelog section, commit and push.
 
@@ -80,5 +80,5 @@ Redeploy the previous release: `git checkout v<previous>` and
 `docker compose build paperless-rearchive && docker compose up -d
 paperless-rearchive` (or re-tag the previous image if it is still on
 disk). Archives are safe — replaced archives have `.bak` copies in
-`REARCHIVE_BACKUP_DIRECTORY`, and the checksum drift adoption logic
+`/archive-backups`, and the checksum drift adoption logic
 reconciles the DB with on-disk reality.

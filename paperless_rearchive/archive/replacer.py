@@ -71,8 +71,8 @@ def backup_destination(
     Raises:
         ArchiveReplaceError: if the computed destination would land inside
             the archive directory. Backups are **never** written there —
-            this is a runtime backstop for a ``backup_dir`` that turned out
-            to be inside the archive tree despite startup validation
+            this is a runtime backstop for mounts that turned out
+            to overlap despite startup validation
             (e.g. a symlink created after boot).
     """
     name = f"{archive_path.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
@@ -102,8 +102,8 @@ def _refuse_destination_inside_archive_dir(dest: Path, archive_dir: Path | None)
     if inside:
         raise ArchiveReplaceError(
             f"Refusing to write a backup into the archive directory: {dest} "
-            f"is inside {archive_dir}. REARCHIVE_BACKUP_DIRECTORY must point "
-            "outside the archive tree."
+            f"is inside {archive_dir}. Mount /archive-backups outside "
+            "the archive tree."
         )
 
 
@@ -118,9 +118,9 @@ def replace_archive(
 
     Returns the SHA-256 checksum of the newly written file. The previous
     archive version is **always** preserved as ``<name>.bak-<timestamp>``
-    below the required ``backup_dir`` (see :func:`backup_destination`) — a
-    backup is never skipped and never written into the archive directory.
-    The backup is *copied*, so ``backup_dir`` may live on a different
+    below the fixed ``/archive-backups`` mount (see :func:`backup_destination`)
+    — a backup is never skipped and never written into the archive directory.
+    The backup is *copied*, so it may live on a different
     filesystem/disk; keeping it outside the media directory is what stops
     paperless-ngx's health check from reporting the backups as orphaned
     files.

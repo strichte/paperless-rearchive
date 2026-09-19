@@ -22,7 +22,7 @@
 # and originals/ respectively beneath the media documents root.  The PDFs are then read inside the *paperless*
 # container, which mounts the whole media tree (originals/ AND archive/) and
 # ships poppler-utils.  The paperless-rearchive container only mounts
-# /archives, so it cannot see originals and is not used here.
+# /archive, so it cannot see originals and is not used here.
 #
 # Override via environment:
 #     PAPERLESS_CONTAINER      (default paperless)

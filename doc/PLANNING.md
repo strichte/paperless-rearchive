@@ -38,7 +38,7 @@ The original file is immutable; it is only downloaded via the API and used as OC
   `PAPERLESS_MEDIA_ROOT` and flags every file it cannot account for, so the sidecar's
   `.bak-<timestamp>` copies sitting in `media/documents/archive/` surface as
   `Orphaned file in media dir: …/documents/archive/….pdf.bak-…` warnings. Hence
-  `REARCHIVE_BACKUP_DIRECTORY`: backups go outside the media dir (typically a separate bind
+  backups go to the fixed `/archive-backups` mount outside the media dir (typically a separate bind
   mount, possibly another disk - they are *copied*, so cross-device is fine), and startup
   refuses to run when the setting resolves into the archive tree.
 - **Archive filename / path**: *not* always `<id>.pdf`. `file_handling.generate_unique_filename(
@@ -130,7 +130,7 @@ flowchart TB
         INGEST["ocr/ingest_args.py<br/>ingest-parity ocrmypdf args<br/>(mode mapping + fallback)"]
         PROV["ocr/provenance.py<br/>pdf-inspector born-digital gate<br/>(layer 1 of OCR strategy)"]
         CHAN["ocr/chandra.py: ChandraProvider"]
-        REP["archive/replacer.py<br/>backup (REARCHIVE_BACKUP_DIRECTORY) + os.replace + sha256"]
+        REP["archive/replacer.py<br/>backup (/archive-backups) + os.replace + sha256"]
         DBM["archive/db.py<br/>psycopg fetch + UPDATE archive_checksum"]
         CFG["config.py (Settings.from_env)"]
         MAIN --> CFG
@@ -211,7 +211,7 @@ flowchart TD
     DRY -- "no" --> PATCH["PATCH content (markdown)<br/>collect extra_tags<br/>(page-errors, detection-unknown)"]
     PATCH --> MODE{"archive PDF produced?<br/>(re-ocr-all)"}
     MODE -- "no" --> PROVWRITE
-    MODE -- "yes" --> REPL["backup old archive to REARCHIVE_BACKUP_DIRECTORY<br/>atomic os.replace(new, archive_path)<br/>sha256 then UPDATE documents_document"]
+    MODE -- "yes" --> REPL["backup old archive to /archive-backups<br/>atomic os.replace(new, archive_path)<br/>sha256 then UPDATE documents_document"]
     REPL --> PROVWRITE["write provenance<br/>(custom fields + audit note)"]
     PROVWRITE --> TAGSWAP{"tag swap<br/>(trigger → -success / -failure<br/>+ extra_tags)"}
     TAGSWAP -- "ok" --> DONE
@@ -309,7 +309,7 @@ paperless-rearchive/
 ### Phase 4 — Archive replacement ✅
 - ✅ `archive/db.py` (psycopg; fetch + update archive_checksum)
 - ✅ `archive/replacer.py` (verify checksum + checksum-drift repair, backup below the
-  mandatory `REARCHIVE_BACKUP_DIRECTORY`, atomic replace, sha256 — the legacy
+  fixed `/archive-backups` mount outside the archive tree, atomic replace, sha256 — the legacy
   next-to-archive fallback was removed)
 - ✅ DB password from secret file `paperless_db_paperless_passwd`
 - ✅ `restore.py` (`restore_backup` CLI): restore archive and/or `content` from
@@ -373,8 +373,8 @@ token, the Chandra key, and the database user/password.
 | `REARCHIVE_TRIGGER_TAG_ALL` | `re-ocr-all` | trigger tag, archive + content mode |
 | `REARCHIVE_SUCCESS_SUFFIX` | `-success` | success tag suffix |
 | `REARCHIVE_FAILURE_SUFFIX` | `-failure` | failure tag suffix |
-| `REARCHIVE_ARCHIVE_DIR` | `/archives` | bind-mounted `media/documents/archive` |
-| `REARCHIVE_BACKUP_DIRECTORY` | *(required)* | directory for the `.bak-<timestamp>` archive backups. Must be a directory **outside** the archive tree - typically a separate bind mount, possibly another disk (the backup is *copied*). Created/verified at startup; startup **refuses to run** when unset, when it resolves to the archive dir or a subdirectory of it (symlinks included), or when it is not writable. |
+| `REARCHIVE_ARCHIVE_DIR` | `/archive` | in-container mount of `media/documents/archive` (override only if the mount differs) |
+| `REARCHIVE_BACKUP_DIRECTORY` | n/a (fixed `/archive-backups`) | hardwired backup mount for `.bak-<timestamp>` files. Outside the archive tree — separate bind mount, possibly another disk (backups are *copied*). Created/verified at startup; startup **refuses to run** when the mounts overlap (symlinks included), or when it is not writable. |
 | `REARCHIVE_PROVIDER` | `chandra` | OCR provider plugin |
 | `PAPERLESS_CHANDRA_SERVER_URL` | *(required)* | e.g. `http://ai:8110/v1` |
 | `PAPERLESS_CHANDRA_MODEL_NAME` | `chandra` | e.g. `chandra-ocr-2-q8` |
@@ -487,7 +487,7 @@ Secrets (already defined in `paperless-lxc/docker-compose.yml`): `chandra_api_ke
 - ⬜ `REARCHIVE_OCR_MODE=force` should only be used knowingly: it is the only mode that changes
   archive size dramatically, and it bypasses the provenance gate.
 - ✅ **Resolved** — `.bak` files inside `media/documents/archive/` tripped paperless-ngx's
-  orphaned-file health check. `REARCHIVE_BACKUP_DIRECTORY` relocates the backups outside the
+  orphaned-file health check. `/archive-backups` relocates the backups outside the
   media dir (cross-disk safe: they are copied), mirrors the archive's sub-directory layout, is
   created/verified at startup, and is refused at/below the archive directory. It is now a
   **mandatory** setting — the legacy next-to-archive fallback was removed entirely, backups are

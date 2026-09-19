@@ -44,11 +44,17 @@ def _is_within(path: Path, parent: Path) -> bool:
     """True when ``path`` is ``parent`` itself or lives underneath it.
 
     Both sides are resolved first so symlinks, ``..`` and trailing slashes
-    cannot disguise e.g. ``/archives/link-to-self`` as a distinct directory.
+    cannot disguise e.g. ``/archive/link-to-self`` as a distinct directory.
     """
     resolved = path.resolve()
     root = parent.resolve()
     return resolved == root or root in resolved.parents
+
+
+#: Fixed in-container mount points. The operator controls them via bind
+#: mounts, not via environment variables.
+ARCHIVE_DIR_DEFAULT = Path("/archive")
+BACKUP_DIR_FIXED = Path("/archive-backups")
 
 
 @dataclass(frozen=True)
@@ -79,9 +85,10 @@ class Settings:
     paperless_url: str
     api_token: str
     archive_dir: Path
-    #: Where replaced archives are backed up. Required: backups must live
-    #: outside the archive tree (enforced by :meth:`validate`), never next to
-    #: the archives in paperless's media directory.
+    #: Backup location for replaced archives (fixed ``/archive-backups``).
+    #: Backups must live outside the archive tree (enforced by
+    #: :meth:`validate`), never next to the archives in paperless's media
+    #: directory.
     backup_dir: Path
 
     trigger_tag_content: str
@@ -140,7 +147,7 @@ class Settings:
     def validate(self) -> None:
         """Refuse obviously unsafe configurations (called once at startup).
 
-        ``REARCHIVE_BACKUP_DIRECTORY`` must not be at or below the archive
+        The backup directory must not be at or below the archive
         directory: paperless-ngx's health check (``sanity_checker``) walks
         ``PAPERLESS_MEDIA_ROOT`` and cannot tell sidecar backups apart from
         orphaned files, so backups written into the archive tree produce
@@ -149,20 +156,20 @@ class Settings:
             Orphaned file in media dir: .../documents/archive/....pdf.bak-...
 
         Anything at or below the archive directory is therefore rejected.
+        With both paths hardwired this only trips when bind mounts overlap.
         """
         if _is_within(self.backup_dir, self.archive_dir):
             raise ValueError(
-                "REARCHIVE_BACKUP_DIRECTORY resolves to the archive directory "
-                f"{self.archive_dir} itself or a directory inside it "
-                f"({self.backup_dir}). paperless-ngx's health check then "
-                "reports every backup as an orphaned file in the media "
-                "directory. Point REARCHIVE_BACKUP_DIRECTORY at a directory "
-                "outside the archive tree - typically a separate bind mount, "
-                "possibly another disk."
+                f"backup directory {self.backup_dir} resolves to the archive "
+                f"directory {self.archive_dir} itself or a directory inside "
+                "it. paperless-ngx's health check then reports every backup "
+                "as an orphaned file in the media directory. Mount "
+                "/archive-backups outside the archive tree - typically a "
+                "separate bind mount, possibly another disk."
             )
         if self.backup_dir.exists() and not self.backup_dir.is_dir():
             raise ValueError(
-                f"REARCHIVE_BACKUP_DIRECTORY {self.backup_dir} exists but is "
+                f"backup directory {self.backup_dir} exists but is "
                 "not a directory."
             )
         if self.pdf_provenance not in ("auto", "off"):
@@ -186,7 +193,7 @@ class Settings:
         if not self.backup_dir.exists():
             if self.dry_run:
                 log.warning(
-                    "DRY-RUN: REARCHIVE_BACKUP_DIRECTORY %s does not exist; "
+                    "DRY-RUN: backup directory %s does not exist; "
                     "it would be created on the first archive replacement.",
                     self.backup_dir,
                 )
@@ -195,13 +202,13 @@ class Settings:
                 self.backup_dir.mkdir(parents=True, exist_ok=True)
             except OSError as e:
                 raise ValueError(
-                    f"REARCHIVE_BACKUP_DIRECTORY {self.backup_dir} could not "
+                    f"backup directory {self.backup_dir} could not "
                     f"be created: {e}"
                 ) from e
             log.info("created backup directory %s", self.backup_dir)
         if not os.access(self.backup_dir, os.W_OK | os.X_OK):
             raise ValueError(
-                f"REARCHIVE_BACKUP_DIRECTORY {self.backup_dir} is not writable "
+                f"backup directory {self.backup_dir} is not writable "
                 "by this process."
             )
         self._log_backup_filesystem()
@@ -239,21 +246,11 @@ class Settings:
             raise ValueError(f"REARCHIVE_OCR_USER_ARGS is not valid JSON: {e}") from e
         if not isinstance(user_args, dict):
             raise ValueError("REARCHIVE_OCR_USER_ARGS must decode to a JSON object")
-        backup_raw = _env("REARCHIVE_BACKUP_DIRECTORY", "")
-        if not backup_raw:
-            raise ValueError(
-                "REARCHIVE_BACKUP_DIRECTORY is required: replaced archives are "
-                "backed up there before the new file is put in place. Point it "
-                "at a directory OUTSIDE the archive tree (REARCHIVE_ARCHIVE_DIR) "
-                "- typically a separate bind mount, possibly another disk - so "
-                "paperless-ngx's health check does not report the backups as "
-                "orphaned files in the media directory."
-            )
         return cls(
             paperless_url=_env("PAPERLESS_BASE_URL", "http://paperless:8000").rstrip("/"),
             api_token=secret("PAPERLESS_API_TOKEN"),
-            archive_dir=Path(_env("REARCHIVE_ARCHIVE_DIR", "/archives")),
-            backup_dir=Path(backup_raw) if backup_raw else None,
+            archive_dir=Path(_env("REARCHIVE_ARCHIVE_DIR", str(ARCHIVE_DIR_DEFAULT))),
+            backup_dir=BACKUP_DIR_FIXED,
             trigger_tag_content=_env("REARCHIVE_TRIGGER_TAG_CONTENT", "re-ocr-content"),
             trigger_tag_all=_env("REARCHIVE_TRIGGER_TAG_ALL", "re-ocr-all"),
             success_suffix=_env("REARCHIVE_SUCCESS_SUFFIX", "-success"),

@@ -30,13 +30,10 @@
     environment:
       PAPERLESS_BASE_URL: "http://paperless:8000"
       PAPERLESS_API_TOKEN_FILE: /run/secrets/paperless_api_token
-      REARCHIVE_ARCHIVE_DIR: "/archives"
-      # Required: keep `.bak-<ts>` archive backups OUTSIDE the media directory
-      # so paperless's health check does not report them as orphaned files.
-      # Must be a different directory than REARCHIVE_ARCHIVE_DIR - ideally a
-      # separate bind mount (it may be another disk; backups are copied).
-      # The sidecar refuses to start without it.
-      REARCHIVE_BACKUP_DIRECTORY: "/archive-backups"
+      # Mount points are fixed: /archive (paperless media/documents/archive)
+      # and /archive-backups (see volumes below). Override the archive path
+      # only if the mount differs.
+      # REARCHIVE_ARCHIVE_DIR: "/archive"
       PAPERLESS_CHANDRA_SERVER_URL: "http://ai:8110/v1"
       PAPERLESS_CHANDRA_MODEL_NAME: "chandra-ocr-2-q8"
       PAPERLESS_CHANDRA_CONTENT_FORMAT: "markdown"
@@ -59,11 +56,10 @@
       REARCHIVE_DRY_RUN: "false"
     volumes:
       # Read-write: archive files are replaced here (originals are NEVER touched).
-      - /data/paperless/media/documents/archive:/archives
-      # Required: backup bind mount for REARCHIVE_BACKUP_DIRECTORY. Must NOT be
-      # inside /archives (the sidecar refuses to run; paperless would report
-      # the backups as orphaned files). May be a different disk than the
-      # archive mount.
+      - /data/paperless/media/documents/archive:/archive
+      # Required: `.bak-<ts>` backups. Mounted outside the archive tree so
+      # paperless does not report them as orphaned files. May be a different
+      # disk than the archive mount (backups are copied).
       - /data/paperless/archive-backups:/archive-backups
     secrets:
       - paperless_api_token

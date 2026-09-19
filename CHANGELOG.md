@@ -31,6 +31,9 @@ patch).
 - OCR strategy is now two layers: provenance (which pages need OCR) and mode
   (how existing text on those pages is treated). `auto` no longer silently
   upgrades to `redo`; mixed documents use `--skip-text`.
+- Backup location hardwired to `/archive-backups` (`REARCHIVE_BACKUP_DIRECTORY`
+  removed); archive mount default is now `/archive` (paperless-ngx naming).
+  Control both via bind mounts.
 
 ## 0.1.0 — 2026-09-17
 

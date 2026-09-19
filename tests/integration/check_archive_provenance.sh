@@ -30,7 +30,7 @@
 # paperless-rearchive container; only pdfinfo (poppler-utils) runs there.
 #
 # Paths are resolved inside the container against $ARCHIVE_ROOT_IN_CONTAINER
-# (default /archives); absolute paths are used as-is.  --all scans the mount and
+# (default /archive); absolute paths are used as-is.  --all scans the mount and
 # may take minutes on a large library (one pdfinfo per file).
 #
 # Exit status: 0 = every archive showed Chandra, 1 = at least one Tesseract or
@@ -42,7 +42,7 @@
 set -euo pipefail
 
 CONTAINER="${REARCHIVE_CONTAINER:-paperless-rearchive}"
-ROOT="${ARCHIVE_ROOT_IN_CONTAINER:-/archives}"
+ROOT="${ARCHIVE_ROOT_IN_CONTAINER:-/archive}"
 
 if [ "$#" -eq 0 ]; then
   sed -n '2,27p' "$0"

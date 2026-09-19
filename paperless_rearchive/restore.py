@@ -1,11 +1,11 @@
 """Restore archives and/or the ``content`` field from ``.bak-*`` backups.
 
 The re-OCR pipeline keeps the pre-replacement archive version as
-``<name>.pdf.bak-<timestamp>`` below ``REARCHIVE_BACKUP_DIRECTORY`` (mirroring
+``<name>.pdf.bak-<timestamp>`` below ``/archive-backups`` (mirroring
 the archive's template sub-directories). This tool restores from those backups:
 
 * archive restore: copy the backup over the live archive file on the
-  ``/archives`` bind mount, then ``UPDATE documents_document SET
+  ``/archive`` bind mount, then ``UPDATE documents_document SET
   archive_checksum`` (the REST API cannot replace an archive).
 * content restore: ``pdftotext -q -layout -enc UTF-8`` on the *backed-up*
   archive, cleaned with :func:`post_process_text` (same normalization the
@@ -477,7 +477,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "One or more numeric document IDs or backup file names "
             "(basename, '<name>.pdf.bak-<stamp>' or glob, matched below "
-            "REARCHIVE_BACKUP_DIRECTORY)."
+            "/archive-backups)."
         ),
     )
     return parser

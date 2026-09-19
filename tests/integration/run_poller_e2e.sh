@@ -19,12 +19,12 @@ docker rm -f rearch-poller >/dev/null 2>&1 || true
 : > "$OUT"
 docker run --rm --name rearch-poller \
   --network backend \
-  -v /data/paperless/media/documents/archive:/archives \
+  -v /data/paperless/media/documents/archive:/archive \
+  -v /data/paperless/archive-backups:/archive-backups \
   -v "${SECRETS}/chandra_api_key:/run/secrets/chandra_api_key:ro" \
   -v "${SECRETS}/paperless_db_paperless_passwd:/run/secrets/paperless_db_paperless_passwd:ro" \
   -e PAPERLESS_BASE_URL=http://paperless:8000 \
   -e PAPERLESS_API_TOKEN="${TOKEN}" \
-  -e REARCHIVE_ARCHIVE_DIR=/archives \
   -e PAPERLESS_CHANDRA_SERVER_URL=http://ai:8110/v1 \
   -e PAPERLESS_CHANDRA_MODEL_NAME=chandra-ocr-2-q8 \
   -e PAPERLESS_CHANDRA_CONTENT_FORMAT=markdown \
