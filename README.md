@@ -22,21 +22,29 @@ services:
     build:
       context: ./paperless-rearchive
       dockerfile: docker/Dockerfile
-    image: paperless-rearchive:latest
+    image: paperless-rearchive:local
     user: "1000:1000"   # UID:GID that owns the archive files (same as paperless USERMAP_UID/GID)
     environment:
       PAPERLESS_API_TOKEN: "<paperless-api-token>"          # Admin -> Documents -> Tokens
       PAPERLESS_CHANDRA_SERVER_URL: "http://my-ai.local:8000/v1"  # see Chandra server below
+      PAPERLESS_CHANDRA_MODEL_NAME: "chandra-ocr-2-q8"      # must match server's --served-model-name
       PAPERLESS_DBPASS: "<postgres-password>"               # re-ocr-all only; omit for content-only
     volumes:
       - /data/paperless/media/documents/archive:/archive         # read-write
       - /data/paperless/archive-backups:/archive-backups         # required, outside the archive tree
 ```
 
+Truly required: `PAPERLESS_API_TOKEN` (poller exits without it) and
+`PAPERLESS_CHANDRA_SERVER_URL` (provider `validate()` fails without it). `PAPERLESS_DBPASS`
+only for `re-ocr-all` — content-only never opens a DB connection. `PAPERLESS_CHANDRA_MODEL_NAME`
+defaults to `chandra`, so you can omit it when the server is started with
+`--served-model-name=chandra` — but the value **must** match the server's served name or every
+request fails with `model not found`, so listing it explicitly is safer.
+
 Steps:
 
 - Clone the repo next to your compose file: `git clone https://github.com/<you>/paperless-rearchive.git`
-- Adjust the three placeholders above (token, server URL, DB password) and the two host paths.
+- Adjust the placeholders above (token, server URL, model name, DB password) and the two host paths.
 - `docker compose build paperless-rearchive && docker compose up -d paperless-rearchive`
 - Tag one disposable test document `re-ocr-content`, wait a cycle, check for
   `re-ocr-content-success`. For an immediate cycle: `docker kill -s HUP paperless-rearchive`.
@@ -183,7 +191,8 @@ Re-OCR rewrites `content` and *replaces archive files*. Check every item:
 - **Backup mount.** Every replaced archive is copied to `/archive-backups` first. Mount it
   outside the archive tree (separate bind mount, may be another disk).
 - **No undo button.** Changes are recorded (audit note, provenance fields, `.bak` copies) — still,
-  start with `REARCHIVE_DRY_RUN=true` and one test doc. TODO: point to restore backup script
+  start with `REARCHIVE_DRY_RUN=true` and one test doc. Mistakes are reversible (with caveats) via
+  [`restore_backup`](#restoring-from-backups-restore_backup).
 
 Only need Chandra for **new** documents? Run
 [paperless-chandra](https://github.com/flobernd/paperless-chandra) directly — this project is for
@@ -216,10 +225,9 @@ what's already in your library.
   through to content-only.
 - **Backups unconditional.** Every replacement copies the old archive to `/archive-backups`
   (layout mirrored). Startup creates the dir, verifies writability, and refuses to run when the
-  mounts overlap.
+  mounts overlap. Undo via [`restore_backup`](#restoring-from-backups-restore_backup).
 - **Dry run.** `REARCHIVE_DRY_RUN=true` does the full OCR run, writes nothing (no PATCH, no file,
   no DB, no tag swaps).
-- TODO: backup restore script
 
 ## OCR strategy
 
@@ -641,6 +649,9 @@ docker exec -it paperless-rearchive restore_backup [-a] [-c] [-f] [-v] DOC_ID|BA
 - Archive: copied over `/archive/<archive_filename>` (atomic), checksum updated in DB.
 - Content: re-extracted from the backup via `pdftotext`, normalised like paperless ingest, PATCHed
   back (may differ from the pre-re-OCR text depending on ingest settings).
+- Cleanup on every restore: OCR provenance custom fields (`OCR engine/date/pages/archive ratio`)
+  are wiped (stale after restore), all re-OCR tags are removed, and an audit note records what was
+  restored, which backup was used, and which tags were removed.
 
 ## Status
 
