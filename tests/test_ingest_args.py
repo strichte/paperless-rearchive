@@ -51,12 +51,12 @@ def test_post_process_text_normalises_whitespace() -> None:
     assert post_process_text("  a   b \r\n   c ") == "a b \r\nc"
     assert post_process_text("a\x00b") == "a b"
     assert post_process_text(None) is None
-    assert post_process_text("   \r\n ") is None
+    assert post_process_text("   \r\n ") == ""
 
 
 def test_post_process_text_matches_paperless_samples() -> None:
     # form-feed padding from pdftotext disappears into normalisation
-    assert post_process_text("\x0c\x0c") is None
+    assert post_process_text("\x0c\x0c") == ""
     assert post_process_text("word\x0cword") == "word word"
 
 

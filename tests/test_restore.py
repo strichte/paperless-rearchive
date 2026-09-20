@@ -28,7 +28,7 @@ def test_post_process_text_nul_and_empty() -> None:
     assert restore.post_process_text("a\0b") == "a b"
     assert restore.post_process_text("") is None
     assert restore.post_process_text(None) is None
-    assert restore.post_process_text("   \n  ") is None  # layout padding -> None
+    assert restore.post_process_text("   \n  ") == ""  # layout padding -> ""
 
 
 # --- backup discovery ---------------------------------------------------------

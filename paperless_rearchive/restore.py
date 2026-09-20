@@ -23,11 +23,13 @@ Anything that would overwrite live state asks for confirmation first, unless
 from __future__ import annotations
 
 import argparse
+import codecs
 import logging
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path
@@ -62,7 +64,7 @@ def post_process_text(text: str | None) -> str | None:
     no_trailing_whitespace = re.sub(r"([^\S\n\r]+)$", "", no_leading_whitespace)
 
     result = no_trailing_whitespace.strip().replace("\0", " ")
-    return result or None
+    return result
 
 
 def extract_text_from_pdf(path: Path) -> str:
@@ -82,19 +84,38 @@ def extract_text_from_pdf(path: Path) -> str:
         )
     completed = None
     try:
-        completed = subprocess.run(
-            ["pdftotext", "-q", "-layout", "-enc", "UTF-8", str(path), "-"],
-            capture_output=True,
-            check=True,
-        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = Path(tmpdir) / "text.txt"
+            completed = subprocess.run(
+                [
+                    "pdftotext",
+                    "-q",
+                    "-layout",
+                    "-enc",
+                    "UTF-8",
+                    str(path),
+                    str(out_path),
+                ],
+                capture_output=True,
+                check=True,
+            )
+            # Same decoding as paperless.parsers.utils.read_file_handle_unicode_errors
+            # (BOM sniffing, then utf-8, then utf-8 with errors="replace") and NUL
+            # stripping - identical to ingest's extract_pdf_text.
+            raw = out_path.read_bytes()
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"pdftotext failed for {path}: {e}") from e
     assert completed is not None
-    try:
-        raw = completed.stdout.decode("utf-8")
-    except UnicodeDecodeError as e:
-        raise RuntimeError(f"pdftotext output for {path} is not valid UTF-8: {e}") from e
-    text = post_process_text(raw)
+    if raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        text = raw.decode("utf-16")
+    elif raw.startswith(codecs.BOM_UTF8):
+        text = raw.decode("utf-8-sig")
+    else:
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode("utf-8", errors="replace")
+    text = post_process_text(text.replace("\x00", ""))
     if not text:
         raise RuntimeError(f"pdftotext produced no usable text for {path}.")
     return text

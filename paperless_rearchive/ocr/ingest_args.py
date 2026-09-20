@@ -25,9 +25,11 @@ PDF/A-conversion-only run is wanted.
 
 from __future__ import annotations
 
+import codecs
 import logging
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -51,8 +53,9 @@ _VALID_MIXED_MODES = {"skip", "redo", "force"}
 def post_process_text(text: str | None) -> str | None:
     """Normalise extracted PDF/OCR text (verbatim port of paperless).
 
-    Returns ``None`` for ``None`` or whitespace-only input, so callers can
-    treat "no text" and "only layout padding" the same way.
+    Returns ``None`` only for ``None`` input; whitespace-only text
+    normalises to an empty string (``""``), matching paperless-ngx's
+    behaviour.
     """
     if not text:
         return None
@@ -64,19 +67,46 @@ def post_process_text(text: str | None) -> str | None:
     # replace \0 prevents issues with saving to postgres.
     # text may contain \0 when this character is present in PDF files.
     result = no_trailing_whitespace.strip().replace("\0", " ")
-    return result or None
+    return result
 
 
 def extract_pdf_text(path: Path) -> str | None:
-    """Run ``pdftotext`` on *path* and return the extracted text, or None."""
+    """Run ``pdftotext -q -layout -enc UTF-8`` on *path* and return the
+    extracted text, or None on failure.
+
+    Mirrors ``paperless.parsers.utils.extract_pdf_text``: writes to a temp
+    file, reads it back with BOM-aware decoding, and strips NUL bytes before
+    returning (so ``post_process_text`` sees the same bytes ingest does).
+    """
     try:
-        result = subprocess.run(
-            ["pdftotext", str(path), "-"],
-            capture_output=True,
-            check=True,
-            timeout=120,
-        )
-        return result.stdout.decode("utf-8", errors="replace")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = Path(tmpdir) / "text.txt"
+            subprocess.run(
+                [
+                    "pdftotext",
+                    "-q",
+                    "-layout",
+                    "-enc",
+                    "UTF-8",
+                    str(path),
+                    str(out_path),
+                ],
+                capture_output=True,
+                check=True,
+                timeout=120,
+            )
+            raw = out_path.read_bytes()
+            if raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+                text = raw.decode("utf-16")
+            elif raw.startswith(codecs.BOM_UTF8):
+                text = raw.decode("utf-8-sig")
+            else:
+                try:
+                    text = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    text = raw.decode("utf-8", errors="replace")
+            text = text.replace("\x00", "")
+            return text or None
     except Exception:
         log.warning("Error while getting text from PDF document with pdftotext", exc_info=True)
         return None

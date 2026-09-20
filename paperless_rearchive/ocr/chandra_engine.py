@@ -39,6 +39,7 @@ except Exception:
 from paperless_chandra.engine.blocks import markdown_sidecar, page_from_chunks
 from paperless_chandra.engine.hocr import sidecar_text
 
+from paperless_rearchive.ocr.ingest_args import post_process_text
 from paperless_rearchive.ocr.model_check import cached_models_for, ensure_model_served
 
 log = logging.getLogger(__name__)
@@ -779,15 +780,26 @@ class ChandraOcrEngine:
     def _pdftotext_page_text(pdf_path: Path, page_num: int) -> str:
         """Extract text for a single page with pdftotext (same as paperless-ngx).
 
-        Runs ``pdftotext`` once on the whole PDF, splits on form feeds, and
-        returns the slice for *page_num* (1-based). Returns empty string on
-        failure, so callers can fall back to pdf-inspector markdown.
+        Runs ``pdftotext -q -layout -enc UTF-8`` once on the whole PDF, splits
+        on form feeds, strips NUL bytes (as ``read_file_handle_unicode_errors``
+        does for ingest), post-processes each page with the same whitespace
+        normalization paperless-ngx applies, and returns the slice for
+        *page_num* (1-based). Returns empty string on failure, so callers can
+        fall back to pdf-inspector markdown.
         """
         import subprocess
 
         try:
             result = subprocess.run(
-                ["pdftotext", "-layout", "-enc", "UTF-8", str(pdf_path), "-"],
+                [
+                    "pdftotext",
+                    "-q",
+                    "-layout",
+                    "-enc",
+                    "UTF-8",
+                    str(pdf_path),
+                    "-",
+                ],
                 capture_output=True,
                 timeout=120,
             )
@@ -800,11 +812,17 @@ class ChandraOcrEngine:
         if not full_text:
             return ""
 
-        # pdftotext joins pages with a form feed (\f). Split and strip.
+        # Strip NUL bytes the way paperless's read_file_handle_unicode_errors
+        # does, so post_process_text sees the same bytes ingest does.
+        full_text = full_text.replace("\x00", "")
+
+        # pdftotext joins pages with a form feed (\f). Split, then
+        # post-process each page individually (form feeds are whitespace
+        # and would be collapsed by post_process_text on the full text).
         pages = full_text.split("\f")
         if page_num < 1 or page_num > len(pages):
             return ""
-        return pages[page_num - 1].strip()
+        return post_process_text(pages[page_num - 1]) or ""
 
     def _render_page_image(self, page: Any) -> Any:
         """Render one PyMuPDF page to a PIL Image, or None when blank."""
