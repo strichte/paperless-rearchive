@@ -683,9 +683,10 @@ class ChandraOcrEngine:
         """Content-only OCR driven by a per-page provenance verdict.
 
         Only pages in ``provenance.pages_needing_ocr`` (or every page under
-        ``force``) are sent to Chandra; native pages keep pdf-inspector's
-        markdown (falling back to PyMuPDF text extraction), so born-digital
-        pages of a mixed document are never handed to the LLM.
+        ``force``) are sent to Chandra; native pages get their text via
+        ``pdftotext`` (same as paperless-ngx ingest), falling back to
+        pdf-inspector's markdown only when pdftotext finds nothing, so
+        born-digital pages are never handed to the LLM.
         """
         import fitz  # PyMuPDF
 
@@ -718,12 +719,13 @@ class ChandraOcrEngine:
             for page_num in range(1, total_pages + 1):
                 page = doc[page_num - 1]
                 if page_num not in needed:
-                    # Born-digital page: use PyMuPDF text extraction (plain text,
-                    # not markdown) so born-digital pages keep their raw text rather
-                    # than acquiring pdf-inspector's markdown formatting.
-                    text = (page.get_text() or "").strip()
-                    if not text:
-                        # Fall back to pdf-inspector's markdown if PyMuPDF found nothing.
+                    # Born-digital page: extract with pdftotext (same as
+                    # paperless-ngx ingest), split by form feed for per-page
+                    # text, so native pages keep text close to the original
+                    # content rather than PyMuPDF's layout extraction.
+                    text = self._pdftotext_page_text(pdf_path, page_num)
+                    if not text.strip():
+                        # Fall back to pdf-inspector's markdown if pdftotext found nothing.
                         text = provenance.native_markdown.get(page_num, "")
                     if text.strip():
                         native_count += 1
@@ -756,7 +758,7 @@ class ChandraOcrEngine:
 
             log.info(
                 "Provenance-driven content OCR done: %d page(s) sent to Chandra, "
-                "%d kept as native text (PyMuPDF extraction), %d error(s)",
+                "%d kept as native text (pdftotext), %d error(s)",
                 len(needed),
                 native_count,
                 len(error_pages),
@@ -771,6 +773,38 @@ class ChandraOcrEngine:
             error_pages=error_pages,
             errors=errors,
         )
+
+
+    @staticmethod
+    def _pdftotext_page_text(pdf_path: Path, page_num: int) -> str:
+        """Extract text for a single page with pdftotext (same as paperless-ngx).
+
+        Runs ``pdftotext`` once on the whole PDF, splits on form feeds, and
+        returns the slice for *page_num* (1-based). Returns empty string on
+        failure, so callers can fall back to pdf-inspector markdown.
+        """
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                ["pdftotext", "-layout", "-enc", "UTF-8", str(pdf_path), "-"],
+                capture_output=True,
+                timeout=120,
+            )
+            if result.returncode != 0:
+                return ""
+            full_text = result.stdout.decode("utf-8", errors="replace") or ""
+        except Exception:
+            return ""
+
+        if not full_text:
+            return ""
+
+        # pdftotext joins pages with a form feed (\f). Split and strip.
+        pages = full_text.split("\f")
+        if page_num < 1 or page_num > len(pages):
+            return ""
+        return pages[page_num - 1].strip()
 
     def _render_page_image(self, page: Any) -> Any:
         """Render one PyMuPDF page to a PIL Image, or None when blank."""

@@ -124,20 +124,26 @@ def process_document(
             )
             # Per-page matrix: which page is native vs needs OCR.
             if provenance.kind in (TEXT_BASED, SCANNED, MIXED):
-                rows: list[str] = []
-                for p in range(1, provenance.page_count + 1):
-                    if p in provenance.pages_needing_ocr:
-                        rows.append(f"  page {p:>2}: OCR")
-                    elif p in provenance.native_markdown:
-                        preview = provenance.native_markdown[p].strip()[:48].replace("\n", " ")
-                        rows.append(f"  page {p:>2}: native  {preview}")
-                    else:
-                        rows.append(f"  page {p:>2}: native  (text via PyMuPDF)")
+                page_labels: list[str] = [str(p) for p in range(1, provenance.page_count + 1)]
+                keep_marks = [
+                    "x" if p not in provenance.pages_needing_ocr else "-"
+                    for p in range(1, provenance.page_count + 1)
+                ]
+                ocr_marks = [
+                    "x" if p in provenance.pages_needing_ocr else "-"
+                    for p in range(1, provenance.page_count + 1)
+                ]
                 log.info(
-                    "Document %d: page matrix:\n%s",
+                    "Document %d: page matrix:\n"
+                    "  Page: [%s]\n"
+                    "  Keep: [%s]\n"
+                    "  OCR:  [%s]",
                     ctx.doc_id,
-                    "\n".join(rows),
+                    " ".join(f"{p:>3}" for p in page_labels),
+                    " ".join(f"{m:>3}" for m in keep_marks),
+                    " ".join(f"{m:>3}" for m in ocr_marks),
                 )
+
             if ctx.force:
                 log.warning(
                     "Document %d: modifier tag %r present - provenance gate "
