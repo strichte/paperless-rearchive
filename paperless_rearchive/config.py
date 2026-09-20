@@ -111,9 +111,9 @@ class Settings:
     archive_for_images: bool
 
     #: Provenance gate (layer 1 of the OCR strategy):
-    #: ``auto`` classifies each original with pdf-inspector; ``off`` keeps the
+    #: ``on`` classifies each original with pdf-inspector; ``off`` keeps the
     #: legacy mode-driven behaviour.
-    pdf_provenance: str  # auto | off
+    pdf_provenance: str  # on | off
     #: When True, born-digital originals are left untouched (content and
     #: archive) instead of being re-OCR'd.
     skip_born_digital: bool
@@ -172,9 +172,9 @@ class Settings:
                 f"backup directory {self.backup_dir} exists but is "
                 "not a directory."
             )
-        if self.pdf_provenance not in ("auto", "off"):
+        if self.pdf_provenance not in ("on", "off"):
             raise ValueError(
-                f"REARCHIVE_PDF_PROVENANCE must be 'auto' or 'off', "
+                f"REARCHIVE_PDF_PROVENANCE must be 'on' or 'off', "
                 f"got {self.pdf_provenance!r}"
             )
         if self.ocr_mixed_mode not in ("skip", "redo", "force"):
@@ -266,7 +266,7 @@ class Settings:
             ocr_output_type=_env("REARCHIVE_OCR_OUTPUT_TYPE", "pdfa"),
             ocr_user_args=user_args,
             archive_for_images=_env_bool("REARCHIVE_ARCHIVE_FOR_IMAGES", False),
-            pdf_provenance=_env("REARCHIVE_PDF_PROVENANCE", "auto").strip().lower(),
+            pdf_provenance=_env("REARCHIVE_PDF_PROVENANCE", "on").strip().lower(),
             skip_born_digital=_env_bool("REARCHIVE_SKIP_BORN_DIGITAL", True),
             preserved_tag=_env_optional("REARCHIVE_PRESERVED_TAG", "re-ocr-preserved").strip(),
             ocr_mixed_mode=_env("REARCHIVE_OCR_MIXED_MODE", "skip").strip().lower(),

@@ -112,7 +112,7 @@ def process_document(
         # scanned vs mixed). The verdict routes pages to OCR and, for a
         # born-digital document, stops the run before anything is written.
         provenance: PdfProvenance | None = None
-        if settings.pdf_provenance == "auto" and original.suffix.lower() == ".pdf":
+        if settings.pdf_provenance == "on" and original.suffix.lower() == ".pdf":
             provenance = classify_pdf(original, max_pages=settings.provenance_max_pages)
             log.info(
                 "Document %d: provenance=%s%s",

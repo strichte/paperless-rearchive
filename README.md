@@ -155,6 +155,26 @@ provenance gate in front:
 - Archive mode fails the whole doc on an un-OCRable page; `re-ocr-page-errors` only appears on
   content runs.
 
+### Why a separate provenance test?
+
+Paperless-ngx's own born-digital check (`pdf_born_digital_text` + `has_visible_text_content`)
+is document-level and binary: it answers *"does this PDF have a text layer?"* but cannot tell a
+scanned page with an invisible OCR overlay from a genuinely born-digital page, and it cannot split
+a mixed document page by page. The result: a scanned document carrying an OCR overlay is mistakenly
+treated as born-digital and skipped; a document mixing native and scanned pages is treated as all
+one thing.
+
+`REARCHIVE_PDF_PROVENANCE=on` (default) replaces that with pdf-inspector's per-page
+`extract_pages_markdown`: each page is classified individually with a correct `needs_ocr` flag,
+and pages that are native keep their own markdown (better-than-Chandra content, free). This is the
+more robust test the re-OCR tool exists to provide — it is what distinguishes a re-OCR run from
+paperless-ngx's ingestion pipeline.
+
+`REARCHIVE_PDF_PROVENANCE=off` falls back to paperless-ngx's own document-level heuristics (the
+same check ingest uses). It behaves like a paperless-ngx ingestion pipeline: the
+`REARCHIVE_OCR_MODE` knob is the sole policy, no per-page routing, no native markdown extraction.
+Use it when you want behaviour parity with ingest or when pdf-inspector is unavailable.
+
 ## Full setup (docker compose)
 
 ### Chandra LLM server setup
@@ -446,7 +466,7 @@ services:
       REARCHIVE_OCR_CONCURRENCY: "1"       # parallel pages (see reference)
       # --- OCR behaviour (mirrors PAPERLESS_OCR_*; see "OCR strategy") -------
       REARCHIVE_OCR_MODE: "redo"           # redo | auto | force | off | skip
-      REARCHIVE_PDF_PROVENANCE: "auto"     # born-digital gate: auto | off
+      REARCHIVE_PDF_PROVENANCE: "on"     # born-digital gate: on (pdf-inspector) | off (paperless-ngx heuristics)
       REARCHIVE_SKIP_BORN_DIGITAL: "true"  # never re-OCR born-digital PDFs
       REARCHIVE_PRESERVED_TAG: "re-ocr-preserved"
       REARCHIVE_OCR_MIXED_MODE: "skip"     # archive mode for mixed provenance
@@ -584,8 +604,8 @@ Booleans accept `true/false/yes/on/1`. Mounts are fixed: `/archive` (paperless
 | --- | --- | --- |
 | `REARCHIVE_PROVIDER` | `chandra` | OCR provider plugin. Only `chandra` exists today. |
 | `REARCHIVE_OCR_MODE` | `redo` | How existing text on OCR-routed pages is treated — see [OCR strategy](#ocr-strategy). `redo`/`auto`/`force`/`off`/`skip` (legacy `skip`/`skip_noarchive` = `auto`). |
-| `REARCHIVE_PDF_PROVENANCE` | `auto` | Born-digital detection (pdf-inspector): `auto` classifies each original; `off` keeps mode-driven behaviour. |
-| `REARCHIVE_SKIP_BORN_DIGITAL` | `true` | `true`: born-digital docs untouched (no PATCH, no ocrmypdf, no DB); tagged `re-ocr-preserved`. |
+| `REARCHIVE_PDF_PROVENANCE` | `on` | Per-page born-digital detection (pdf-inspector): `on` classifies each PDF page individually and routes only scan pages to OCR (`text_based` docs skipped entirely); `off` falls back to paperless-ngx's own document-level heuristics and behaves like the ingestion pipeline (mode-driven, no per-page routing). See [Why a separate provenance test?](#why-a-separate-provenance-test) and [OCR strategy](#ocr-strategy). |
+| `REARCHIVE_SKIP_BORN_DIGITAL` | `true` | Works with `REARCHIVE_PDF_PROVENANCE` (both `on` and `off`): when a document is classified `text_based` (all native), `true` skips it entirely (no OCR, no PATCH, no archive write; tagged `re-ocr-preserved`); `false` runs OCR anyway using `REARCHIVE_OCR_MODE` (useful when you want Chandra markdown over native text, or suspect the classifier). |
 | `REARCHIVE_PRESERVED_TAG` | `re-ocr-preserved` | Tag added alongside `-success` when native text was preserved. Empty disables. |
 | `REARCHIVE_OCR_MIXED_MODE` | `skip` | ocrmypdf mode for mixed docs (`skip`/`redo`/`force`). `skip` = `--skip-text`, keeps native pages. |
 | `REARCHIVE_PROVENANCE_MAX_PAGES` | `0` | Pages inspected by the provenance classifier; `0` = all. |

@@ -124,7 +124,7 @@ def test_prepare_backup_dir_dry_run_does_not_create(tmp_path: Path) -> None:
 
 def test_provenance_defaults() -> None:
     s = _settings()
-    assert s.pdf_provenance == "auto"
+    assert s.pdf_provenance == "on"
     assert s.skip_born_digital is True
     assert s.preserved_tag == "re-ocr-preserved"
     assert s.ocr_mixed_mode == "skip"
@@ -151,7 +151,9 @@ def test_provenance_settings_from_env() -> None:
 
 def test_validate_rejects_unknown_provenance_mode() -> None:
     s = _settings(REARCHIVE_PDF_PROVENANCE="sometimes")
-    with pytest.raises(ValueError, match="REARCHIVE_PDF_PROVENANCE"):
+    with pytest.raises(
+        ValueError, match="REARCHIVE_PDF_PROVENANCE must be 'on' or 'off'"
+    ):
         s.validate()
 
 
