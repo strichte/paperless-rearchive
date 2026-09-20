@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from paperless_rearchive.config import Settings
+from paperless_rearchive.ocr.model_check import ModelNotServedError
 from paperless_rearchive.paperless_api import PaperlessError
 from paperless_rearchive.poller import (
     _ACTIVE_POLL_INTERVAL_S,
@@ -66,16 +67,28 @@ def _settings(**env: str) -> Settings:
         return Settings.from_env()
 
 
-def _result(processed=0, succeeded=0, failed=0, remaining=0):
+def _result(processed=0, succeeded=0, failed=0, remaining=0, aborted=False):
     from paperless_rearchive.poller import CycleResult
 
     return CycleResult(
-        processed=processed, succeeded=succeeded, failed=failed, remaining=remaining
+        processed=processed,
+        succeeded=succeeded,
+        failed=failed,
+        remaining=remaining,
+        aborted=aborted,
     )
 
 
 def test_next_wait_idle_uses_full_interval() -> None:
     assert _next_wait(_settings(), _result(), 0) == 300
+
+
+def test_next_wait_model_error_uses_full_interval() -> None:
+    """A misconfiguration that no retry can clear waits the full idle
+    interval, not the tight active one - no hammering while broken."""
+    s = _settings()
+    assert _next_wait(s, _result(aborted=True), 0) == 300
+    assert _next_wait(s, _result(aborted=True), 5) == 300
 
 
 def test_next_wait_progress_or_backlog_uses_active_interval() -> None:
@@ -205,3 +218,32 @@ def test_dry_run_escalation_changes_no_tags() -> None:
         cycle(settings, _FakeAPI(), "chandra")
         cycle(settings, _FakeAPI(), "chandra")
     assert finishes == []  # dry runs never swap tags, even on escalation
+
+
+def test_model_not_served_aborts_cycle_without_failure_strikes() -> None:
+    """A model the server does not serve is a deployment-wide config error,
+    not a document fault: the cycle stops at the first document, no per-doc
+    failure is recorded and no document is escalated."""
+    settings = _settings()
+    finishes: list[dict] = []
+    calls: list[int] = []
+
+    def broken(settings, api, provider, ctx):
+        calls.append(ctx.doc_id)
+        raise ModelNotServedError("Chandra model 'typo' is not served")
+
+    with (
+        patch("paperless_rearchive.poller.get_provider", return_value=object()),
+        patch("paperless_rearchive.poller.process_document", side_effect=broken),
+        patch(
+            "paperless_rearchive.poller._finish",
+            side_effect=lambda *a, **kw: finishes.append({"ctx": a[1], **kw}),
+        ),
+    ):
+        result = cycle(settings, _FakeAPI(), "chandra")
+
+    assert result.aborted is True
+    assert result.processed == 0
+    assert calls == [101]  # aborts on the first document, not all five
+    assert _FAILURE_ATTEMPTS == {}  # no per-document failure strikes
+    assert finishes == []  # nothing escalated

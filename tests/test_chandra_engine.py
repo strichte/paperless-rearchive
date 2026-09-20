@@ -8,12 +8,15 @@ errors and fail the document with a partial result.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
 from paperless_chandra.engine.client import ChandraClientError
 
+from paperless_rearchive.ocr import chandra_engine
 from paperless_rearchive.ocr.chandra_engine import ChandraOcrEngine
+from paperless_rearchive.ocr.model_check import ModelNotServedError
 
 
 def _engine(concurrency: int = 1) -> ChandraOcrEngine:
@@ -23,6 +26,17 @@ def _engine(concurrency: int = 1) -> ChandraOcrEngine:
         api_key="secret",
         concurrency=concurrency,
     )
+
+
+@pytest.fixture(autouse=True)
+def _no_model_probe(monkeypatch):
+    """Keep the /models preflight offline for the local-logic tests.
+
+    The probe itself is covered by tests/test_model_check.py, and the
+    abort-before-any-page behaviour by
+    test_model_not_served_aborts_before_any_page below.
+    """
+    monkeypatch.setattr(chandra_engine, "ensure_model_served", lambda *a, **k: None)
 
 
 def test_transport_error_aborts_document_sequential(tmp_path: Path, monkeypatch) -> None:
@@ -211,3 +225,69 @@ def test_resolve_ingest_mode_uses_provenance(tmp_path: Path) -> None:
         settings, missing, PdfProvenance(kind=TEXT_BASED, page_count=1), True
     ) == "force"
     assert engine._resolve_ingest_mode(settings, missing, None, True) == "force"
+
+
+# ── model-name preflight ─────────────────────────────────────────────────────
+
+
+def test_model_not_served_aborts_before_any_page(tmp_path: Path, monkeypatch) -> None:
+    """A model the server does not advertise fails the document up front:
+    no page is rendered and no page request (hence no retry ladder) is made."""
+    engine = _engine()
+
+    def raise_missing(server_url, model_name, api_key=""):
+        raise ModelNotServedError(f"Chandra model {model_name!r} is not served by {server_url}")
+
+    monkeypatch.setattr(chandra_engine, "ensure_model_served", raise_missing)
+    rendered: list[int] = []
+    monkeypatch.setattr(
+        ChandraOcrEngine,
+        "_render_pdf_pages",
+        lambda self, p: rendered.append(1) or [object()],
+    )
+    generated: list[int] = []
+    monkeypatch.setattr(
+        "paperless_rearchive.ocr.chandra_engine.chandra_client.ocr_image",
+        lambda image, options: generated.append(1),
+    )
+
+    with pytest.raises(ModelNotServedError, match="not served"):
+        engine.ocr_document(tmp_path / "in.pdf")
+
+    assert rendered == []
+    assert generated == []
+
+
+def test_model_preflight_receives_engine_configuration(tmp_path: Path, monkeypatch) -> None:
+    engine = _engine()
+    seen: dict[str, str] = {}
+
+    def record(server_url, model_name, api_key=""):
+        seen.update(server_url=server_url, model_name=model_name, api_key=api_key)
+
+    monkeypatch.setattr(chandra_engine, "ensure_model_served", record)
+    monkeypatch.setattr(ChandraOcrEngine, "_render_pdf_pages", lambda self, p: [])
+
+    engine.ocr_document(tmp_path / "in.pdf")
+
+    assert seen == {
+        "server_url": "http://ai:8110/v1",
+        "model_name": "chandra-ocr-2-q8",
+        "api_key": "secret",
+    }
+
+
+def test_upstream_generation_error_is_logged_with_model(monkeypatch, caplog) -> None:
+    """Upstream prints a bare 'Error during VLLM generation: ...'; the
+    interceptor re-logs it with the model name (which the message omits)."""
+    chandra_engine._install_retry_log_interceptor()
+    monkeypatch.setattr(chandra_engine, "_current_model_name", lambda: "typo-model")
+
+    with caplog.at_level(logging.ERROR):
+        print("Error during VLLM generation: Error code: 404 - no router for requested model")
+
+    assert any(
+        "typo-model" in record.getMessage()
+        for record in caplog.records
+        if record.levelno >= logging.ERROR
+    )

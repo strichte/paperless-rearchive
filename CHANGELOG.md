@@ -21,11 +21,22 @@ patch).
   `REARCHIVE_PROVENANCE_MAX_PAGES`, `REARCHIVE_FORCE_TAG`.
 - Explicit `skip` value for `REARCHIVE_OCR_MODE` (ocrmypdf `--skip-text`).
 - `inspect_pdf.py --decide` reports the sidecar's gate decision.
+- Model-name preflight (`ocr/model_check.py`): `PAPERLESS_CHANDRA_MODEL_NAME`
+  is checked once per process against the server's `GET /v1/models` list, so a
+  typo fails the document before any page (and any retry) is attempted.
 
 ### Fixed
 - `re-ocr-all` could mangle born-digital PDFs: the default `redo` mode
   stripped their native text layer and replaced it with Chandra output.
 - `_finish()` logged `extra_tags` but never added them to the document.
+- A wrong `PAPERLESS_CHANDRA_MODEL_NAME` no longer pays the upstream retry
+  ladder per page before failing: the failure names the requested model and
+  lists the models the server actually serves. The poller treats it as a
+  deployment-wide misconfiguration: the cycle is aborted (no per-document
+  failure is recorded and no document is escalated) and the next cycle waits
+  the full poll interval. The upstream `Error during VLLM generation: ...`
+  print is also re-logged with the model name when the server exposes no
+  usable `/v1/models` list.
 
 ### Changed
 - OCR strategy is now two layers: provenance (which pages need OCR) and mode

@@ -39,6 +39,8 @@ except Exception:
 from paperless_chandra.engine.blocks import markdown_sidecar, page_from_chunks
 from paperless_chandra.engine.hocr import sidecar_text
 
+from paperless_rearchive.ocr.model_check import cached_models_for, ensure_model_served
+
 log = logging.getLogger(__name__)
 
 # The ocrmypdf plugin that replaces ocrmypdf's default Tesseract engine with
@@ -66,6 +68,12 @@ _FALLBACK_MAX_RETRIES = 6
 _RETRY_PRINT_RE = re.compile(
     r"Detected (repeat token|vllm error), retrying generation \(attempt (\d+)\)"
 )
+
+# Upstream reports each failed request with a bare print() too (see
+# chandra/model/vllm.py::generate_vllm). The message omits the model name, so
+# match it here and re-log with the model - plus the server's advertised
+# models when the /models preflight already fetched them.
+_VLLM_ERROR_PRINT_RE = re.compile(r"Error during VLLM generation: (?P<detail>.*)", re.DOTALL)
 _interceptor_installed = False
 _policy_logged = False
 
@@ -85,13 +93,25 @@ def _retry_temperature(base: float, attempt: int) -> float:
     return min(base + _RETRY_TEMP_STEP * attempt, _RETRY_TEMP_CAP)
 
 
+def _current_model_name() -> str:
+    """Model upstream applied to the last request (read from its settings)."""
+    try:
+        if _chandra_settings is not None:
+            return str(_chandra_settings.VLLM_MODEL_NAME or "")
+    except Exception:
+        pass
+    return ""
+
+
 def _install_retry_log_interceptor() -> None:
-    """Route upstream's print() retry notices through logging with params.
+    """Route upstream's print() retry/error notices through logging.
 
     Idempotent; preserves the original stdout output. The attempt number in
-    the message maps to retry_temperature(N) / top_p=0.95, since upstream
+    the retry message maps to retry_temperature(N) / top_p=0.95, since upstream
     computes retry_temperature the same way for both repeat-token and error
-    retries.
+    retries. Generation failures are re-logged with the configured model name
+    (and the server's advertised models when known), which upstream's bare
+    ``Error during VLLM generation: ...`` print omits.
     """
     global _interceptor_installed
     if _interceptor_installed:
@@ -118,6 +138,17 @@ def _install_retry_log_interceptor() -> None:
                 _RETRY_TOP_P,
                 _BASE_TEMPERATURE,
                 _BASE_TOP_P,
+            )
+        error = _VLLM_ERROR_PRINT_RE.search(msg)
+        if error:
+            model = _current_model_name()
+            available = cached_models_for(model) if model else None
+            hint = f" Server advertises: {', '.join(sorted(available))}." if available else ""
+            log.error(
+                "Chandra generation failed for model %r: %s%s",
+                model or "<unset>",
+                error.group("detail").strip(),
+                hint,
             )
         _orig_print(*args, sep=sep, end=end, **kwargs)
 
@@ -299,6 +330,13 @@ class ChandraOcrEngine:
         """
         if produce_pdf and output_pdf_path is None:
             raise ValueError("output_pdf_path is required when produce_pdf=True")
+
+        # Fail fast on a model the server does not serve. The upstream retry
+        # ladder would otherwise re-send the same 404 once per page
+        # (MAX_VLLM_RETRIES attempts, ~40 s at the default six) before the
+        # error surfaces - and without naming the offending model. Cached once
+        # per (url, model) per process, so this is one probe, not one per page.
+        ensure_model_served(self.server_url, self.model_name, self.api_key)
 
         if produce_pdf and settings is not None:
             return self._ocr_document_ingest_pass(

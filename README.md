@@ -87,8 +87,11 @@ Truly required: `PAPERLESS_API_TOKEN` (poller exits without it) and
 `PAPERLESS_CHANDRA_SERVER_URL` (provider `validate()` fails without it). `PAPERLESS_DBPASS`
 only for `re-ocr-all` — content-only never opens a DB connection. `PAPERLESS_CHANDRA_MODEL_NAME`
 defaults to `chandra`, so you can omit it when the server is started with
-`--served-model-name=chandra` — but the value **must** match the server's served name or every
-request fails with `model not found`.
+`--served-model-name=chandra` — but the value **must** match a name the server advertises. A
+mismatch is caught once per process against the server's `GET /v1/models` list and aborts the
+poll cycle immediately — naming the requested model and listing the models the server actually
+serves — instead of retrying the same `model not found` on every page (and then escalating each
+document after three strikes). Fix the env var and redeploy; the poller resumes on the next cycle.
 
 Steps:
 
@@ -570,7 +573,7 @@ Booleans accept `true/false/yes/on/1`. Mounts are fixed: `/archive` (paperless
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `PAPERLESS_CHANDRA_SERVER_URL` | *(required)* | OpenAI-compatible server hosting Chandra, e.g. `http://chandra-server:8000` or `http://ai:8110/v1`. |
-| `PAPERLESS_CHANDRA_MODEL_NAME` | `chandra` | The model name the server advertises (`/v1/models`). |
+| `PAPERLESS_CHANDRA_MODEL_NAME` | `chandra` | The model name the server advertises. Checked against `GET /v1/models` once per process; a mismatch aborts the poll cycle (no document is modified or escalated). |
 | `PAPERLESS_CHANDRA_API_KEY` / `…_FILE` | *(empty)* | Bearer token for the server; leave unset if the server needs no auth. |
 | `PAPERLESS_CHANDRA_CONTENT_FORMAT` | `markdown` | Format of the OCR text stored in paperless: `markdown` (recommended) or `text`. |
 | `PAPERLESS_CHANDRA_MAX_OUTPUT_TOKENS` | `12384` | Per-page output token budget for the model. |

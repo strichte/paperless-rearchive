@@ -26,6 +26,7 @@ from paperless_rearchive import __version__
 from paperless_rearchive.config import Settings
 from paperless_rearchive.logging_setup import configure_logging
 from paperless_rearchive.ocr.base import get_provider
+from paperless_rearchive.ocr.model_check import ModelNotServedError
 from paperless_rearchive.paperless_api import PaperlessAPI, PaperlessError
 from paperless_rearchive.pipeline import (
     DocumentContext,
@@ -62,6 +63,10 @@ class CycleResult:
     failed: int
     #: Documents still tagged when the cycle ended (backlog left to drain).
     remaining: int
+    #: True when the cycle was cut short by a gate that no retry can clear
+    #: (today: the configured Chandra model is not served). The next cycle
+    #: then waits the full idle interval instead of the active drain one.
+    aborted: bool = False
 
 
 def _on_signal(signum: int, _frame: object) -> None:
@@ -118,6 +123,24 @@ def cycle(settings: Settings, api: PaperlessAPI, provider_name: str) -> CycleRes
                 process_document(settings, api, get_provider(provider_name), ctx)
                 succeeded += 1
                 _FAILURE_ATTEMPTS.pop((doc_id, name), None)
+            except ModelNotServedError as exc:
+                # Deployment-wide misconfiguration, not a document fault: every
+                # tagged document would fail identically, so stop the cycle
+                # instead of spending one attempt - and one escalation strike -
+                # per document. Nothing was modified and no failure is counted.
+                log.error(
+                    "Aborting poll cycle: %s No document was modified and no "
+                    "failure was recorded; fix PAPERLESS_CHANDRA_MODEL_NAME "
+                    "(and restart) and the poller will resume.",
+                    exc,
+                )
+                return CycleResult(
+                    processed=processed,
+                    succeeded=succeeded,
+                    failed=failed,
+                    remaining=total_backlog,
+                    aborted=True,
+                )
             except PaperlessError as exc:
                 log.exception("API error on document %d; keeping trigger tag.", doc_id)
                 failed += 1
@@ -265,11 +288,15 @@ def _log_cycle_summary(
 def _next_wait(settings: Settings, result: CycleResult, no_progress_streak: int) -> float:
     """Wait before the next cycle, from the just-finished cycle's outcome.
 
+    * aborted (a gate no retry can clear, e.g. model not served) -> full
+      ``REARCHIVE_POLL_INTERVAL``
     * idle (nothing attempted, nothing tagged) -> full ``REARCHIVE_POLL_INTERVAL``
     * progress or known backlog -> the fixed active interval (drain mode)
     * attempts but no successes -> exponential backoff from the active
       interval, capped at the full interval (never a tight retry loop)
     """
+    if result.aborted:
+        return settings.poll_interval
     if result.processed == 0 and result.remaining == 0:
         return settings.poll_interval
     if no_progress_streak <= 0:
