@@ -21,3 +21,20 @@ venv/
 # Local deployment artefacts (secrets, staged tarballs) - top-level deploy dir
 /deploy/
 *.bak-*
+
+# Keep secrets out of source control
+*.log
+*.log.*
+*.logrotate
+*.logrotate.conf
+*.logrotate.d
+*.logrotate.conf.d
+*.logrotate.d.*
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+id_rsa*
+id_ed25519*

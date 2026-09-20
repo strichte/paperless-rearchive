@@ -1,0 +1,10 @@
+# Extend the default Gitleaks configuration rules
+[extend]
+useDefault = true
+
+# Define what Gitleaks should ignore
+[allowlist]
+description = "Exclude Python virtual environments"
+paths = [
+    '''\.venv\/'''
+]
