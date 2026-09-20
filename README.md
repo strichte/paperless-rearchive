@@ -22,11 +22,11 @@ services:
     build:
       context: ./paperless-rearchive
       dockerfile: docker/Dockerfile
-    image: paperless-rearchive:v0.1.0
+    image: paperless-rearchive:latest
     user: "1000:1000"   # UID:GID that owns the archive files (same as paperless USERMAP_UID/GID)
     environment:
       PAPERLESS_API_TOKEN: "<paperless-api-token>"          # Admin -> Documents -> Tokens
-      PAPERLESS_CHANDRA_SERVER_URL: "http://chandra-server:8000"  # see Chandra server below
+      PAPERLESS_CHANDRA_SERVER_URL: "http://my-ai.local:8000/v1"  # see Chandra server below
       PAPERLESS_DBPASS: "<postgres-password>"               # re-ocr-all only; omit for content-only
     volumes:
       - /data/paperless/media/documents/archive:/archive         # read-write
@@ -44,53 +44,128 @@ Steps:
 
 ## Chandra server setup
 
-All inference happens on a self-hosted OpenAI-compatible server. The sidecar itself is CPU-only.
+All inference happens on a self-hosted server with an OpenAI-compatible endpoint. The sidecar itself is CPU-only.
 Any server exposing `/v1/chat/completions` works; [vLLM](https://github.com/vllm-project/vllm) is
-the reference. Same server you (would) use for
-[paperless-chandra](https://github.com/flobernd/paperless-chandra) ingest works as-is.
+the reference. Same server you would use for
+[paperless-chandra](https://github.com/flobernd/paperless-chandra) ingest works as-is. If you want to host with vLLM please follow [paperless-chandra'  recommended setup](https://github.com/flobernd/paperless-chandra/tree/master#docker-compose-example).
 
-Minimal server next to paperless (from
-[paperless-chandra's example](https://github.com/flobernd/paperless-chandra/blob/master/examples/docker-compose.vllm.yml)):
+Alternatively, you can host it with `llama-swap`:
 
 ```yaml
 services:
-  chandra-server:
-    image: vllm/vllm-openai:v0.17.0
-    command:
-      - --model=datalab-to/chandra-ocr-2
-      - --served-model-name=chandra
-      - --api-key=${CHANDRA_API_KEY:?missing CHANDRA_API_KEY in .env}
-      - --dtype=bfloat16
-      - --max-model-len=18000
-      - --max-num-seqs=16
-      - --max-num-batched-tokens=2048
-      - --gpu-memory-utilization=0.85
-      - --enable-prefix-caching
-      - --no-enforce-eager
-      - --mm-processor-kwargs={"min_pixels":3136,"max_pixels":6291456}
-    expose: ["8000"]
-    ipc: host
-    volumes: [hf_cache:/root/.cache/huggingface]   # ~10 GB model weights, persist between restarts
+    image: ghcr.io/mostlygeek/llama-swap:v255-cuda13-b10902
+    labels:
+    container_name: llama-swap
+    ports:
+      - "8080:8080"
+    volumes:
+      - ~/docker/llama.cpp/models:/models
+      - ~/docker/llama.cpp/cache:/root/.cache/huggingface
+      - ~/docker/llama-swap/config.yaml:/app/config.yaml
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CHANDRA_API_KEY=${CHANDRA_API_KEY:?missing CHANDRA_API_KEY in .env}
+    restart: unless-stopped
+    command: --config /app/config.yaml --listen 0.0.0.0:8080
     deploy:
       resources:
         reservations:
-          devices: [{driver: nvidia, capabilities: [gpu], count: 1}]
-
-volumes:
-  hf_cache:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+```
+with `config.yaml`:
+```yaml
+models:
+  "chandra-ocr-2-q8":
+    description: "Datalab Chandra OCR 2 (5B vision model) - document/image OCR to markdown"
+    ttl: 600
+    cmd: |
+      llama-server
+      -m /models/chandra-ocr-2/chandra-ocr-2.Q8_0.gguf
+      --mmproj /models/chandra-ocr-2/chandra-ocr-2.mmproj-f16.gguf
+      --port ${PORT}
+      --api-key ${env.CHANDRA_API_KEY}
+      -ngl 999
+      --parallel 1
+      --flash-attn on
+      --ctx-size 18000
+      --temp 0.0
+      --jinja
+      --chat-template-kwargs '{"enable_thinking":false}'
+  "chandra-ocr-2-bf16":
+    description: "Datalab Chandra OCR 2 (5B vision model) - unquantized BF16, max fidelity"
+    ttl: 600
+    cmd: |
+      llama-server
+      -m /models/chandra-ocr-2/chandra-ocr-2.BF16.gguf
+      --mmproj /models/chandra-ocr-2/chandra-ocr-2.mmproj-bf16.gguf
+      --port ${PORT}
+      --api-key ${env.CHANDRA_API_KEY}
+      -ngl 999
+      --parallel 1
+      --flash-attn on
+      --ctx-size 18000
+      --temp 0.0
+      --jinja
+      --chat-template-kwargs '{"enable_thinking":false}'
 ```
 
-Notes:
+The model name (`chandra-ocr-2-q8` and `chandra-ocr-2-bf16` in the example above) is what you specify in your `paperless-rearchive` docker compose file with the `PAPERLESS_CHANDRA_MODEL_NAME` environment variable.
 
-- GPU: ~24 GB class (L4, RTX 4090) for full-precision bf16 at 1–2 pages/sec. Smaller GPUs via
-  quantized GGUF take tens of seconds per page; CPU-only takes minutes per page.
-- Point the sidecar at it: `PAPERLESS_CHANDRA_SERVER_URL: "http://chandra-server:8000"` (same
-  compose) or `http://ai:8110/v1` (remote GPU box).
-- `PAPERLESS_CHANDRA_MODEL_NAME` must equal `--served-model-name` (`chandra` above).
-- `PAPERLESS_CHANDRA_API_KEY` must equal `CHANDRA_API_KEY` — omit both if the server needs no auth.
-- Check it: `curl http://chandra-server:8000/v1/models` should list your model.
-- Commercial self-hosting needs a [license](https://datalab.to/pricing) (weights are modified
-  OpenRAIL-M; the plugin code is MIT).
+I've downloaded two different quants of the Chandra model to `~/docker/llama.cpp/models` and added the directory with bind mount `~/docker/llama.cpp/models:/models` to `llama-swap`. Pick the one that works for you or try both and compare the results. I found Q8 to give very good results already.
+
+```bash
+mkdir -p ~/docker/llama.cpp/models/chandra-ocr-2
+cd ~/docker/llama.cpp/models/chandra-ocr-2
+
+# Q8_0 quantized (~5.16 GB)
+curl -L -C - -o chandra-ocr-2.Q8_0.gguf \
+  https://huggingface.co/prithivMLmods/chandra-ocr-2-GGUF/resolve/main/chandra-ocr-2.Q8_0.gguf
+
+# Unquantized BF16 (~9.7 GB) — lossless repackaging of the bf16 checkpoint weights
+curl -L -C - -o chandra-ocr-2.BF16.gguf \
+  https://huggingface.co/prithivMLmods/chandra-ocr-2-GGUF/resolve/main/chandra-ocr-2.BF16.gguf
+
+# Vision projector (shared by both variants — see note below)
+curl -L -C - -o chandra-ocr-2.mmproj-f16.gguf \
+  https://huggingface.co/prithivMLmods/chandra-ocr-2-GGUF/resolve/main/chandra-ocr-2.mmproj-f16.gguf
+```
+
+Files:
+- `chandra-ocr-2.Q8_0.gguf`         5,157,833,312 bytes (~5.16 GB)
+- `chandra-ocr-2.BF16.gguf`        9,695,791,712 bytes (~9.70 GB)  ← unquantized
+- `chandra-ocr-2.mmproj-f16.gguf`     675,568,928 bytes (~676 MB)
+
+**mmproj note:** the repo's `mmproj-bf16.gguf` is byte-identical to
+`mmproj-f16.gguf` (same sha256 `a270372d…` — one projector ships with every
+quant). You can keep a single physical copy and make `chandra-ocr-2.mmproj-bf16.gguf`
+a **hardlink** to `chandra-ocr-2.mmproj-f16.gguf`. Re-create it after any
+re-download with:
+`ln chandra-ocr-2.mmproj-f16.gguf chandra-ocr-2.mmproj-bf16.gguf`
+
+Served via llama-swap, entries in `~/docker/llama-swap/config.yaml`:
+- `chandra-ocr-2-q8`  → Q8_0
+- `chandra-ocr-2-bf16` → BF16 (unquantized)
+
+Both entries use `--temp 0.0` (Chandra expects greedy decoding; llama-server
+defaults to temp 0.8 which makes output nondeterministic) and
+`--chat-template-kwargs '{"enable_thinking":false}'` is required — see
+https://github.com/flobernd/paperless-chandra (GGUF builds re-enable thinking
+otherwise, breaking the output).
+
+**Note:** Datalab's [Chandra OCR 2 model](https://github.com/datalab-to/chandra) uses a dual licensing structure: the source code is licensed under Apache-2.0, while the model weights are governed by a modified OpenRAIL-M license.
+
+* **License Breakdown:** 
+  * Code License: Apache-2.0 for the repository's codebase.
+  * Model Weights License: Modified OpenRAIL-M.
+* **Usage Terms & Free Tier:**
+  * Free Use: Free for research, personal use, and startups with under $2 million in funding or revenue.
+  * Restrictions: Cannot be used to compete directly with Datalab's API services.
+  * Commercial License: Required for larger organizations, companies with over $2M in revenue/funding, or high-volume/on-prem enterprise needs. You can obtain a commercial agreement through the Datalab Pricing page.
+
+
 
 ## Is this tool for you?
 
@@ -104,12 +179,11 @@ Re-OCR rewrites `content` and *replaces archive files*. Check every item:
 - **PostgreSQL** (`re-ocr-all` only). SQLite/MariaDB: `re-ocr-content` works, `re-ocr-all`
   cannot. Reuse paperless's `PAPERLESS_DB*` credentials. Content-only runs never open a DB
   connection.
-- **Chandra server** (above). Same server as paperless-chandra ingest.
+- **Chandra server** (above). Same server as [paperless-chandra](https://github.com/flobernd/paperless-chandra) ingest.
 - **Backup mount.** Every replaced archive is copied to `/archive-backups` first. Mount it
-  outside the archive tree (separate bind mount, may be another disk) or paperless flags the
-  backups as orphaned files.
+  outside the archive tree (separate bind mount, may be another disk).
 - **No undo button.** Changes are recorded (audit note, provenance fields, `.bak` copies) — still,
-  start with `REARCHIVE_DRY_RUN=true` and one test doc.
+  start with `REARCHIVE_DRY_RUN=true` and one test doc. TODO: point to restore backup script
 
 Only need Chandra for **new** documents? Run
 [paperless-chandra](https://github.com/flobernd/paperless-chandra) directly — this project is for
@@ -123,7 +197,7 @@ what's already in your library.
 | `re-ocr-all` | As above, **plus** regenerate the archive (same ocrmypdf pipeline as ingest) and update `archive_checksum` in the DB. |
 | `re-ocr-force` | Modifier, not a trigger: add next to one of the above to force OCR of every page. Never auto-created. |
 
-- Trigger tags are auto-created. No manual setup — tag a doc and wait (or `docker kill -s HUP
+- Tag a doc and wait (or `docker kill -s HUP
   paperless-rearchive`).
 - After processing the trigger is swapped for `<trigger>-success` or `<trigger>-failure`.
 - Extra tags: `re-ocr-preserved` (born-digital, left untouched), `re-ocr-detection-unknown`
@@ -145,6 +219,7 @@ what's already in your library.
   mounts overlap.
 - **Dry run.** `REARCHIVE_DRY_RUN=true` does the full OCR run, writes nothing (no PATCH, no file,
   no DB, no tag swaps).
+- TODO: backup restore script
 
 ## OCR strategy
 
@@ -183,7 +258,7 @@ git clone https://github.com/<you>/paperless-rearchive.git
 
 Abbreviated but complete: postgres, valkey/redis, tika, gotenberg, paperless (with Chandra plugin
 for ingest) plus `paperless-rearchive`. Host paths `/data/paperless/...`, UID/GID `1000` are
-placeholders. Chandra server runs elsewhere (`http://ai:8110/v1` here) — or add
+placeholders. Chandra server runs elsewhere (`http://my-ai.local:8000/v1` here) — or add
 [chandra-server](#chandra-server-setup) to the same file.
 
 ```yaml
@@ -272,7 +347,7 @@ services:
       PAPERLESS_TIKA_ENDPOINT: http://tika:9998
       PAPERLESS_TIKA_GOTENBERG_ENDPOINT: http://gotenberg:3000
       # Chandra at ingest (requires the paperless-chandra build above):
-      PAPERLESS_CHANDRA_SERVER_URL: http://ai:8110/v1
+      PAPERLESS_CHANDRA_SERVER_URL: http://my-ai.local:8000/v1
       PAPERLESS_CHANDRA_MODEL_NAME: chandra-ocr-2-q8
       PAPERLESS_CHANDRA_API_KEY_FILE: /run/secrets/chandra_api_key
     secrets:
@@ -308,7 +383,7 @@ services:
       PAPERLESS_BASE_URL: "http://paperless:8000"     # paperless web UI/API
       PAPERLESS_API_TOKEN_FILE: /run/secrets/paperless_api_token
       # Chandra inference server (OpenAI-compatible /v1 API):
-      PAPERLESS_CHANDRA_SERVER_URL: "http://ai:8110/v1"
+      PAPERLESS_CHANDRA_SERVER_URL: "http://my-ai.local:8000/v1"
       PAPERLESS_CHANDRA_MODEL_NAME: "chandra-ocr-2-q8"
       PAPERLESS_CHANDRA_API_KEY_FILE: /run/secrets/chandra_api_key
       # Database (re-ocr-all only) - copy from paperless's own environment:
