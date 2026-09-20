@@ -718,12 +718,16 @@ class ChandraOcrEngine:
             for page_num in range(1, total_pages + 1):
                 page = doc[page_num - 1]
                 if page_num not in needed:
-                    markdown = provenance.native_markdown.get(page_num, "")
-                    if not markdown.strip():
-                        markdown = (page.get_text() or "").strip()
-                    if markdown.strip():
+                    # Born-digital page: use PyMuPDF text extraction (plain text,
+                    # not markdown) so born-digital pages keep their raw text rather
+                    # than acquiring pdf-inspector's markdown formatting.
+                    text = (page.get_text() or "").strip()
+                    if not text:
+                        # Fall back to pdf-inspector's markdown if PyMuPDF found nothing.
+                        text = provenance.native_markdown.get(page_num, "")
+                    if text.strip():
                         native_count += 1
-                    parts[page_num - 1] = markdown
+                    parts[page_num - 1] = text
                     continue
 
                 image = self._render_page_image(page)
@@ -751,8 +755,8 @@ class ChandraOcrEngine:
                 )
 
             log.info(
-                "Provenance-driven content OCR done: %d page(s) OCR'd, %d kept "
-                "native, %d error(s)",
+                "Provenance-driven content OCR done: %d page(s) sent to Chandra, "
+                "%d kept as native text (PyMuPDF extraction), %d error(s)",
                 len(needed),
                 native_count,
                 len(error_pages),

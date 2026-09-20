@@ -34,6 +34,8 @@ from paperless_rearchive.archive.replacer import (
 from paperless_rearchive.ocr.base import OcrProviderPlugin
 from paperless_rearchive.ocr.chandra_engine import ChandraOcrEngine, OcrResult
 from paperless_rearchive.ocr.provenance import (
+    MIXED,
+    SCANNED,
     TEXT_BASED,
     UNKNOWN,
     PdfProvenance,
@@ -120,6 +122,22 @@ def process_document(
                 provenance.summary(),
                 " (forced)" if ctx.force else "",
             )
+            # Per-page matrix: which page is native vs needs OCR.
+            if provenance.kind in (TEXT_BASED, SCANNED, MIXED):
+                rows: list[str] = []
+                for p in range(1, provenance.page_count + 1):
+                    if p in provenance.pages_needing_ocr:
+                        rows.append(f"  page {p:>2}: OCR")
+                    elif p in provenance.native_markdown:
+                        preview = provenance.native_markdown[p].strip()[:48].replace("\n", " ")
+                        rows.append(f"  page {p:>2}: native  {preview}")
+                    else:
+                        rows.append(f"  page {p:>2}: native  (text via PyMuPDF)")
+                log.info(
+                    "Document %d: page matrix:\n%s",
+                    ctx.doc_id,
+                    "\n".join(rows),
+                )
             if ctx.force:
                 log.warning(
                     "Document %d: modifier tag %r present - provenance gate "
