@@ -1,9 +1,5 @@
 # Changelog
 
-All notable changes to paperless-rearchive are documented here. Format is
-based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
-project versions with SemVer (pre-1.0: features bump the minor, fixes the
-patch).
 
 ## Unreleased
 
