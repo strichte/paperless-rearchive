@@ -34,7 +34,7 @@
       # and /archive-backups (see volumes below). Override the archive path
       # only if the mount differs.
       # REARCHIVE_ARCHIVE_DIR: "/archive"
-      PAPERLESS_CHANDRA_SERVER_URL: "http://ai:8110/v1"
+      PAPERLESS_CHANDRA_SERVER_URL: "http://my-ai.local:8000/v1"
       PAPERLESS_CHANDRA_MODEL_NAME: "chandra-ocr-2-q8"
       PAPERLESS_CHANDRA_CONTENT_FORMAT: "markdown"
       PAPERLESS_CHANDRA_API_KEY_FILE: /run/secrets/chandra_api_key
