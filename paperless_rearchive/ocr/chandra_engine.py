@@ -978,12 +978,12 @@ class ChandraOcrEngine:
                 parts.append(orig_map.get(page_num, ""))
         return "\n\n".join(parts)
 
-    def _render_page_image(self, page: Any) -> Any:
+    def _render_page_image(self, page: Any, skip_blank: bool = True) -> Any:
         """Render one PyMuPDF page to a PIL Image, or None when blank."""
         import fitz  # PyMuPDF
         from PIL import Image
 
-        if not page.get_text().strip() and not page.get_images():
+        if skip_blank and not page.get_text().strip() and not page.get_images():
             return None
         zoom = self.dpi / 72.0
         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
@@ -1002,9 +1002,24 @@ class ChandraOcrEngine:
 
         images: list[Any] = []
         try:
-            doc = fitz.open(pdf_path)
+            try:
+                doc = fitz.open(pdf_path)
+            except fitz.FileDataError as e:
+                # Unrenderable input (Office document, corrupt file, ...).
+                # The pipeline skips non-OCR-able originals before this
+                # point; reaching here means an unforeseen type slipped
+                # through - fail with a clear message, not a mupdf dump.
+                raise RuntimeError(
+                    f"original is not a renderable document "
+                    f"({pdf_path.suffix.lower() or 'unknown type'}): {e}"
+                ) from e
+            # Raster-image originals (JPG/PNG/...): the image IS the page, so
+            # get_text()/get_images() are empty and the PDF blank-page
+            # heuristic would skip every page. Render image documents
+            # unconditionally; blank detection only applies to PDFs.
+            allow_blank_skip = bool(doc.is_pdf)
             for page_num in range(len(doc)):
-                image = self._render_page_image(doc[page_num])
+                image = self._render_page_image(doc[page_num], skip_blank=allow_blank_skip)
                 if image is None:
                     log.debug("Skipping blank page %d", page_num + 1)
                     continue

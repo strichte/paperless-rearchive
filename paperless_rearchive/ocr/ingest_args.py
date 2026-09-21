@@ -353,6 +353,10 @@ def build_ocrmypdf_args(
         ocrmypdf_args["clean"] = True
     elif clean == "final":
         if mode == "redo":
+            log.info(
+                "clean-final requested but downgraded to clean: "
+                "--clean-final is incompatible with --redo-ocr"
+            )
             ocrmypdf_args["clean"] = True
         else:
             ocrmypdf_args["clean_final"] = True
@@ -361,6 +365,12 @@ def build_ocrmypdf_args(
         # --deskew is not compatible with --redo-ocr; dropping deskew is
         # what paperless itself does.
         ocrmypdf_args["deskew"] = True
+    elif deskew and mode == "redo":
+        log.info(
+            "deskew requested but dropped: --deskew is incompatible with "
+            "--redo-ocr (redo never alters page images, so skew cannot be "
+            "fixed without re-rendering them)"
+        )
 
     if rotate:
         ocrmypdf_args["rotate_pages"] = True

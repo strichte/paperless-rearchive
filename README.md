@@ -610,8 +610,9 @@ Booleans accept `true/false/yes/on/1`. Mounts are fixed: `/archive` (paperless
 | `REARCHIVE_OCR_MIXED_MODE` | `skip` | ocrmypdf mode for mixed docs (`skip`/`redo`/`force`). `skip` = `--skip-text`, keeps native pages. |
 | `REARCHIVE_PROVENANCE_MAX_PAGES` | `0` | Pages inspected by the provenance classifier; `0` = all. |
 | `REARCHIVE_FORCE_TAG` | `re-ocr-force` | Modifier tag (never auto-created) to force OCR of every page. Empty disables. |
+| `re-ocr-skipped` (auto tag) | — | Marker applied when the original is not OCR-able (Office documents etc.): digital-born, not PDF, text extracted at ingest - nothing to re-run. Trigger swaps to `<trigger>-success`. Raster-image originals (JPG/PNG/TIFF) are OCR-able and take the normal content path. |
 | `REARCHIVE_OCR_CLEAN` | `clean` | Image cleaning: `clean` (pre-OCR), `final` (becomes pre-OCR under `redo`), `none`. |
-| `REARCHIVE_OCR_DESKEW` | `true` | Fix small skew. Silently skipped under `redo` (ocrmypdf constraint, same as paperless). |
+| `REARCHIVE_OCR_DESKEW` | `true` | Fix small skew. Ineffective under `redo` - which includes the mixed-provenance `--pages` path (ocrmypdf constraint: redo never re-renders page images; the run logs when it drops deskew). Applies to textless pages under `auto`/`skip` and to all pages under `force`. |
 | `REARCHIVE_OCR_ROTATE_PAGES` | `true` | Fix page orientation. Detection: local Tesseract OSD (no GPU). |
 | `REARCHIVE_OCR_ROTATE_PAGES_THRESHOLD` | `12.0` | Rotation confidence threshold; lower = more aggressive. |
 | `REARCHIVE_OCR_OUTPUT_TYPE` | `pdfa` | Archive flavour (`pdfa`, `pdfa-1/2/3`, `pdf`), like `PAPERLESS_OCR_OUTPUT_TYPE`. |

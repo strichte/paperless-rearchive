@@ -510,3 +510,37 @@ def test_page_action_summary_empty_without_actions() -> None:
 
     assert _page_action_summary(object()) == ""
     assert _page_action_summary(type("R", (), {"page_actions": {}})()) == ""
+
+
+def test_unrenderable_input_raises_clear_error(tmp_path: Path) -> None:
+    """An unforeseen non-renderable original fails with a clear message,
+    not a raw PyMuPDF FileDataError dump."""
+    import pytest as _pytest
+
+    engine = _engine()
+    junk = tmp_path / "expense.xls"
+    junk.write_bytes(b"\xd0\xcf\x11\xe0")
+    with _pytest.raises(RuntimeError, match="not a renderable document"):
+        engine._render_pdf_pages(junk)
+
+
+def test_image_original_flows_through_content_path(tmp_path: Path, monkeypatch) -> None:
+    """Raster-image originals (paperless stores scans as JPG/PNG) are
+    renderable by PyMuPDF as single-page documents and OCR via the legacy
+    content path."""
+    from PIL import Image
+
+    engine = _engine()
+    img_path = tmp_path / "scan.png"
+    Image.new("RGB", (64, 64), color="white").save(img_path)
+
+    monkeypatch.setattr(
+        ChandraOcrEngine,
+        "_ocr_page",
+        lambda self, image, page_num, page_count=0: "ocr-text",
+    )
+
+    result = engine.ocr_document(img_path)
+    assert "ocr-text" in result.markdown
+    assert result.page_count == 1
+    assert result.error_pages == []

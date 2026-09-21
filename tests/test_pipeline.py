@@ -239,3 +239,60 @@ def test_unrepairable_drift_fails_the_document(tmp_path: Path) -> None:
     assert len(finishes) == 1
     assert finishes[0]["success"] is False
     assert "Checksum mismatch" in finishes[0]["note"]
+
+
+def test_non_ocrable_original_is_skipped_with_marker_tag(tmp_path: Path, monkeypatch) -> None:
+    """Regression (doc 5080): an Office-document original (.xls, ...) has no
+    OCR text layer to re-run - the pipeline must resolve the trigger cleanly
+    (success + re-ocr-skipped) instead of crashing 3 cycles into a failure."""
+    settings = _settings(tmp_path)
+
+    class _XlsAPI(_RecordingAPI):
+        def download_original(self, doc_id: int, dest_dir: Path) -> Path:
+            original = Path(dest_dir) / "expense.xls"
+            original.write_bytes(b"\xd0\xcf\x11\xe0")  # OLE2 magic
+            return original
+
+    monkeypatch.setattr(
+        "paperless_rearchive.pipeline.ChandraOcrEngine",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("engine must not run")),
+    )
+    api = _XlsAPI()
+    ctx = DocumentContext(
+        doc_id=5080,
+        trigger_tag_id=11,
+        trigger_tag_name="re-ocr-all",
+        archive_mode=True,
+        current_tags=[11],
+    )
+    process_document(settings, api, None, ctx)
+
+    assert api.patched == []  # content untouched
+    skipped_id = api._tags["re-ocr-skipped"]
+    success_id = api._tags["re-ocr-all-success"]
+    assert api.added_tags[0] == [success_id, skipped_id]
+    assert any("digital-born" in note and "not PDF" in note for note in api.notes)
+
+
+def test_dry_run_keeps_trigger_for_non_ocrable_original(tmp_path: Path) -> None:
+    """Dry-run: log only, no tag changes, no note."""
+    settings = dataclasses.replace(_settings(tmp_path), dry_run=True)
+
+    class _XlsAPI(_RecordingAPI):
+        def download_original(self, doc_id: int, dest_dir: Path) -> Path:
+            original = Path(dest_dir) / "memo.docx"
+            original.write_bytes(b"PK\x03\x04")
+            return original
+
+    api = _XlsAPI()
+    ctx = DocumentContext(
+        doc_id=1,
+        trigger_tag_id=11,
+        trigger_tag_name="re-ocr-all",
+        archive_mode=True,
+        current_tags=[11],
+    )
+    process_document(settings, api, None, ctx)
+
+    assert api.removed_tags == [] and api.added_tags == []
+    assert api.notes == []

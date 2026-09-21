@@ -81,6 +81,43 @@ class DocumentContext:
         return ids
 
 
+#: Suffixes the OCR engine can actually render (PyMuPDF). Everything else
+#: was text-extracted at ingest and has no OCR text layer to re-run.
+_OCRABLE_SUFFIXES = {
+    ".pdf", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp", ".gif",
+}
+
+
+def _skip_not_ocrable(
+    settings: Settings,
+    api: PaperlessAPI,
+    ctx: DocumentContext,
+    original: Path,
+) -> None:
+    """No-op outcome for a non-OCR-able original (Office document etc.).
+
+    Paperless ingests these via Tika/Gotenberg: the content is extracted
+    text, never OCR, so there is no OCR text layer to re-run. Resolve the
+    trigger cleanly (success + ``re-ocr-skipped`` marker) instead of
+    failing 3 cycles and escalating to ``<trigger>-failure``.
+    """
+    note = (
+        f"Re-OCR skipped ({ctx.trigger_tag_name}): original is "
+        f"{original.name!r} ({original.suffix.lower()}) - digital-born, "
+        f"not PDF. Its text was extracted at ingest (Tika/Gotenberg), "
+        f"not OCR - nothing to re-run."
+    )
+    log.info("Document %d: %s", ctx.doc_id, note.replace("\n", " | "))
+    if settings.dry_run:
+        log.info(
+            "DRY-RUN document %d: would skip non-OCR-able original (trigger tag kept).",
+            ctx.doc_id,
+        )
+        return
+    skipped_tag_id = api.ensure_tag("re-ocr-skipped")
+    _finish(api, ctx, success=True, note=note, settings=settings, extra_tags=[skipped_tag_id])
+
+
 def process_document(
     settings: Settings,
     api: PaperlessAPI,
@@ -109,6 +146,15 @@ def process_document(
         log.debug("Document %d: original file size=%d bytes, mime=%s",
                   ctx.doc_id, original.stat().st_size,
                   original.suffix.lower())
+
+        # Only PDFs and raster images carry an OCR text layer to re-run.
+        # Anything else (Office documents, email, ...) was text-extracted at
+        # ingest by paperless (Tika/Gotenberg) - re-OCR does not apply.
+        # Resolve the trigger cleanly instead of crashing (observed on doc
+        # 5080, an .xls original: 3 failed cycles + failure escalation).
+        if original.suffix.lower() not in _OCRABLE_SUFFIXES:
+            _skip_not_ocrable(settings, api, ctx, original)
+            return
 
         # Layer 1 of the OCR strategy: per-page provenance (born-digital vs
         # scanned vs mixed). The verdict routes pages to OCR and, for a
