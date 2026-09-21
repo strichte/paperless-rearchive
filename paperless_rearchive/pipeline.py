@@ -444,8 +444,64 @@ def process_document(
             log.exception("Could not update tags on document %d; keeping trigger.", ctx.doc_id)
             return
 
-    log.info("Document %d re-OCR complete: %d pages, %d succeeded, %d failed",
-             ctx.doc_id, result.page_count, result.success_count, len(result.error_pages))
+    log.info(
+        "Document %d re-OCR complete: %d pages, %d succeeded, %d failed%s",
+        ctx.doc_id,
+        result.page_count,
+        result.success_count,
+        len(result.error_pages),
+        _page_action_summary(result),
+    )
+
+
+def _page_action_summary(result: "object") -> str:
+    """Human-readable per-page breakdown for the final run log.
+
+    Groups pages by the action the engine took, e.g.
+    ``; pages: 1 native (text kept), 2-3 ocr (Chandra re-OCR)`` - so the log
+    states explicitly what was done to which page.
+    """
+    actions: dict[int, str] = getattr(result, "page_actions", {}) or {}
+    if not actions:
+        return ""
+
+    label = {
+        "ocr": "ocr (fresh Chandra layer)",
+        "native": "native (text kept)",
+        "passthrough": "passthrough (untouched)",
+        "skipped": "skipped (page cap)",
+        "error": "error",
+    }
+
+    def _ranges(pages: list[int]) -> str:
+        """1,2,3,7 -> '1-3,7'."""
+        if not pages:
+            return ""
+        runs: list[tuple[int, int]] = []
+        start = prev = pages[0]
+        for p in pages[1:]:
+            if p == prev + 1:
+                prev = p
+            else:
+                runs.append((start, prev))
+                start = prev = p
+        runs.append((start, prev))
+        return ",".join(f"{a}" if a == b else f"{a}-{b}" for a, b in runs)
+
+    order = ["ocr", "native", "passthrough", "error", "skipped"]
+    groups: dict[str, list[int]] = {}
+    for page, action in actions.items():
+        groups.setdefault(action, []).append(page)
+
+    parts = []
+    for action in order:
+        pages = sorted(groups.get(action, []))
+        if pages:
+            parts.append(f"{_ranges(pages)} {label.get(action, action)}")
+    leftover = sorted(set(groups) - set(order))
+    for action in leftover:
+        parts.append(f"{_ranges(sorted(groups[action]))} {action}")
+    return "; pages: " + ", ".join(parts)
 
 
 def _repair_checksum_drift(

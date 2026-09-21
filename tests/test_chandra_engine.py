@@ -291,3 +291,222 @@ def test_upstream_generation_error_is_logged_with_model(monkeypatch, caplog) -> 
         for record in caplog.records
         if record.levelno >= logging.ERROR
     )
+
+
+# ── mixed-provenance ingest pass (document 5830 regression) ──────────────────
+
+
+def _mixed_provenance(page_count: int = 3) -> "object":
+    from paperless_rearchive.ocr.provenance import MIXED, PdfProvenance
+
+    return PdfProvenance(
+        kind=MIXED,
+        page_count=page_count,
+        pages_needing_ocr=frozenset({2, 3}),
+        native_markdown={1: "native-1"},
+        source="pdf_inspector",
+    )
+
+
+def _three_page_pdf(tmp_path: Path) -> Path:
+    import fitz
+
+    doc = fitz.open()
+    for _ in range(3):
+        doc.new_page(width=595, height=842)
+    path = tmp_path / "three.pdf"
+    doc.save(path)
+    doc.close()
+    return path
+
+
+def _ingest_settings() -> "object":
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        ocr_mode="redo",
+        ocr_mixed_mode="skip",
+        ocr_clean="clean",
+        ocr_deskew=True,
+        ocr_rotate=True,
+        ocr_rotate_threshold=12.0,
+        ocr_output_type="pdfa",
+        ocr_user_args=None,
+    )
+
+
+def test_mixed_ingest_pass_ocrs_only_pages_needing_ocr(tmp_path: Path, monkeypatch) -> None:
+    """Regression (doc 5830): a mixed document must not be handed to ocrmypdf
+    with skip_text (which skipped every text-bearing page, OCR no-op). OCR is
+    restricted to the pages the provenance verdict marked, native pages pass
+    through via --pages."""
+    import ocrmypdf
+
+    engine = _engine()
+    captured: dict = {}
+    output_pdf = tmp_path / "out.pdf"
+
+    def fake_ocr(**kwargs):
+        captured.update(kwargs)
+        output_pdf.write_bytes(b"%PDF-fake")
+        return 0
+
+    monkeypatch.setattr(ocrmypdf, "ocr", fake_ocr)
+    monkeypatch.setattr(
+        ChandraOcrEngine, "_stamp_model_provenance", lambda self, pdf: None
+    )
+    monkeypatch.setattr(
+        ChandraOcrEngine,
+        "_pdftotext_page_map",
+        lambda self, pdf: {1: "native-1", 2: "ocr-2", 3: "ocr-3"},
+    )
+
+    result = engine._ocr_document_ingest_pass(
+        _three_page_pdf(tmp_path),
+        output_pdf,
+        _ingest_settings(),
+        provenance=_mixed_provenance(),
+    )
+
+    assert "skip_text" not in captured
+    assert captured["pages"] == "2,3"
+    assert captured.get("redo_ocr") is True
+    assert "sidecar" not in captured
+    assert "native-1" in result.markdown
+    assert "ocr-2" in result.markdown and "ocr-3" in result.markdown
+
+
+def test_mixed_ingest_pass_respects_max_pages_cap(tmp_path: Path, monkeypatch) -> None:
+    """The mixed --pages list is intersected with the REARCHIVE_MAX_PAGES cap."""
+    import ocrmypdf
+
+    engine = ChandraOcrEngine(
+        server_url="http://ai:8110/v1",
+        model_name="m",
+        api_key="k",
+        max_pages=2,
+    )
+    captured: dict = {}
+    output_pdf = tmp_path / "out.pdf"
+
+    def fake_ocr(**kwargs):
+        captured.update(kwargs)
+        output_pdf.write_bytes(b"%PDF-fake")
+        return 0
+
+    monkeypatch.setattr(ocrmypdf, "ocr", fake_ocr)
+    monkeypatch.setattr(
+        ChandraOcrEngine, "_stamp_model_provenance", lambda self, pdf: None
+    )
+    monkeypatch.setattr(
+        ChandraOcrEngine, "_pdftotext_page_map", lambda self, pdf: {1: "n", 2: "o"}
+    )
+
+    engine._ocr_document_ingest_pass(
+        _three_page_pdf(tmp_path),
+        output_pdf,
+        _ingest_settings(),
+        provenance=_mixed_provenance(),
+    )
+
+    assert captured["pages"] == "2"  # page 3 beyond the cap
+
+
+def test_mixed_ingest_pass_warns_when_all_pages_skipped(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    """Guard: a sidecar with a skip placeholder for every page (the silent
+    no-op seen on doc 5830) must log a loud warning."""
+    import ocrmypdf
+
+    engine = _engine()
+    output_pdf = tmp_path / "out.pdf"
+    sidecar = tmp_path / "archive-sidecar.txt"
+    sidecar.write_text(
+        "[OCR skipped on page 1]\n[OCR skipped on page 2]\n[OCR skipped on page 3]\n"
+    )
+
+    def fake_ocr(**kwargs):
+        output_pdf.write_bytes(b"%PDF-fake")
+        sidecar.touch()
+        return 0
+
+    monkeypatch.setattr(ocrmypdf, "ocr", fake_ocr)
+    monkeypatch.setattr(
+        ChandraOcrEngine, "_stamp_model_provenance", lambda self, pdf: None
+    )
+    monkeypatch.setattr(
+        "paperless_rearchive.ocr.ingest_args.sidecar_content",
+        lambda *a, **k: "untouched text",
+    )
+
+    with caplog.at_level(logging.WARNING):
+        engine._ocr_document_ingest_pass(
+            _three_page_pdf(tmp_path),
+            output_pdf,
+            _ingest_settings(),
+            provenance=None,  # not mixed: skip mode + skip-all sidecar
+        )
+
+    assert any("made no changes" in r.getMessage() for r in caplog.records)
+
+
+# ── per-page action reporting (final pipeline log) ───────────────────────────
+
+
+def test_ingest_pass_reports_page_actions(tmp_path: Path, monkeypatch) -> None:
+    """The ingest pass records which pages were OCR'd vs passed through, so
+    the pipeline can log 'what was done to which page'."""
+    import ocrmypdf
+
+    engine = _engine()
+    output_pdf = tmp_path / "out.pdf"
+
+    def fake_ocr(**kwargs):
+        output_pdf.write_bytes(b"%PDF-fake")
+        return 0
+
+    monkeypatch.setattr(ocrmypdf, "ocr", fake_ocr)
+    monkeypatch.setattr(
+        ChandraOcrEngine, "_stamp_model_provenance", lambda self, pdf: None
+    )
+    monkeypatch.setattr(
+        ChandraOcrEngine,
+        "_pdftotext_page_map",
+        lambda self, pdf: {1: "native-1", 2: "ocr-2", 3: "ocr-3"},
+    )
+
+    result = engine._ocr_document_ingest_pass(
+        _three_page_pdf(tmp_path),
+        output_pdf,
+        _ingest_settings(),
+        provenance=_mixed_provenance(),
+    )
+
+    assert result.page_actions == {1: "passthrough", 2: "ocr", 3: "ocr"}
+
+
+def test_page_action_summary_formats_groups() -> None:
+    from paperless_rearchive.pipeline import _page_action_summary
+
+    class _R:
+        page_actions = {
+            1: "passthrough",
+            2: "ocr",
+            3: "ocr",
+            4: "error",
+            5: "skipped",
+        }
+
+    summary = _page_action_summary(_R())
+    assert summary == (
+        "; pages: 2-3 ocr (fresh Chandra layer), "
+        "1 passthrough (untouched), 4 error, 5 skipped (page cap)"
+    )
+
+
+def test_page_action_summary_empty_without_actions() -> None:
+    from paperless_rearchive.pipeline import _page_action_summary
+
+    assert _page_action_summary(object()) == ""
+    assert _page_action_summary(type("R", (), {"page_actions": {}})()) == ""

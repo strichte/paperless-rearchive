@@ -274,7 +274,8 @@ def effective_mode(
         if mode == "redo":
             log.info(
                 "mixed provenance: redo would strip the native pages; "
-                "using %r (REARCHIVE_OCR_MIXED_MODE)", mixed_mode
+                "restricting OCR to the textless pages (REARCHIVE_OCR_MIXED_MODE=%r)",
+                mixed_mode,
             )
             return mixed_mode
         return "skip"
@@ -296,6 +297,7 @@ def build_ocrmypdf_args(
     color_conversion_strategy: str = "RGB",
     jobs: int = 1,
     max_pages: int = 0,
+    pages: str | None = None,
     user_args: dict[str, Any] | None = None,
     chandra_server_url: str = "",
     chandra_model_name: str = "",
@@ -364,7 +366,12 @@ def build_ocrmypdf_args(
         ocrmypdf_args["rotate_pages"] = True
         ocrmypdf_args["rotate_pages_threshold"] = rotate_threshold
 
-    if max_pages is not None and max_pages > 0:
+    if pages:
+        # Explicit page restriction (mixed provenance): OCR only the listed
+        # pages, native pages pass through unmodified. Mutually exclusive
+        # with sidecar, exactly like the max_pages cap.
+        ocrmypdf_args["pages"] = pages
+    elif max_pages is not None and max_pages > 0:
         ocrmypdf_args["pages"] = f"1-{max_pages}"
     else:
         ocrmypdf_args["sidecar"] = sidecar_file

@@ -188,12 +188,19 @@ class OcrResult:
         page_count: int = 0,
         error_pages: list[int] | None = None,
         errors: list[str] | None = None,
+        page_actions: dict[int, str] | None = None,
     ) -> None:
         self.markdown = markdown
         self.pdf_path = pdf_path
         self.page_count = page_count
         self.error_pages = error_pages or []
         self.errors = errors or []
+        #: Per-page outcome, 1-based page -> action: ``ocr`` (sent to the OCR
+        #: engine), ``native`` (kept its original text layer / born-digital
+        #: text), ``passthrough`` (copied through the archive pass untouched),
+        #: ``skipped`` (beyond the page cap), or ``error``. Pages absent from
+        #: the map have no distinct action.
+        self.page_actions: dict[int, str] = page_actions or {}
 
     @property
     def has_errors(self) -> bool:
@@ -466,6 +473,11 @@ class ChandraOcrEngine:
             page_count=total_pages,
             error_pages=error_pages,
             errors=errors,
+            page_actions={
+                **{p: "ocr" for p in range(1, len(images) + 1)},
+                **{p: "error" for p in error_pages if p <= len(images)},
+                **{p: "skipped" for p in skipped_pages},
+            },
         )
 
     def _stamp_model_provenance(self, pdf_path: Path) -> None:
@@ -578,6 +590,35 @@ class ChandraOcrEngine:
             effective_pages = total_pages
 
         resolved_mode = self._resolve_ingest_mode(settings, pdf_path, provenance, force)
+
+        # Mixed provenance: ocrmypdf's skip_text cannot express "OCR only the
+        # textless pages" - it skips *every* page carrying a text layer,
+        # including scans with a stale OCR layer, so the pass becomes a no-op
+        # (observed on document 5830: all 3 pages skipped, no OCR at all).
+        # Instead, restrict OCR to exactly the pages the provenance verdict
+        # marked as needing OCR (--pages); native pages pass through
+        # unmodified. Pages in the range run in redo mode so a stale text
+        # layer is replaced rather than causing PriorOcrFoundError.
+        mixed_pages: str | None = None
+        mixed_needed: list[int] = []
+        if (
+            resolved_mode == "skip"
+            and getattr(provenance, "kind", None) == "mixed"
+        ):
+            cap = self.max_pages
+            mixed_needed = [
+                p
+                for p in sorted(provenance.pages_needing_ocr)
+                if cap <= 0 or p <= cap
+            ]
+            if mixed_needed:
+                mixed_pages = ",".join(str(p) for p in mixed_needed)
+                log.info(
+                    "mixed provenance: OCR limited to page(s) %s (--pages, "
+                    "redo); native pages pass through unmodified",
+                    mixed_pages,
+                )
+
         sidecar = output_pdf_path.parent / "archive-sidecar.txt"
 
         def _build(*, safe_fallback: bool) -> dict[str, Any]:
@@ -586,7 +627,7 @@ class ChandraOcrEngine:
                 output_file=output_pdf_path,
                 sidecar_file=sidecar,
                 language=self.language,
-                mode=resolved_mode,
+                mode="redo" if mixed_pages else resolved_mode,
                 clean=settings.ocr_clean,
                 deskew=settings.ocr_deskew,
                 rotate=settings.ocr_rotate,
@@ -594,6 +635,7 @@ class ChandraOcrEngine:
                 output_type=settings.ocr_output_type,
                 jobs=self.concurrency,
                 max_pages=effective_pages,
+                pages=mixed_pages,
                 user_args=settings.ocr_user_args,
                 chandra_server_url=self.server_url,
                 chandra_model_name=self.model_name,
@@ -610,15 +652,16 @@ class ChandraOcrEngine:
         )
         log.info(
             "Ingest-parity OCR pass: %d page(s), mode=%s (%s), clean=%s, deskew=%s, "
-            "rotate=%s, output_type=%s, jobs=%d",
+            "rotate=%s, output_type=%s, jobs=%d%s",
             total_pages,
-            resolved_mode,
+            "redo" if mixed_pages else resolved_mode,
             flag,
             settings.ocr_clean,
             bool(args.get("deskew")),
             bool(args.get("rotate_pages")),
             args.get("output_type"),
             args.get("jobs"),
+            f", pages={mixed_pages}" if mixed_pages else "",
         )
         log.debug(
             "ocrmypdf args: %s",
@@ -646,7 +689,25 @@ class ChandraOcrEngine:
         # next to the engine + library versions ocrmypdf already recorded.
         self._stamp_model_provenance(output_pdf_path)
 
-        if sidecar.exists():
+        # Per-page action map for the final pipeline log: in a mixed --pages
+        # run the listed pages get fresh Chandra layers and the rest pass
+        # through untouched; otherwise the resolved mode applies per page.
+        if mixed_pages:
+            page_actions: dict[int, str] = {p: "ocr" for p in mixed_needed}
+            for p in range(1, total_pages + 1):
+                page_actions.setdefault(p, "passthrough")
+        elif resolved_mode == "off":
+            page_actions = {p: "passthrough" for p in range(1, total_pages + 1)}
+        else:
+            page_actions = {p: "ocr" for p in range(1, total_pages + 1)}
+
+        if mixed_pages:
+            # Mixed provenance, --pages run: no sidecar (mutually exclusive
+            # with ``pages``). Content = Chandra markdown for OCR'd pages +
+            # pdftotext for native pages - the same per-page composition the
+            # provenance-driven content pass produces.
+            content = self._mixed_content(pdf_path, output_pdf_path, mixed_needed)
+        elif sidecar.exists():
             content = sidecar_content(sidecar, output_pdf_path)
         else:
             # pages cap set: ocrmypdf got ``pages=1-N`` instead of a sidecar
@@ -659,19 +720,39 @@ class ChandraOcrEngine:
             )
             content = post_process_text(extract_pdf_text(output_pdf_path)) or ""
 
+        # Guard against the silent no-op seen on document 5830: ocrmypdf
+        # skipping *every* page (e.g. skip_text over a fully-text-bearing
+        # PDF) would otherwise surface as a successful run.
+        skipped_all = (
+            sidecar.exists()
+            and not mixed_pages
+            and sidecar.read_text(encoding="utf-8", errors="replace").count(
+                "[OCR skipped on page"
+            )
+            >= total_pages
+        )
+        if skipped_all:
+            log.warning(
+                "OCR skipped on all %d page(s); the pass made no changes - "
+                "check the resolved mode vs the document's text layers",
+                total_pages,
+            )
+
         elapsed = time.monotonic() - started
         log.info(
             "Ingest-parity OCR done: %d page(s) in %.1fs (%.1f pages/min), "
-            "content %d chars",
+            "content %d chars%s",
             total_pages,
             elapsed,
             (total_pages / elapsed * 60) if elapsed > 0 else 0.0,
             len(content),
+            f", pages={mixed_pages}" if mixed_pages else "",
         )
         return OcrResult(
             markdown=content,
             pdf_path=output_pdf_path,
             page_count=total_pages,
+            page_actions=page_actions,
         )
 
     def _ocr_document_pages(
@@ -767,12 +848,21 @@ class ChandraOcrEngine:
         finally:
             doc.close()
 
+        # Per-page action map for the final pipeline log.
+        page_actions = {p: "ocr" for p in needed}
+        for p in range(1, total_pages + 1):
+            if p not in needed:
+                page_actions[p] = "native"
+        for p in error_pages:
+            page_actions[p] = "error" if p in needed else "skipped"
+
         return OcrResult(
             markdown="\n\n".join(parts),
             pdf_path=None,
             page_count=len(parts),
             error_pages=error_pages,
             errors=errors,
+            page_actions=page_actions,
         )
 
 
@@ -823,6 +913,70 @@ class ChandraOcrEngine:
         if page_num < 1 or page_num > len(pages):
             return ""
         return post_process_text(pages[page_num - 1]) or ""
+
+    @classmethod
+    def _pdftotext_all_pages(cls, pdf_path: Path) -> str:
+        """Whole-PDF pdftotext text (layout mode), NUL-stripped, unsplit.
+
+        Same extraction as :meth:`_pdftotext_page_text`, but returns the raw
+        form-feed-joined text for callers that need several pages at once.
+        """
+        import subprocess
+
+        try:
+            result = subprocess.run(
+                [
+                    "pdftotext",
+                    "-q",
+                    "-layout",
+                    "-enc",
+                    "UTF-8",
+                    str(pdf_path),
+                    "-",
+                ],
+                capture_output=True,
+                timeout=120,
+            )
+            if result.returncode != 0:
+                return ""
+            full_text = result.stdout.decode("utf-8", errors="replace") or ""
+        except Exception:
+            return ""
+        return full_text.replace("\x00", "")
+
+    def _pdftotext_page_map(self, pdf_path: Path) -> dict[int, str]:
+        """pdftotext text keyed by 1-based page number, post-processed per page."""
+        pages: dict[int, str] = {}
+        full = self._pdftotext_all_pages(pdf_path)
+        if not full:
+            return pages
+        for idx, chunk in enumerate(full.split("\f"), start=1):
+            pages[idx] = post_process_text(chunk) or ""
+        return pages
+
+    def _mixed_content(
+        self,
+        original_pdf: Path,
+        ocr_pdf: Path,
+        ocr_pages: list[int],
+    ) -> str:
+        """Per-page content for a mixed-provenance ``--pages`` run.
+
+        OCR'd pages come from the produced PDF's per-page text (the fresh
+        Chandra layer via pdftotext, split on form feeds); native pages come
+        from the *original* PDF's pdftotext text - the same composition the
+        provenance-driven content pass produces (page order preserved, pages
+        joined with blank lines).
+        """
+        ocr_map = self._pdftotext_page_map(ocr_pdf)
+        orig_map = self._pdftotext_page_map(original_pdf)
+        parts: list[str] = []
+        for page_num in range(1, max(len(ocr_map), len(orig_map)) + 1):
+            if page_num in ocr_pages:
+                parts.append(ocr_map.get(page_num, ""))
+            else:
+                parts.append(orig_map.get(page_num, ""))
+        return "\n\n".join(parts)
 
     def _render_page_image(self, page: Any) -> Any:
         """Render one PyMuPDF page to a PIL Image, or None when blank."""
