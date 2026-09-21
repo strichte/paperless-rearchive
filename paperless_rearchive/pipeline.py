@@ -574,13 +574,41 @@ def _write_provenance(
         return
     ok_pages = result.page_count - len(result.error_pages)
     pages_value = f"{ok_pages}/{result.page_count} ok"
+
+    # "ok" counts pages without errors, but not all of them were OCR'd: for
+    # mixed documents some pages pass through untouched (born-digital or
+    # outside --pages), and a skip/off run OCRs nothing at all. A bare
+    # "3/3 ok" would then overstate what happened - spell the split out.
+    # Errored pages are not counted here; they are listed by number in the
+    # ``errors:`` suffix below.
+    actions = getattr(result, "page_actions", {}) or {}
+    counts: dict[str, int] = {}
+    for action in actions.values():
+        if action == "ocr":
+            key = "ocr"
+        elif action in ("passthrough", "native"):
+            key = "passthrough"
+        elif action == "skipped":
+            key = "skipped"
+        else:  # "error" and anything unknown: covered by the errors suffix
+            continue
+        counts[key] = counts.get(key, 0) + 1
+    detail: list[str] = []
+    if counts.get("ocr"):
+        detail.append(f"{counts['ocr']} ocr")
+    if counts.get("passthrough"):
+        detail.append(f"{counts['passthrough']} passthrough")
+    if counts.get("skipped"):
+        detail.append(f"{counts['skipped']} skipped")
     if len(result.error_pages) > 1 or (
         len(result.error_pages) == 1 and result.error_pages != [0]
     ):
         shown = ",".join(str(n) for n in result.error_pages[:8])
         if len(result.error_pages) > 8:
             shown += "\u2026"
-        pages_value += f" (errors: {shown})"
+        detail.append(f"errors: {shown}")
+    if detail:
+        pages_value += f" ({', '.join(detail)})"
     if result.page_count and ok_pages == 0:
         pages_value = "0 ok - failed scan?"
     note_lines = [
