@@ -63,6 +63,70 @@ _ACTIVE_POLL_INTERVAL_S = 10.0
 _FAILURE_ATTEMPTS: dict[tuple[int, str], int] = {}
 
 
+def _short_error(exc: BaseException, *, _depth: int = 0) -> str:
+    """One-line human summary of a transport/API failure, traceback-free.
+
+    Walks ``__cause__``/``__context__`` to the root (urllib3 wraps the real
+    error 3+ levels deep: MaxRetryError -> NewConnectionError ->
+    ConnectionRefusedError) and renders ``<root>: <detail>``. Query strings
+    are stripped from embedded URLs so API tokens in params never land in
+    the log. Anything unexpected falls back to ``repr``.
+    """
+    if _depth > 10 or exc is None:
+        return repr(exc)
+    cause = getattr(exc, "__cause__", None) or getattr(exc, "__context__", None)
+    if cause is not None and not isinstance(exc, PaperlessError):
+        text = str(cause).strip()
+        if _is_wrapper_only(exc, text):
+            return _short_error(cause, _depth=_depth + 1)
+    return _one_line(exc)
+
+
+def _is_wrapper_only(exc: BaseException, text: str) -> bool:
+    name = type(exc).__name__
+    return bool(text) and (
+        text.startswith(f"{name}(")
+        or text.startswith("Max retries exceeded")
+        or "Failed to establish a new connection" in text
+    )
+
+
+def _one_line(exc: BaseException) -> str:
+    root = exc
+    for _ in range(10):
+        nxt = getattr(root, "__cause__", None) or getattr(root, "__context__", None)
+        if nxt is None or isinstance(root, PaperlessError):
+            break
+        root = nxt
+    raw = str(root).strip().splitlines()[0] if str(root).strip() else ""
+    detail = _strip_url_query(raw)
+    label = type(root).__name__
+    # urllib3's NewConnectionError message already contains its class-ish
+    # prefix ("<NewConnectionError ...>: Failed to establish..."); prefer it
+    # as-is over "NewConnectionError: <NewConnectionError ...>: ...".
+    if label in ("NewConnectionError", "MaxRetryError") and label in detail:
+        return detail
+    if not detail or detail == label:
+        return label
+    return f"{label}: {detail}"
+
+
+def _strip_url_query(text: str) -> str:
+    import re
+    from urllib.parse import urlsplit, urlunsplit
+
+    def _clean(m: re.Match[str]) -> str:
+        try:
+            parts = urlsplit(m.group(0))
+            if parts.query:
+                return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+        except Exception:
+            pass
+        return m.group(0)
+
+    return re.sub(r"https?://[^\s\"']+", _clean, text)
+
+
 @dataclass
 class CycleResult:
     """Outcome of one poll cycle, used to schedule the next one."""
@@ -96,14 +160,28 @@ def cycle(settings: Settings, api: PaperlessAPI, provider_name: str) -> CycleRes
         settings.trigger_tag_content: False,  # archive_mode
         settings.trigger_tag_all: True,
     }
-    tag_ids = {name: api.ensure_tag(name) for name in triggers}
-    # ``REARCHIVE_FORCE_TAG`` is a modifier, not a trigger: it is never
-    # auto-created (a document can only carry it if an operator made it).
-    # Resolved once per cycle; it bypasses the provenance gate for that
-    # document. ``None`` when the tag does not exist or is disabled.
-    force_tag_id = api.tag_id(settings.force_tag) if settings.force_tag else None
-    # Backlog snapshot before this cycle (for progress + tuning advice).
-    backlog_start = {name: len(api.doc_ids_with_tag(tid, limit=100_000)) for name, tid in tag_ids.items()}
+    try:
+        tag_ids = {name: api.ensure_tag(name) for name in triggers}
+        # ``REARCHIVE_FORCE_TAG`` is a modifier, not a trigger: it is never
+        # auto-created (a document can only carry it if an operator made it).
+        # Resolved once per cycle; it bypasses the provenance gate for that
+        # document. ``None`` when the tag does not exist or is disabled.
+        force_tag_id = api.tag_id(settings.force_tag) if settings.force_tag else None
+        # Backlog snapshot before this cycle (for progress + tuning advice).
+        backlog_start = {name: len(api.doc_ids_with_tag(tid, limit=100_000)) for name, tid in tag_ids.items()}
+    except Exception as exc:
+        if _is_connection_error(exc):
+            # paperless down at cycle start (your 23:46 log): one clear line
+            # instead of a 60-line urllib3 traceback, no strikes, full idle
+            # wait before retrying (aborted=True -> poll interval, and the
+            # main loop's no-progress backoff also applies).
+            log.error(
+                "Cannot reach paperless at %s: %s; retrying after the poll interval.",
+                settings.paperless_url,
+                _short_error(exc),
+            )
+            return CycleResult(processed=0, succeeded=0, failed=0, remaining=0, aborted=True)
+        raise
     total_backlog = sum(backlog_start.values())
     # One provider instance per cycle (it is stateless: every attribute is
     # read from the environment). Previously each document called
@@ -207,10 +285,32 @@ def cycle(settings: Settings, api: PaperlessAPI, provider_name: str) -> CycleRes
                     inference_seconds=cycle_inference_s,
                 )
             except PaperlessError as exc:
-                log.exception("API error on document %d; keeping trigger tag.", doc_id)
+                # API-level failure (HTTP 4xx/5xx with a message): one line,
+                # no traceback - the message already says what happened.
+                log.error("API error on document %d: %s; keeping trigger tag.", doc_id, exc)
                 failed += 1
                 _record_failure(settings, api, ctx, exc)
             except Exception as exc:  # noqa: BLE001 - unexpected bug: keep trigger, keep going
+                if _is_connection_error(exc):
+                    # Transport failure mid-cycle (paperless went away after
+                    # the cycle started): one line, no traceback, no strike.
+                    log.error(
+                        "Lost connection to paperless at %s mid-cycle: %s; "
+                        "keeping trigger tags, retrying next cycle.",
+                        settings.paperless_url,
+                        _short_error(exc),
+                    )
+                    return CycleResult(
+                        processed=processed,
+                        succeeded=succeeded,
+                        failed=failed,
+                        remaining=total_backlog,
+                        aborted=True,
+                        ocr_pages=cycle_ocr_pages,
+                        total_tokens=cycle_tokens,
+                        pages_with_tokens=cycle_token_pages,
+                        inference_seconds=cycle_inference_s,
+                    )
                 log.exception("Unexpected error on document %d; keeping trigger tag.", doc_id)
                 failed += 1
                 _record_failure(settings, api, ctx, exc)
