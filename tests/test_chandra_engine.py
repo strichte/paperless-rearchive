@@ -17,6 +17,7 @@ from paperless_chandra.engine.client import ChandraClientError
 from paperless_rearchive.ocr import chandra_engine
 from paperless_rearchive.ocr.chandra_engine import ChandraOcrEngine
 from paperless_rearchive.ocr.model_check import ModelNotServedError
+from paperless_rearchive.ocr.server_check import ServerUnreachableError
 
 
 def _engine(concurrency: int = 1) -> ChandraOcrEngine:
@@ -29,14 +30,15 @@ def _engine(concurrency: int = 1) -> ChandraOcrEngine:
 
 
 @pytest.fixture(autouse=True)
-def _no_model_probe(monkeypatch):
-    """Keep the /models preflight offline for the local-logic tests.
+def _no_preflight_probes(monkeypatch):
+    """Keep the /models preflights offline for the local-logic tests.
 
-    The probe itself is covered by tests/test_model_check.py, and the
-    abort-before-any-page behaviour by
+    The probes themselves are covered by tests/test_model_check.py and
+    tests/test_server_check.py, and the abort-before-any-page behaviour by
     test_model_not_served_aborts_before_any_page below.
     """
     monkeypatch.setattr(chandra_engine, "ensure_model_served", lambda *a, **k: None)
+    monkeypatch.setattr(chandra_engine, "ensure_server_reachable", lambda *a, **k: None)
 
 
 def test_transport_error_aborts_document_sequential(tmp_path: Path, monkeypatch) -> None:
@@ -256,6 +258,140 @@ def test_model_not_served_aborts_before_any_page(tmp_path: Path, monkeypatch) ->
 
     assert rendered == []
     assert generated == []
+
+
+# ── reachability preflight (2026-09-22 outage, doc 3697) ─────────────────────
+
+
+def test_unreachable_server_aborts_before_any_page(tmp_path: Path, monkeypatch) -> None:
+    """An unreachable inference server fails the document up front as a
+    ChandraClientError subclass - before any page is rendered, so the poller
+    aborts the cycle instead of recording a per-document failure."""
+
+    def raise_unreachable(server_url, api_key="", timeout=None):
+        raise ServerUnreachableError(
+            f"The Chandra server at {server_url} is not reachable "
+            "([Errno 111] Connection refused)."
+        )
+
+    monkeypatch.setattr(chandra_engine, "ensure_server_reachable", raise_unreachable)
+    engine = _engine()
+    rendered: list[int] = []
+    monkeypatch.setattr(
+        ChandraOcrEngine,
+        "_render_pdf_pages",
+        lambda self, p: rendered.append(1) or [object()],
+    )
+    generated: list[int] = []
+    monkeypatch.setattr(
+        "paperless_rearchive.ocr.chandra_engine.chandra_client.ocr_image",
+        lambda image, options: generated.append(1),
+    )
+
+    with pytest.raises(ChandraClientError, match="not reachable"):
+        engine.ocr_document(tmp_path / "in.pdf")
+
+    assert rendered == []
+    assert generated == []
+
+
+def _ingest_pass_engine(
+    tmp_path: Path, monkeypatch, ocr_side_effects, expected_error: type[Exception] | None = None
+) -> list[dict]:
+    """Drive _ocr_document_ingest_pass with the given ocrmypdf.ocr behaviour;
+    return the captured ocrmypdf kwargs per call."""
+    import ocrmypdf
+
+    engine = _engine()
+    output_pdf = tmp_path / "out.pdf"
+    calls: list[dict] = []
+
+    def fake_ocr(**kwargs):
+        calls.append(kwargs)
+        side_effect = ocr_side_effects[len(calls) - 1]
+        if isinstance(side_effect, Exception):
+            raise side_effect
+        output_pdf.write_bytes(b"%PDF-fake")
+        return 0
+
+    monkeypatch.setattr(ocrmypdf, "ocr", fake_ocr)
+    monkeypatch.setattr(ChandraOcrEngine, "_stamp_model_provenance", lambda self, pdf: None)
+    monkeypatch.setattr(
+        ChandraOcrEngine,
+        "_pdftotext_page_map",
+        lambda self, pdf: {1: "native-1", 2: "ocr-2", 3: "ocr-3"},
+    )
+    monkeypatch.setattr(
+        "paperless_rearchive.ocr.ingest_args.sidecar_content",
+        lambda *a, **k: "ocr-2 ocr-3",
+    )
+    if expected_error is not None:
+        with pytest.raises(expected_error):
+            engine._ocr_document_ingest_pass(
+                _three_page_pdf(tmp_path),
+                output_pdf,
+                _ingest_settings(),
+                provenance=_mixed_provenance(),
+            )
+    else:
+        engine._ocr_document_ingest_pass(
+            _three_page_pdf(tmp_path),
+            output_pdf,
+            _ingest_settings(),
+            provenance=_mixed_provenance(),
+        )
+    return calls
+
+
+def test_unreachable_server_not_retried_with_safe_fallback(tmp_path: Path, monkeypatch) -> None:
+    """The plugin's check_options probe raises MissingDependencyError when the
+    server is unreachable. The safe fallback only changes ocrmypdf args - it
+    cannot bring a dead server back - so the error must propagate as-is
+    (previously: a second identical pass + a wrapped RuntimeError)."""
+    from ocrmypdf.exceptions import MissingDependencyError
+
+    boom = MissingDependencyError(
+        "The Chandra server at http://ai:8110/v1 is not reachable "
+        "([Errno 111] Connection refused). Check PAPERLESS_CHANDRA_SERVER_URL "
+        "and that the inference server container is running."
+    )
+    calls = _ingest_pass_engine(
+        tmp_path, monkeypatch, [boom], expected_error=MissingDependencyError
+    )
+    assert len(calls) == 1  # no safe-fallback second pass
+
+
+def test_other_ocr_failures_still_get_safe_fallback(tmp_path: Path, monkeypatch) -> None:
+    """Non-outage failures keep the paperless-style safe-fallback retry:
+    first pass fails with a redo-specific error, force_ocr pass succeeds."""
+    from ocrmypdf.exceptions import PriorOcrFoundError
+
+    calls = _ingest_pass_engine(
+        tmp_path,
+        monkeypatch,
+        [PriorOcrFoundError("prior ocr found"), None],
+    )
+    assert len(calls) == 2
+    assert calls[0].get("redo_ocr") is True
+    assert calls[1].get("force_ocr") is True
+
+
+def test_missing_dependency_discriminator_matches_plugin_messages() -> None:
+    """The message regex separates the plugin's two MissingDependencyError
+    causes: unreachable server (skip the fallback) vs rejected API key
+    (configuration error, fallback behaviour unchanged)."""
+    unreachable = (
+        "The Chandra server at http://ai:8000/v1 is not reachable "
+        "([Errno 111] Connection refused). Check PAPERLESS_CHANDRA_SERVER_URL."
+    )
+    bad_key = (
+        "The Chandra server at http://ai:8000/v1 rejected the API key "
+        "(HTTP 401). Check PAPERLESS_CHANDRA_API_KEY."
+    )
+    other = "OCRmyPDF failed: UnknownError: something else"
+    assert chandra_engine._is_missing_dependency(Exception(unreachable)) is True
+    assert chandra_engine._is_missing_dependency(Exception(bad_key)) is False
+    assert chandra_engine._is_missing_dependency(Exception(other)) is False
 
 
 def test_model_preflight_receives_engine_configuration(tmp_path: Path, monkeypatch) -> None:

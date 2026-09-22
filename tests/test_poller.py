@@ -152,6 +152,7 @@ def test_escalation_after_three_consecutive_failures() -> None:
     settings = _settings()
     finishes: list[dict] = []
     with (
+        patch("paperless_rearchive.poller.get_provider", return_value=object()),
         patch(
             "paperless_rearchive.poller.process_document",
             side_effect=PaperlessError("boom"),
@@ -206,6 +207,7 @@ def test_dry_run_escalation_changes_no_tags() -> None:
     settings = _settings(REARCHIVE_DRY_RUN="true")
     finishes: list[dict] = []
     with (
+        patch("paperless_rearchive.poller.get_provider", return_value=object()),
         patch(
             "paperless_rearchive.poller.process_document",
             side_effect=PaperlessError("boom"),
@@ -247,3 +249,30 @@ def test_model_not_served_aborts_cycle_without_failure_strikes() -> None:
     assert calls == [101]  # aborts on the first document, not all five
     assert _FAILURE_ATTEMPTS == {}  # no per-document failure strikes
     assert finishes == []  # nothing escalated
+
+
+# ── server-outage gate (2026-09-22: dead AI server burned strikes) ───────────
+
+
+def test_server_outage_aborts_cycle_before_any_document() -> None:
+    """With the inference server unreachable and a backlog queued, the cycle
+    aborts immediately: no document is attempted, no failure strike recorded
+    and nothing escalated - the outage must not escalate healthy docs."""
+    settings = _settings()
+    calls: list[int] = []
+    with (
+        patch("paperless_rearchive.poller.get_provider", return_value=object()),
+        patch(
+            "paperless_rearchive.poller.process_document",
+            side_effect=lambda *a: calls.append(a[3].doc_id),
+        ),
+        patch("paperless_rearchive.poller.server_check.outage", return_value=True),
+        patch("paperless_rearchive.poller._finish"),
+    ):
+        result = cycle(settings, _FakeAPI(), "chandra")
+
+    assert result.aborted is True
+    assert result.processed == 0
+    assert result.remaining == 5
+    assert calls == []  # no document attempted
+    assert _FAILURE_ATTEMPTS == {}  # no escalation strikes burned

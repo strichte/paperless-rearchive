@@ -22,6 +22,14 @@
   typo fails the document before any page (and any retry) is attempted.
 
 ### Fixed
+- An unreachable Chandra server no longer burns escalation strikes on healthy
+  documents (2026-09-22 outage, doc 3697): the poller now probes the server
+  once per cycle and aborts before attempting any document when it cannot be
+  reached (no per-document failure recorded, nothing escalated, next cycle
+  after the full poll interval - same semantics as the model-name preflight).
+  A document-level preflight covers mid-cycle outages and dry runs, and the
+  archive pass no longer retries an unreachable server with the pointless
+  safe-fallback ocrmypdf pass (which produced the doubled traceback).
 - `re-ocr-all` could mangle born-digital PDFs: the default `redo` mode
   stripped their native text layer and replaced it with Chandra output.
 - `_finish()` logged `extra_tags` but never added them to the document.

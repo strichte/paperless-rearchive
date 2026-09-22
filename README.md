@@ -118,7 +118,10 @@ Steps:
   (could not classify, processed anyway), `re-ocr-page-errors` (content mode, some pages failed).
 - Transient errors (server down, network hiccup) keep the trigger tag — documents self-heal next
   cycle. After **3 consecutive failures** a doc is escalated to `<trigger>-failure` with an audit
-  note.
+  note. An inference-server **outage is not counted**: with documents queued, the sidecar probes
+  the server once per cycle and aborts immediately when it cannot be reached — no document is
+  attempted, no failure is recorded, nothing escalates — and the next cycle waits the full poll
+  interval, so an outage neither hammers the network nor mis-tags healthy documents.
 
 ## Safety
 

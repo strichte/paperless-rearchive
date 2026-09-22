@@ -41,6 +41,7 @@ from paperless_chandra.engine.hocr import sidecar_text
 
 from paperless_rearchive.ocr.ingest_args import post_process_text
 from paperless_rearchive.ocr.model_check import cached_models_for, ensure_model_served
+from paperless_rearchive.ocr.server_check import ensure_server_reachable
 
 log = logging.getLogger(__name__)
 
@@ -77,6 +78,25 @@ _RETRY_PRINT_RE = re.compile(
 _VLLM_ERROR_PRINT_RE = re.compile(r"Error during VLLM generation: (?P<detail>.*)", re.DOTALL)
 _interceptor_installed = False
 _policy_logged = False
+
+# The ocrmypdf plugin's preflight (paperless_chandra.ocrmypdf_plugin::
+# _probe_server) raises MissingDependencyError for exactly two conditions:
+# an unreachable server (URLError underneath) and a rejected API key.
+# A rejected key is a configuration error (the safe-fallback retry with
+# different ocrmypdf args cannot help either, but it is not an outage);
+# only the unreachable-server variant is matched here.
+_MISSING_DEPENDENCY_RE = re.compile(r"Chandra server at (?P<url>\S+) is not reachable \(")
+
+
+def _is_missing_dependency(exc: BaseException) -> bool:
+    """True when the ocrmypdf plugin probe failed on an unreachable server.
+
+    The plugin raises :class:`ocrmypdf.exceptions.MissingDependencyError`
+    (an ``OcrmypdfError``, deliberately *not* a ``ChandraClientError``) from
+    its ``check_options`` hook before any page runs, so the message is the
+    only stable discriminator.
+    """
+    return _MISSING_DEPENDENCY_RE.search(str(exc)) is not None
 
 
 def _upstream_max_retries() -> int:
@@ -345,6 +365,13 @@ class ChandraOcrEngine:
         # error surfaces - and without naming the offending model. Cached once
         # per (url, model) per process, so this is one probe, not one per page.
         ensure_model_served(self.server_url, self.model_name, self.api_key)
+
+        # Fail fast when the inference server cannot be reached at all. The
+        # plugin's own check_options probe reports the outage one ocrmypdf
+        # validation step later; this preflight makes the failure a
+        # ChandraClientError subclass the poller aborts on without recording
+        # per-document failures - the outage equivalent of the model preflight.
+        ensure_server_reachable(self.server_url, self.api_key)
 
         if produce_pdf and settings is not None:
             return self._ocr_document_ingest_pass(
@@ -670,6 +697,12 @@ class ChandraOcrEngine:
         try:
             ocrmypdf.ocr(**args)
         except Exception as exc:  # noqa: BLE001 - mirror paperless's safe fallback
+            # The safe fallback changes OCRmyPDF *arguments* (force_ocr,
+            # clean/deskew). An unreachable inference server fails both passes
+            # identically - retrying only duplicates the same
+            # ConnectionRefusedError (observed 2026-09-22, doc 3697).
+            if _is_missing_dependency(exc):
+                raise
             log.warning(
                 "OCR failed (%s: %s); retrying with safe fallback (force_ocr, "
                 "clean/deskew per settings)",

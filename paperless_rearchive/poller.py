@@ -11,6 +11,13 @@ server never turns into a tight retry loop.
 Documents that fail ``_MAX_CONSECUTIVE_FAILURES`` times in a row are
 escalated: the trigger tag is swapped for ``<trigger>-failure`` plus an audit
 note, so permanently broken documents do not retry forever.
+
+Deployment-wide gates are exempt from escalation (they are not document
+faults, so no strike is recorded and the cycle stops at the first
+document): a model the server does not serve, and - probed once per cycle
+before any document is attempted - an inference server that cannot be
+reached at all. A cycle aborted by a gate waits the full idle interval,
+so an outage never turns into a rapid attempt loop either.
 """
 
 from __future__ import annotations
@@ -25,8 +32,10 @@ from dataclasses import dataclass
 from paperless_rearchive import __version__
 from paperless_rearchive.config import Settings
 from paperless_rearchive.logging_setup import configure_logging
+from paperless_rearchive.ocr import server_check
 from paperless_rearchive.ocr.base import get_provider
 from paperless_rearchive.ocr.model_check import ModelNotServedError
+from paperless_rearchive.ocr.server_check import ServerUnreachableError
 from paperless_rearchive.paperless_api import PaperlessAPI, PaperlessError
 from paperless_rearchive.pipeline import (
     DocumentContext,
@@ -88,6 +97,38 @@ def cycle(settings: Settings, api: PaperlessAPI, provider_name: str) -> CycleRes
     # Backlog snapshot before this cycle (for progress + tuning advice).
     backlog_start = {name: len(api.doc_ids_with_tag(tid, limit=100_000)) for name, tid in tag_ids.items()}
     total_backlog = sum(backlog_start.values())
+    # One provider instance per cycle (it is stateless: every attribute is
+    # read from the environment). Previously each document called
+    # get_provider() itself, re-validating and re-logging the same config.
+    provider = get_provider(provider_name)
+    # Deployment-wide reachability gate: with the inference server down,
+    # every document in the batch would fail identically - one transport
+    # round-trip now instead of one wasted download + OCR attempt (and one
+    # escalation strike) per document. Skipped when nothing is queued: an
+    # idle poller must not keep the server from starting in peace, and
+    # skipped for dry runs (the per-document preflight inside the no-write
+    # run already exercises the same probe). Read defensively: an
+    # alternative provider plugin may not expose the attributes, and an
+    # empty URL is "no probe", not an outage.
+    if settings.dry_run:
+        pass  # probe runs per document as part of the (no-write) run
+    elif total_backlog and server_check.outage(
+        getattr(provider, "server_url", "") or "",
+        getattr(provider, "api_key", "") or "",
+    ):
+        log.error(
+            "Aborting poll cycle: the OCR server at %s is not reachable. No "
+            "document was modified and no failure was recorded; the cycle "
+            "will be retried after the full poll interval.",
+            getattr(provider, "server_url", ""),
+        )
+        return CycleResult(
+            processed=0,
+            succeeded=0,
+            failed=0,
+            remaining=total_backlog,
+            aborted=True,
+        )
     processed = 0
     succeeded = 0
     failed = 0
@@ -120,18 +161,19 @@ def cycle(settings: Settings, api: PaperlessAPI, provider_name: str) -> CycleRes
                     settings.force_tag,
                 )
             try:
-                process_document(settings, api, get_provider(provider_name), ctx)
+                process_document(settings, api, provider, ctx)
                 succeeded += 1
                 _FAILURE_ATTEMPTS.pop((doc_id, name), None)
-            except ModelNotServedError as exc:
-                # Deployment-wide misconfiguration, not a document fault: every
-                # tagged document would fail identically, so stop the cycle
-                # instead of spending one attempt - and one escalation strike -
-                # per document. Nothing was modified and no failure is counted.
+            except (ModelNotServedError, ServerUnreachableError) as exc:
+                # Deployment-wide (misconfiguration or outage), not a document
+                # fault: every tagged document would fail identically, so stop
+                # the cycle instead of spending one attempt - and one escalation
+                # strike - per document. Nothing was modified and no failure is
+                # counted.
                 log.error(
                     "Aborting poll cycle: %s No document was modified and no "
-                    "failure was recorded; fix PAPERLESS_CHANDRA_MODEL_NAME "
-                    "(and restart) and the poller will resume.",
+                    "failure was recorded; resolve the issue and the poller "
+                    "will resume on the next cycle.",
                     exc,
                 )
                 return CycleResult(
@@ -288,8 +330,8 @@ def _log_cycle_summary(
 def _next_wait(settings: Settings, result: CycleResult, no_progress_streak: int) -> float:
     """Wait before the next cycle, from the just-finished cycle's outcome.
 
-    * aborted (a gate no retry can clear, e.g. model not served) -> full
-      ``REARCHIVE_POLL_INTERVAL``
+    * aborted (a gate no retry can clear: model not served, server
+      unreachable) -> full ``REARCHIVE_POLL_INTERVAL``
     * idle (nothing attempted, nothing tagged) -> full ``REARCHIVE_POLL_INTERVAL``
     * progress or known backlog -> the fixed active interval (drain mode)
     * attempts but no successes -> exponential backoff from the active

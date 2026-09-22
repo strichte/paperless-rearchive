@@ -1,8 +1,8 @@
 # Test Suite — paperless-rearchive
 
 Inventory of the pytest suite (unit + component tests) and the manual
-integration harness. Generated from `pytest --collect-only`; 181 tests in
-13 files, all passing as of this writing.
+integration harness. Generated from `pytest --collect-only`; 201 tests in
+14 files, all passing as of this writing.
 
 ## Running
 
@@ -23,23 +23,24 @@ pytest (see [Integration tooling](#integration-tooling)).
 
 | File | Tests | Covers |
 | --- | --- | --- |
-| `test_chandra_engine.py` | 17 | OCR engine: error semantics, provenance-driven paths, mixed `--pages` pass, per-page action reporting |
+| `test_chandra_engine.py` | 23 | OCR engine: error semantics, provenance-driven paths, mixed `--pages` pass, per-page action reporting, reachability preflight |
 | `test_config.py` | 17 | Settings: dirs, backup-dir validation, provenance knobs |
 | `test_ingest_args.py` | 33 | Ingest-parity ocrmypdf args + text helpers (paperless parity layer) |
 | `test_model_check.py` | 11 | `/models` preflight (fail fast on unserved model) |
 | `test_paperless_api.py` | 16 | REST client: tags, custom fields, notes, pagination |
 | `test_pipeline.py` | 5 | End-to-end document processing flow (mocked engine/API) |
-| `test_poller.py` | 12 | Poll cycle timing, signals, backoff, failure escalation |
+| `test_poller.py` | 13 | Poll cycle timing, signals, backoff, failure escalation, outage gate |
 | `test_provenance.py` | 8 | Per-page born-digital/scanned/mixed classification |
 | `test_replacer.py` | 9 | Archive file replacement + backup handling |
 | `test_restore.py` | 16 | `restore.py`: backup matching, restore, content restore |
 | `test_runner.py` | 30 | Legacy runner: args, MIME sniffing, Content-Disposition, strategy |
 | `test_secrets.py` | 5 | `_FILE`-suffixed secret env vars |
+| `test_server_check.py` | 11 | `/models` reachability probe (fail fast on server outage) |
 | `test_version.py` | 2 | Version single-sourcing |
 
 ---
 
-## test_chandra_engine.py — OCR engine (17)
+## test_chandra_engine.py — OCR engine (23)
 
 Error semantics: transport/server errors (`ChandraClientError`) abort the
 whole document so the poller keeps the trigger tag and retries; genuine
@@ -56,6 +57,13 @@ per-page failures become page errors with a partial result.
 - `test_model_not_served_aborts_before_any_page` — `/models` probe failure aborts before any page is sent.
 - `test_model_preflight_receives_engine_configuration` — probe gets the engine's URL/model/key.
 - `test_upstream_generation_error_is_logged_with_model` — upstream bare "Error during VLLM generation" is re-logged with the model name.
+
+### Reachability preflight (2026-09-22 outage, doc 3697)
+
+- `test_unreachable_server_aborts_before_any_page` — unreachable server raises `ServerUnreachableError` (a `ChandraClientError`) before any page render; the poller aborts the cycle without recording failures.
+- `test_unreachable_server_not_retried_with_safe_fallback` — the plugin's `MissingDependencyError` (unreachable) propagates as-is; no second, equally doomed ocrmypdf pass (no more doubled traceback).
+- `test_other_ocr_failures_still_get_safe_fallback` — non-outage failures keep the paperless-style force_ocr fallback (first pass `redo_ocr`, retry `force_ocr`).
+- `test_missing_dependency_discriminator_matches_plugin_messages` — the message regex separates the plugin's unreachable-server error (skip fallback) from its rejected-API-key error (config, fallback unchanged).
 
 ### Mixed-provenance ingest pass (document 5830 regression)
 
@@ -198,7 +206,7 @@ a 404 once per page).
 
 ---
 
-## test_poller.py — poller loop (12)
+## test_poller.py — poller loop (13)
 
 - `test_signal_during_cycle_forces_immediate_cycle` / `test_signal_during_wait_returns_promptly` — SIGHUP semantics.
 - `test_quiet_cycle_waits_full_interval` / `test_next_wait_idle_uses_full_interval` — idle → full poll interval.
@@ -209,6 +217,20 @@ a 404 once per page).
 - `test_success_resets_failure_counter` — success clears strikes.
 - `test_dry_run_escalation_changes_no_tags` — dry-run writes nothing.
 - `test_model_not_served_aborts_cycle_without_failure_strikes` — preflight abort is not a document failure.
+- `test_server_outage_aborts_cycle_before_any_document` — unreachable server + queued backlog → cycle aborts before the first document: no attempts, no strikes, nothing escalated.
+
+---
+
+## test_server_check.py — reachability preflight (11)
+
+- `test_outage_true_when_connection_refused` — URLError/ConnectionRefused → outage.
+- `test_outage_true_on_timeout` — timeout → outage.
+- `test_http_answer_is_not_an_outage` — any HTTP status (401/403/404/500) proves the server is up; not an outage.
+- `test_outage_false_for_unusable_url` — empty URL is a config error, not an outage (no network call).
+- `test_server_url_normalised_like_the_model_probe` — `http://ai:8000` → probe hits `http://ai:8000/v1/models`.
+- `test_ensure_server_reachable_raises_chandra_client_error` — outage raises `ServerUnreachableError` (ChandraClientError subclass) with an actionable message.
+- `test_ensure_server_reachable_quiet_when_up` — server answering → no exception.
+- `test_ensure_server_reachable_skips_unusable_url` — empty URL → no exception, no probe.
 
 ---
 
