@@ -16,8 +16,10 @@ but PDF/A assembly only happens for re-ocr-all to avoid wasting CPU.
 from __future__ import annotations
 
 import builtins
+import contextlib
 import logging
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -44,6 +46,64 @@ from paperless_rearchive.ocr.model_check import cached_models_for, ensure_model_
 from paperless_rearchive.ocr.server_check import ensure_server_reachable
 
 log = logging.getLogger(__name__)
+
+# Token capture: the upstream client returns only the raw string, dropping the
+# per-page ``GenerationResult.token_count`` (completion tokens). Wrapping
+# ``generate_vllm`` at the ``paperless_chandra.engine.client`` reference lets
+# this engine recover the count without forking the client: every result list
+# produced inside a page window contributes its token sum to that page. The
+# stack is thread-local, so concurrent pages (each on its own worker thread,
+# retries included) accumulate independently; FIFO/LIFO popping is avoided
+# entirely - each thread only ever touches its own window.
+_TOKEN_WINDOW = threading.local()
+
+
+def _token_stack() -> list[list[int]]:
+    stack = getattr(_TOKEN_WINDOW, "stack", None)
+    if stack is None:
+        stack = []
+        _TOKEN_WINDOW.stack = stack
+    return stack
+
+
+_wrapped_generate_vllm = False
+
+
+def _install_token_tap() -> None:
+    """Wrap upstream generate_vllm once so token counts reach page windows.
+
+    Patches the ``generate_vllm`` reference held by
+    ``paperless_chandra.engine.client`` (bound at its import time, so patching
+    ``chandra.model.vllm`` alone would miss). Idempotent; the wrapper delegates
+    fully and only records ``sum(r.token_count)`` into the current thread's
+    innermost window, if any.
+    """
+
+    global _wrapped_generate_vllm
+    if _wrapped_generate_vllm:
+        return
+    try:
+        original = chandra_client.generate_vllm
+    except AttributeError:
+        return
+
+    def _recording(*args: Any, **kwargs: Any) -> Any:
+        results = original(*args, **kwargs)
+        try:
+            total = sum(int(getattr(r, "token_count", 0) or 0) for r in results or [])
+        except Exception:
+            total = 0
+        stack = getattr(_TOKEN_WINDOW, "stack", None)
+        if stack and stack[-1] is not None:
+            with contextlib.suppress(IndexError):
+                stack[-1].append(total)
+        return results
+
+    try:
+        chandra_client.generate_vllm = _recording  # type: ignore[attr-defined]
+    except Exception:
+        return
+    _wrapped_generate_vllm = True
 
 # The ocrmypdf plugin that replaces ocrmypdf's default Tesseract engine with
 # Chandra. Passing this (plus the chandra_* kwargs it registers via its
@@ -190,6 +250,15 @@ def _final_output_has_repeat(raw: str) -> bool:
         return False
 
 
+class PageStat:
+    """Per-page OCR timing + token usage for one page sent to Chandra."""
+
+    def __init__(self, page_num: int, seconds: float, tokens: int | None = None) -> None:
+        self.page_num = page_num
+        self.seconds = seconds
+        self.tokens = tokens
+
+
 class OcrResult:
     """Result of OCR processing a document.
 
@@ -199,6 +268,12 @@ class OcrResult:
         page_count: Total number of pages processed.
         error_pages: List of page numbers (1-based) that failed OCR.
         errors: List of error messages for failed pages.
+        page_stats: Per-page inference stats (one entry per page actually
+            sent to Chandra; native/passthrough/skipped pages have none).
+        inference_seconds: Sum of per-page Chandra call time (pure
+            inference + HTTP wait + upstream retries, no render/assembly).
+        elapsed_seconds: Wall time of the whole engine call (render +
+            inference + optional ocrmypdf assembly).
     """
 
     def __init__(
@@ -209,6 +284,9 @@ class OcrResult:
         error_pages: list[int] | None = None,
         errors: list[str] | None = None,
         page_actions: dict[int, str] | None = None,
+        page_stats: list[PageStat] | None = None,
+        inference_seconds: float = 0.0,
+        elapsed_seconds: float = 0.0,
     ) -> None:
         self.markdown = markdown
         self.pdf_path = pdf_path
@@ -221,6 +299,24 @@ class OcrResult:
         #: ``skipped`` (beyond the page cap), or ``error``. Pages absent from
         #: the map have no distinct action.
         self.page_actions: dict[int, str] = page_actions or {}
+        #: One PageStat per page actually sent to Chandra (error pages with an
+        #: empty upstream result included when the call itself completed).
+        self.page_stats: list[PageStat] = list(page_stats or [])
+        #: Sum of page_stats seconds (concurrency>1 overlaps, so this may
+        #: exceed wall time).
+        self.inference_seconds: float = inference_seconds
+        #: Whole engine-call wall time (render + inference + assembly).
+        self.elapsed_seconds: float = elapsed_seconds
+
+    @property
+    def total_tokens(self) -> int:
+        """Sum of completion tokens over pages that reported a count."""
+        return sum(s.tokens for s in self.page_stats if s.tokens is not None)
+
+    @property
+    def has_token_counts(self) -> bool:
+        """True when at least one OCR'd page reported a token count."""
+        return any(s.tokens is not None for s in self.page_stats)
 
     @property
     def has_errors(self) -> bool:
@@ -301,6 +397,7 @@ class ChandraOcrEngine:
             )
         self._max_retries = _upstream_max_retries()
         _install_retry_log_interceptor()
+        _install_token_tap()
         global _policy_logged
         if not _policy_logged:
             log.info(
@@ -416,10 +513,23 @@ class ChandraOcrEngine:
         all_markdown_parts: list[str] = [""] * len(images)
         error_pages: list[int] = []
         errors: list[str] = []
+        # One stats bucket per page sent to Chandra. Concurrency>1 overlaps,
+        # so a shared counter would race - index by page under a lock.
+        stats: dict[int, PageStat] = {}
+        stats_lock = threading.Lock()
         doc_started = time.monotonic()
 
         def _run(page_num: int, image: Any) -> str:
-            return self._ocr_page(image, page_num, len(images))
+            started = time.monotonic()
+            _token_stack().append([])
+            try:
+                return self._ocr_page(image, page_num, len(images))
+            finally:
+                elapsed_s = time.monotonic() - started
+                bucket = _token_stack().pop()
+                tokens = sum(bucket) if bucket else None
+                with stats_lock:
+                    stats[page_num] = PageStat(page_num, elapsed_s, tokens)
 
         indexed = list(enumerate(images, start=1))
         if self.concurrency > 1 and len(indexed) > 1:
@@ -447,7 +557,7 @@ class ChandraOcrEngine:
             results = []
             for n, img in indexed:
                 try:
-                    results.append(self._ocr_page(img, n, len(indexed)))
+                    results.append(_run(n, img))
                 except ChandraClientError:
                     # See the concurrent branch above: transient server
                     # failures abort the document instead of becoming
@@ -465,6 +575,18 @@ class ChandraOcrEngine:
 
         elapsed = time.monotonic() - doc_started
         ok = len(images) - len(error_pages)
+        page_stats = [stats[n] for n in sorted(stats)]
+        inference_s = sum(s.seconds for s in page_stats)
+        total_tokens = sum(s.tokens for s in page_stats if s.tokens is not None)
+        known_tokens = sum(1 for s in page_stats if s.tokens is not None)
+        for s in page_stats:
+            log.debug(
+                "Page %d/%d: %.1fs inference, %s tokens",
+                s.page_num,
+                len(images),
+                s.seconds,
+                f"{s.tokens}" if s.tokens is not None else "n/a",
+            )
         log.info(
             "Unified Chandra OCR done: %d/%d pages in %.1fs (%.1f pages/min)%s",
             ok,
@@ -472,6 +594,17 @@ class ChandraOcrEngine:
             elapsed,
             (len(images) / elapsed * 60) if elapsed > 0 else 0.0,
             f" ({len(error_pages)} error(s))" if error_pages else "",
+        )
+        log.info(
+            "OCR stats: %d token(s)%s over %d OCR'd page(s), "
+            "%.1fs inference (%.1fs/page), %.1fs total (%.1fs overhead)",
+            total_tokens,
+            "" if known_tokens == len(page_stats) else f" ({known_tokens}/{len(page_stats)} pages reported)",
+            len(page_stats),
+            inference_s,
+            (inference_s / len(page_stats)) if page_stats else 0.0,
+            elapsed,
+            max(elapsed - inference_s, 0.0),
         )
 
         # Combine all page markdown
@@ -500,6 +633,9 @@ class ChandraOcrEngine:
             page_count=total_pages,
             error_pages=error_pages,
             errors=errors,
+            page_stats=page_stats,
+            inference_seconds=inference_s,
+            elapsed_seconds=elapsed,
             page_actions={
                 **{p: "ocr" for p in range(1, len(images) + 1)},
                 **{p: "error" for p in error_pages if p <= len(images)},
@@ -781,11 +917,22 @@ class ChandraOcrEngine:
             len(content),
             f", pages={mixed_pages}" if mixed_pages else "",
         )
+        # The ocrmypdf pass runs Chandra inside worker processes (jobs>1),
+        # so per-page token counts are not visible here: report n/a rather
+        # than a misleading zero.
+        log.info(
+            "OCR stats: n/a token(s) over %d OCR'd page(s), "
+            "%.1fs inference (n/a/page), %.1fs total",
+            sum(1 for a in page_actions.values() if a == "ocr"),
+            elapsed,
+        )
         return OcrResult(
             markdown=content,
             pdf_path=output_pdf_path,
             page_count=total_pages,
             page_actions=page_actions,
+            inference_seconds=0.0,
+            elapsed_seconds=elapsed,
         )
 
     def _ocr_document_pages(
@@ -809,6 +956,8 @@ class ChandraOcrEngine:
         parts: list[str] = [""] * len(doc)
         error_pages: list[int] = []
         errors: list[str] = []
+        page_stats: list[PageStat] = []
+        pages_started = time.monotonic()
         try:
             total_pages = len(doc)
             cap = self.max_pages
@@ -851,6 +1000,8 @@ class ChandraOcrEngine:
                 if image is None:
                     log.debug("Page %d: blank, nothing to OCR", page_num)
                     continue
+                page_started = time.monotonic()
+                _token_stack().append([])
                 try:
                     markdown = self._ocr_page(image, page_num, total_pages)
                 except ChandraClientError:
@@ -859,6 +1010,15 @@ class ChandraOcrEngine:
                 except Exception as e:  # noqa: BLE001 - page-level failure
                     log.warning("OCR failed on page %d: %s", page_num, e)
                     markdown = ""
+                finally:
+                    bucket = _token_stack().pop()
+                    page_stats.append(
+                        PageStat(
+                            page_num,
+                            time.monotonic() - page_started,
+                            sum(bucket) if bucket else None,
+                        )
+                    )
                 if (markdown or "").strip():
                     parts[page_num - 1] = markdown
                 else:
@@ -878,6 +1038,29 @@ class ChandraOcrEngine:
                 native_count,
                 len(error_pages),
             )
+            pages_elapsed = time.monotonic() - pages_started
+            inference_s = sum(s.seconds for s in page_stats)
+            total_tokens = sum(s.tokens for s in page_stats if s.tokens is not None)
+            known = sum(1 for s in page_stats if s.tokens is not None)
+            for s in sorted(page_stats, key=lambda s: s.page_num):
+                log.debug(
+                    "Page %d/%d: %.1fs inference, %s tokens",
+                    s.page_num,
+                    total_pages,
+                    s.seconds,
+                    f"{s.tokens}" if s.tokens is not None else "n/a",
+                )
+            log.info(
+                "OCR stats: %d token(s)%s over %d OCR'd page(s), "
+                "%.1fs inference (%.1fs/page), %.1fs total (%.1fs overhead)",
+                total_tokens,
+                "" if known == len(page_stats) else f" ({known}/{len(page_stats)} pages reported)",
+                len(page_stats),
+                inference_s,
+                (inference_s / len(page_stats)) if page_stats else 0.0,
+                pages_elapsed,
+                max(pages_elapsed - inference_s, 0.0),
+            )
         finally:
             doc.close()
 
@@ -896,6 +1079,9 @@ class ChandraOcrEngine:
             error_pages=error_pages,
             errors=errors,
             page_actions=page_actions,
+            page_stats=sorted(page_stats, key=lambda s: s.page_num),
+            inference_seconds=inference_s,
+            elapsed_seconds=pages_elapsed,
         )
 
 

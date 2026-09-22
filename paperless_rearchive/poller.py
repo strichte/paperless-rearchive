@@ -76,6 +76,14 @@ class CycleResult:
     #: (today: the configured Chandra model is not served). The next cycle
     #: then waits the full idle interval instead of the active drain one.
     aborted: bool = False
+    #: OCR'd pages (sent to Chandra) across succeeded documents this cycle.
+    ocr_pages: int = 0
+    #: Sum of completion tokens over pages that reported a count.
+    total_tokens: int = 0
+    #: Pages that reported a token count (subset of ocr_pages).
+    pages_with_tokens: int = 0
+    #: Sum of per-page Chandra call time across succeeded documents.
+    inference_seconds: float = 0.0
 
 
 def _on_signal(signum: int, _frame: object) -> None:
@@ -132,6 +140,10 @@ def cycle(settings: Settings, api: PaperlessAPI, provider_name: str) -> CycleRes
     processed = 0
     succeeded = 0
     failed = 0
+    cycle_ocr_pages = 0
+    cycle_tokens = 0
+    cycle_token_pages = 0
+    cycle_inference_s = 0.0
     cycle_started = time.monotonic()
 
     for name, archive_mode in triggers.items():
@@ -161,8 +173,15 @@ def cycle(settings: Settings, api: PaperlessAPI, provider_name: str) -> CycleRes
                     settings.force_tag,
                 )
             try:
-                process_document(settings, api, provider, ctx)
+                doc_stats = process_document(settings, api, provider, ctx)
                 succeeded += 1
+                # Mocked process_document in tests returns None; treat as
+                # empty stats rather than crashing the cycle.
+                if doc_stats is not None:
+                    cycle_ocr_pages += doc_stats.ocr_pages
+                    cycle_tokens += doc_stats.total_tokens
+                    cycle_token_pages += doc_stats.pages_with_tokens
+                    cycle_inference_s += doc_stats.inference_seconds
                 _FAILURE_ATTEMPTS.pop((doc_id, name), None)
             except (ModelNotServedError, ServerUnreachableError) as exc:
                 # Deployment-wide (misconfiguration or outage), not a document
@@ -182,6 +201,10 @@ def cycle(settings: Settings, api: PaperlessAPI, provider_name: str) -> CycleRes
                     failed=failed,
                     remaining=total_backlog,
                     aborted=True,
+                    ocr_pages=cycle_ocr_pages,
+                    total_tokens=cycle_tokens,
+                    pages_with_tokens=cycle_token_pages,
+                    inference_seconds=cycle_inference_s,
                 )
             except PaperlessError as exc:
                 log.exception("API error on document %d; keeping trigger tag.", doc_id)
@@ -202,7 +225,17 @@ def cycle(settings: Settings, api: PaperlessAPI, provider_name: str) -> CycleRes
         remaining_start = {name: len(api.doc_ids_with_tag(tid, limit=100_000)) for name, tid in tag_ids.items()}
         remaining = sum(remaining_start.values())
         _log_cycle_summary(
-            settings, processed, succeeded, failed, elapsed, total_backlog, remaining
+            settings,
+            processed,
+            succeeded,
+            failed,
+            elapsed,
+            total_backlog,
+            remaining,
+            ocr_pages=cycle_ocr_pages,
+            total_tokens=cycle_tokens,
+            pages_with_tokens=cycle_token_pages,
+            inference_seconds=cycle_inference_s,
         )
     else:
         # Nothing attempted: either the queue is empty or everything in it
@@ -210,7 +243,14 @@ def cycle(settings: Settings, api: PaperlessAPI, provider_name: str) -> CycleRes
         # the tagged documents are what remains.
         remaining = total_backlog
     return CycleResult(
-        processed=processed, succeeded=succeeded, failed=failed, remaining=remaining
+        processed=processed,
+        succeeded=succeeded,
+        failed=failed,
+        remaining=remaining,
+        ocr_pages=cycle_ocr_pages,
+        total_tokens=cycle_tokens,
+        pages_with_tokens=cycle_token_pages,
+        inference_seconds=cycle_inference_s,
     )
 
 
@@ -267,6 +307,11 @@ def _log_cycle_summary(
     elapsed: float,
     total_backlog: int,
     remaining: int,
+    *,
+    ocr_pages: int = 0,
+    total_tokens: int = 0,
+    pages_with_tokens: int = 0,
+    inference_seconds: float = 0.0,
 ) -> None:
     """Log throughput + backlog progress and recommend batch/poll tuning.
 
@@ -289,6 +334,32 @@ def _log_cycle_summary(
         remaining,
         done,
     )
+    if ocr_pages or total_tokens or inference_seconds:
+        # Per-cycle OCR averages on top of the existing throughput/backlog
+        # line. Tokens come only from pages that reported a count (content
+        # path); the ingest-parity archive pass runs Chandra inside ocrmypdf
+        # workers where per-page counts are not visible (n/a).
+        avg_inf = (inference_seconds / ocr_pages) if ocr_pages else 0.0
+        if pages_with_tokens == ocr_pages:
+            tok_str = f"{total_tokens} tokens"
+            avg_tok = (total_tokens / ocr_pages) if ocr_pages else 0.0
+            avg_line = f"{avg_tok:.0f} tokens/page"
+        elif pages_with_tokens:
+            tok_str = f"{total_tokens} tokens ({pages_with_tokens}/{ocr_pages} pages reported)"
+            avg_line = f"{total_tokens / pages_with_tokens:.0f} tokens/reported page"
+        else:
+            tok_str = "n/a tokens"
+            avg_line = "n/a tokens/page"
+        log.info(
+            "cycle OCR stats: %d OCR'd page(s) over %d document(s), %s, "
+            "%.1fs inference (%.1fs/page), %s",
+            ocr_pages,
+            succeeded,
+            tok_str,
+            inference_seconds,
+            avg_inf,
+            avg_line,
+        )
     if remaining <= 0 or docs_per_min <= 0:
         return
     eta_min = remaining / docs_per_min

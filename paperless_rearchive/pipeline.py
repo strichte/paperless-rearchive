@@ -118,18 +118,32 @@ def _skip_not_ocrable(
     _finish(api, ctx, success=True, note=note, settings=settings, extra_tags=[skipped_tag_id])
 
 
+@dataclass
+class DocStats:
+    """Per-document OCR stats returned to the poller for cycle aggregates."""
+
+    ocr_pages: int = 0
+    total_tokens: int = 0
+    pages_with_tokens: int = 0
+    inference_seconds: float = 0.0
+
+
 def process_document(
     settings: Settings,
     api: PaperlessAPI,
     provider: OcrProviderPlugin,
     ctx: DocumentContext,
-) -> None:
+) -> DocStats:
     """Re-OCR one document using unified Chandra OCR engine.
 
     Tag outcomes:
     * success  -> trigger removed, ``<trigger>-success`` added
     * failure  -> trigger removed, ``<trigger>-failure`` added
     * retry    -> trigger kept (transient OCR error); nothing else touched
+
+    Returns per-document OCR stats (tokens / inference) so the poller can
+    aggregate per-cycle averages. Early returns (gates, dry runs, failures)
+    yield an empty DocStats.
     """
     doc = api.document(ctx.doc_id)
     log.debug("Document %d: retrieved from API, title=%r", ctx.doc_id, doc.get("title"))
@@ -154,7 +168,7 @@ def process_document(
         # 5080, an .xls original: 3 failed cycles + failure escalation).
         if original.suffix.lower() not in _OCRABLE_SUFFIXES:
             _skip_not_ocrable(settings, api, ctx, original)
-            return
+            return DocStats()
 
         # Layer 1 of the OCR strategy: per-page provenance (born-digital vs
         # scanned vs mixed). The verdict routes pages to OCR and, for a
@@ -199,7 +213,7 @@ def process_document(
                 )
             elif provenance.kind == TEXT_BASED and settings.skip_born_digital:
                 _preserve_born_digital(settings, api, ctx, provenance)
-                return
+                return DocStats()
             elif provenance.kind == UNKNOWN:
                 log.warning(
                     "Document %d: provenance unknown - falling back to "
@@ -219,7 +233,7 @@ def process_document(
             except RuntimeError as e:
                 if settings.dry_run:
                     log.error("DRY-RUN document %d: DB lookup failed: %s", ctx.doc_id, e)
-                    return
+                    return DocStats()
                 raise
             if not archive_filename:
                 log.info(
@@ -267,11 +281,11 @@ def process_document(
                                 ctx.doc_id,
                                 repair_error,
                             )
-                            return
+                            return DocStats()
                         _finish(
                             api, ctx, success=False, note=str(repair_error), settings=settings
                         )
-                        return
+                        return DocStats()
 
         # Use unified Chandra OCR engine
         log.info(
@@ -318,6 +332,43 @@ def process_document(
             provenance=provenance,
             force=ctx.force,
         )
+        # — per-document OCR stats (tokens / inference / overhead / total) ——
+        # page_stats covers exactly the pages sent to Chandra (error pages
+        # with a completed call included); native/passthrough/skipped pages
+        # have no entry. The ingest-parity archive pass runs Chandra inside
+        # ocrmypdf workers, so page_stats is empty there -> tokens n/a.
+        page_stats = sorted(
+            getattr(result, "page_stats", []) or [], key=lambda s: s.page_num
+        )
+        total_tokens = sum(s.tokens for s in page_stats if s.tokens is not None)
+        known_tokens = sum(1 for s in page_stats if s.tokens is not None)
+        tokens_str = (
+            f"{total_tokens}"
+            if page_stats and known_tokens == len(page_stats)
+            else ("n/a" if not page_stats else f"{total_tokens}* ({known_tokens}/{len(page_stats)} pages)")
+        )
+        inference_s = float(getattr(result, "inference_seconds", 0.0) or 0.0)
+        engine_s = float(getattr(result, "elapsed_seconds", 0.0) or 0.0)
+        for s in page_stats:
+            log.info(
+                "Document %d stats: page %d/%d - %.1fs inference, %s tokens",
+                ctx.doc_id,
+                s.page_num,
+                result.page_count,
+                s.seconds,
+                f"{s.tokens}" if s.tokens is not None else "n/a",
+            )
+        log.info(
+            "Document %d stats: %s tokens over %d OCR'd page(s), "
+            "%.1fs inference (%.1fs/page), %.1fs engine total (%.1fs overhead)",
+            ctx.doc_id,
+            tokens_str,
+            len(page_stats),
+            inference_s,
+            (inference_s / len(page_stats)) if page_stats else 0.0,
+            engine_s,
+            max(engine_s - inference_s, 0.0),
+        )
 
         log.info(
             "Document %d: OCR complete - %d pages, %d succeeded, %d failed",
@@ -346,9 +397,19 @@ def process_document(
             message = "OCR produced no content (all pages failed or empty)"
             log.error("Document %d: %s. Nothing written.", ctx.doc_id, message)
             if settings.dry_run:
-                return
+                return DocStats(
+                    ocr_pages=len(page_stats),
+                    total_tokens=total_tokens,
+                    pages_with_tokens=known_tokens,
+                    inference_seconds=inference_s,
+                )
             _finish(api, ctx, success=False, note=message, settings=settings)
-            return
+            return DocStats(
+                ocr_pages=len(page_stats),
+                total_tokens=total_tokens,
+                pages_with_tokens=known_tokens,
+                inference_seconds=inference_s,
+            )
 
         if settings.dry_run:
             would = f"content ({len(content)} chars)"
@@ -356,7 +417,12 @@ def process_document(
                 would += f" and archive {result.pdf_path}"
             log.info("DRY-RUN document %d: would write %s. Trigger tag kept.", ctx.doc_id, would)
             log.debug("Document %d: DRY-RUN - no actual writes performed", ctx.doc_id)
-            return
+            return DocStats(
+                ocr_pages=len(page_stats),
+                total_tokens=total_tokens,
+                pages_with_tokens=known_tokens,
+                inference_seconds=inference_s,
+            )
 
         api.patch_content(ctx.doc_id, content)
         log.info(
@@ -464,6 +530,17 @@ def process_document(
                       ctx.doc_id, checksum)
 
         ocr_seconds = time.monotonic() - ocr_started
+        doc_overhead_s = max(ocr_seconds - engine_s, 0.0)
+        log.info(
+            "Document %d complete: %s tokens, %.1fs inference, "
+            "%.1fs engine, %.1fs overhead, %.1fs total",
+            ctx.doc_id,
+            tokens_str,
+            inference_s,
+            engine_s,
+            doc_overhead_s,
+            ocr_seconds,
+        )
         _write_provenance(
             settings,
             api,
@@ -488,7 +565,12 @@ def process_document(
             )
         except Exception:
             log.exception("Could not update tags on document %d; keeping trigger.", ctx.doc_id)
-            return
+            return DocStats(
+                ocr_pages=len(page_stats),
+                total_tokens=total_tokens,
+                pages_with_tokens=known_tokens,
+                inference_seconds=inference_s,
+            )
 
     log.info(
         "Document %d re-OCR complete: %d pages, %d succeeded, %d failed%s",
@@ -497,6 +579,12 @@ def process_document(
         result.success_count,
         len(result.error_pages),
         _page_action_summary(result),
+    )
+    return DocStats(
+        ocr_pages=len(page_stats),
+        total_tokens=total_tokens,
+        pages_with_tokens=known_tokens,
+        inference_seconds=inference_s,
     )
 
 
