@@ -127,6 +127,51 @@ def _strip_url_query(text: str) -> str:
     return re.sub(r"https?://[^\s\"']+", _clean, text)
 
 
+def _is_connection_error(exc: BaseException) -> bool:
+    """True when *exc* is (or wraps) a transport failure to paperless.
+
+    Matches by class-name walk over ``__cause__``/``__context__`` rather than
+    importing urllib3/requests exception types: the API layer may raise
+    requests/urllib3 errors, ``OSError``/``TimeoutError``, or our own
+    ``PaperlessError`` wrapping any of those. HTTP error responses (4xx/5xx)
+    are *not* connection errors - the server answered.
+    """
+    seen: set[str] = set()
+    stack = [exc]
+    for _ in range(12):
+        if not stack:
+            break
+        current = stack.pop()
+        name = type(current).__name__
+        if name in seen:
+            continue
+        seen.add(name)
+        if name in (
+            "ConnectionError",
+            "ConnectTimeout",
+            "ReadTimeout",
+            "Timeout",
+            "TimeoutError",
+            "NewConnectionError",
+            "MaxRetryError",
+            "NameResolutionError",
+            "NameOrServiceNotKnown",
+            "gaierror",
+        ):
+            return True
+        if name == "PaperlessError":
+            # Only a connection error if it wraps a transport failure;
+            # _check() HTTP errors have no cause chain.
+            pass
+        elif isinstance(current, OSError):
+            return True
+        for attr in ("__cause__", "__context__"):
+            nxt = getattr(current, attr, None)
+            if isinstance(nxt, BaseException):
+                stack.append(nxt)
+    return False
+
+
 @dataclass
 class CycleResult:
     """Outcome of one poll cycle, used to schedule the next one."""
@@ -231,7 +276,30 @@ def cycle(settings: Settings, api: PaperlessAPI, provider_name: str) -> CycleRes
             continue
         log.info("processing %d document(s) tagged %r: %s", len(doc_ids), name, doc_ids)
         for doc_id in doc_ids:
-            doc = api.document(doc_id)
+            try:
+                doc = api.document(doc_id)
+            except Exception as exc:
+                if _is_connection_error(exc):
+                    # paperless went away between the backlog snapshot and
+                    # this fetch: same one-line abort as below.
+                    log.error(
+                        "Lost connection to paperless at %s mid-cycle: %s; "
+                        "keeping trigger tags, retrying next cycle.",
+                        settings.paperless_url,
+                        _short_error(exc),
+                    )
+                    return CycleResult(
+                        processed=processed,
+                        succeeded=succeeded,
+                        failed=failed,
+                        remaining=total_backlog,
+                        aborted=True,
+                        ocr_pages=cycle_ocr_pages,
+                        total_tokens=cycle_tokens,
+                        pages_with_tokens=cycle_token_pages,
+                        inference_seconds=cycle_inference_s,
+                    )
+                raise
             doc_tags = list(doc.get("tags", []))
             forced = force_tag_id is not None and force_tag_id in doc_tags
             ctx = DocumentContext(
@@ -576,8 +644,18 @@ def main() -> None:
                 # trigger tag and will be retried - back off.
                 no_progress_streak += 1
             wait = _next_wait(settings, result, no_progress_streak)
-        except Exception:  # noqa: BLE001 - network hiccup: back off, retry next cycle
-            log.exception("cycle failed; retrying after backoff")
+        except Exception as exc:  # noqa: BLE001 - network hiccup: back off, retry next cycle
+            if _is_connection_error(exc):
+                # paperless down (DNS/refused/timeout, including mid-cycle
+                # failures cycle() didn't already convert): one line, no
+                # traceback - the detail names the root cause.
+                log.error(
+                    "Cannot reach paperless at %s: %s; retrying after backoff.",
+                    settings.paperless_url,
+                    _short_error(exc),
+                )
+            else:
+                log.exception("cycle failed; retrying after backoff")
             no_progress_streak += 1
             wait = min(
                 settings.poll_interval,
