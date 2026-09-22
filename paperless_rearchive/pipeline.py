@@ -335,8 +335,11 @@ def process_document(
         # — per-document OCR stats (tokens / inference / overhead / total) ——
         # page_stats covers exactly the pages sent to Chandra (error pages
         # with a completed call included); native/passthrough/skipped pages
-        # have no entry. The ingest-parity archive pass runs Chandra inside
-        # ocrmypdf workers, so page_stats is empty there -> tokens n/a.
+        # have no entry. Content-path stats carry exact per-page tokens;
+        # the ingest-parity archive pass harvests the token total from the
+        # upstream client's own DEBUG record, so per-page tokens there are
+        # n/a (wall average for time). Prefer the engine's own token total
+        # when the tap saw more pages than page_stats carries.
         page_stats = sorted(
             getattr(result, "page_stats", []) or [], key=lambda s: s.page_num
         )

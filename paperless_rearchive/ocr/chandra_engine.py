@@ -48,14 +48,112 @@ from paperless_rearchive.ocr.server_check import ensure_server_reachable
 log = logging.getLogger(__name__)
 
 # Token capture: the upstream client returns only the raw string, dropping the
-# per-page ``GenerationResult.token_count`` (completion tokens). Wrapping
-# ``generate_vllm`` at the ``paperless_chandra.engine.client`` reference lets
-# this engine recover the count without forking the client: every result list
-# produced inside a page window contributes its token sum to that page. The
-# stack is thread-local, so concurrent pages (each on its own worker thread,
-# retries included) accumulate independently; FIFO/LIFO popping is avoided
-# entirely - each thread only ever touches its own window.
+# per-page ``GenerationResult.token_count`` (completion tokens). Two capture
+# paths cover the two engine flows:
+#
+# * Content path (``_ocr_page`` / ``_ocr_document_pages``): calls
+#   ``chandra_client.ocr_image`` in this process, so a wrapper around the
+#   ``generate_vllm`` reference fills a thread-local per-page window.
+#   Thread-local (not global) so concurrent pages accumulate independently;
+#   FIFO/LIFO popping is avoided entirely - each thread only touches its own
+#   window.
+# * Ingest-parity archive pass (``ocrmypdf`` + Chandra plugin): the plugin
+#   calls the same ``client.ocr_image`` in-process too (ocrmypdf runs with
+#   ``use_threads=True``), but per-page windows can't be opened around calls
+#   we don't make. Instead a logging handler harvests the client's own
+#   ``Chandra returned %d output tokens for one page.`` DEBUG record into a
+#   lock-guarded global accumulator: exact for totals, no per-page
+#   attribution (ordering across threads is meaningless), so per-page time
+#   there is wall average only.
 _TOKEN_WINDOW = threading.local()
+_TOKEN_LOCK = threading.Lock()
+_TOKEN_PASS_TOTAL = 0
+_TOKEN_PASS_PAGES = 0
+_TOKEN_RE = re.compile(r"Chandra returned (\d+) output tokens for one page\.")
+
+
+class _TokenLogTap(logging.Handler):
+    """Accumulate upstream per-page token DEBUG records into the pass total."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return
+        m = _TOKEN_RE.search(msg or "")
+        if not m:
+            return
+        try:
+            tokens = int(m.group(1))
+        except ValueError:
+            return
+        global _TOKEN_PASS_TOTAL, _TOKEN_PASS_PAGES
+        with _TOKEN_LOCK:
+            _TOKEN_PASS_TOTAL += tokens
+            _TOKEN_PASS_PAGES += 1
+
+
+class _ForwardWarnings(logging.Handler):
+    """Re-emit WARNING+ from the tapped logger to the root handlers.
+
+    Needed because the tap sets ``propagate=False`` on the upstream client
+    logger (to keep its per-page token DEBUG records off the console): without
+    this, the client's thinking-template warning would be silenced too.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            for handler in logging.getLogger().handlers:
+                handler.handle(record)
+        except Exception:
+            pass
+
+
+_TOKEN_LOG_TAP = _TokenLogTap(level=logging.DEBUG)
+_FORWARD_WARNINGS = _ForwardWarnings(level=logging.WARNING)
+_TOKEN_LOG_TAP_ATTACHED = False
+
+
+def _attach_token_log_tap() -> None:
+    """Attach the token log tap to the upstream client logger (idempotent).
+
+    The handler is attached to the *named* ``paperless.chandra.client``
+    logger with ``propagate=False`` on that logger, so the tap still fires
+    (handlers on the logger itself always run) but the token DEBUG records
+    never reach the root handlers - no per-page DEBUG spam on the console.
+    A second forwarder re-emits WARNING+ to the root handlers, so the
+    client's thinking-template warning still surfaces. Only the *named*
+    logger's level is forced to DEBUG (never the root), so no other logger
+    emits more than before.
+    """
+
+    global _TOKEN_LOG_TAP_ATTACHED
+    if _TOKEN_LOG_TAP_ATTACHED:
+        return
+    try:
+        client_log = logging.getLogger("paperless.chandra.client")
+        if _TOKEN_LOG_TAP not in client_log.handlers:
+            client_log.addHandler(_TOKEN_LOG_TAP)
+        if _FORWARD_WARNINGS not in client_log.handlers:
+            client_log.addHandler(_FORWARD_WARNINGS)
+        if client_log.level > logging.DEBUG or client_log.level == logging.NOTSET:
+            client_log.setLevel(logging.DEBUG)
+        client_log.propagate = False
+    except Exception:
+        return
+    _TOKEN_LOG_TAP_ATTACHED = True
+
+
+def _reset_pass_tokens() -> None:
+    global _TOKEN_PASS_TOTAL, _TOKEN_PASS_PAGES
+    with _TOKEN_LOCK:
+        _TOKEN_PASS_TOTAL = 0
+        _TOKEN_PASS_PAGES = 0
+
+
+def _take_pass_tokens() -> tuple[int, int]:
+    with _TOKEN_LOCK:
+        return _TOKEN_PASS_TOTAL, _TOKEN_PASS_PAGES
 
 
 def _token_stack() -> list[list[int]]:
@@ -398,6 +496,7 @@ class ChandraOcrEngine:
         self._max_retries = _upstream_max_retries()
         _install_retry_log_interceptor()
         _install_token_tap()
+        _attach_token_log_tap()
         global _policy_logged
         if not _policy_logged:
             log.info(
@@ -830,6 +929,9 @@ class ChandraOcrEngine:
             "ocrmypdf args: %s",
             {k: ("***" if "api_key" in k else v) for k, v in args.items() if k != "plugins"},
         )
+        _attach_token_log_tap()
+        _reset_pass_tokens()
+        pass_started = time.monotonic()
         try:
             ocrmypdf.ocr(**args)
         except Exception as exc:  # noqa: BLE001 - mirror paperless's safe fallback
@@ -847,6 +949,8 @@ class ChandraOcrEngine:
             )
             args = _build(safe_fallback=True)
             log.debug("Retrying OCRmyPDF with args: %s", args)
+            _reset_pass_tokens()
+            pass_started = time.monotonic()
             try:
                 ocrmypdf.ocr(**args)
             except Exception as exc2:  # noqa: BLE001
@@ -917,21 +1021,52 @@ class ChandraOcrEngine:
             len(content),
             f", pages={mixed_pages}" if mixed_pages else "",
         )
-        # The ocrmypdf pass runs Chandra inside worker processes (jobs>1),
-        # so per-page token counts are not visible here: report n/a rather
-        # than a misleading zero.
+        # Token totals come from the tap on the upstream client's own
+        # per-page DEBUG record (the plugin calls client.ocr_image
+        # in-process under ocrmypdf's thread pool). Per-page attribution
+        # across threads is meaningless, so per-page inference is the wall
+        # average; the ocrmypdf pass wall time doubles as inference time
+        # here (render/assembly inside the pass are inseparable).
+        pass_tokens, pass_pages = _take_pass_tokens()
+        ocr_page_count = sum(1 for a in page_actions.values() if a == "ocr")
+        inference_s = time.monotonic() - pass_started
+        ocr_page_nums = sorted(p for p, a in page_actions.items() if a == "ocr")
+        page_stats = (
+            [PageStat(n, inference_s / ocr_page_count, None) for n in ocr_page_nums]
+            if ocr_page_count
+            else []
+        )
+        if pass_pages == ocr_page_count and ocr_page_count:
+            # Full attribution: spread the total evenly, with the remainder
+            # distributed one token each over the first pages so the per-page
+            # values sum exactly to the pass total.
+            per_page, remainder = divmod(pass_tokens, ocr_page_count)
+            page_stats = [
+                PageStat(n, inference_s / ocr_page_count, per_page + (1 if i < remainder else 0))
+                for i, n in enumerate(ocr_page_nums)
+            ]
+            tok_str = f"{pass_tokens}"
+        elif pass_pages:
+            tok_str = f"{pass_tokens}* ({pass_pages}/{ocr_page_count} pages)"
+        else:
+            tok_str = "n/a"
         log.info(
-            "OCR stats: n/a token(s) over %d OCR'd page(s), "
-            "%.1fs inference (n/a/page), %.1fs total",
-            sum(1 for a in page_actions.values() if a == "ocr"),
+            "OCR stats: %s token(s) over %d OCR'd page(s), "
+            "%.1fs inference (%.1fs/page), %.1fs total (%.1fs overhead)",
+            tok_str,
+            ocr_page_count,
+            inference_s,
+            (inference_s / ocr_page_count) if ocr_page_count else 0.0,
             elapsed,
+            max(elapsed - inference_s, 0.0),
         )
         return OcrResult(
             markdown=content,
             pdf_path=output_pdf_path,
             page_count=total_pages,
             page_actions=page_actions,
-            inference_seconds=0.0,
+            page_stats=page_stats,
+            inference_seconds=inference_s,
             elapsed_seconds=elapsed,
         )
 
