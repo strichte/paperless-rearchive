@@ -38,3 +38,10 @@ secrets/
 *.key
 id_rsa*
 id_ed25519*
+.clinerules/memory-bank.md
+memory-bank/activeContext.md
+memory-bank/productContext.md
+memory-bank/progress.md
+memory-bank/projectbrief.md
+memory-bank/systemPatterns.md
+memory-bank/techContext.md
