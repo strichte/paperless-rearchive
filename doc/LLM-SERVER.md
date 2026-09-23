@@ -1,27 +1,32 @@
 # LLM Server setup
 
 ## Introduction
-I tested a few configurations. While the Chandra models run faster on `vllm`, I prefer running the GGUF version in `llama-swap`. It allows me to easily use the same GPU for other tasks and swap models in and out dynamically.
 
-To give an idea of real life speeds, I tested tag `re-ocr-all` on a complex 4 page document. It is a scan from old council files with a mix of forms filled out by hand, hand written letters, and a technical drawing. The table shows the total OCR time, which includes inference and processing overhead.
+I tested a few configurations. The Chandra models run faster on `vllm`, but I prefer the GGUF version under `llama-swap` — it lets me share the same GPU with other tasks and swap models in and out dynamically.
 
-For my documents I didn't notice a quality diofferene between to full model and the quantisized version.
+To give an idea of real-life speeds, I tested tag `re-ocr-all` on a complex 4-page document: a scan from old council files with a mix of hand-filled forms, handwritten letters, and a technical drawing. The table shows total OCR time, including inference and processing overhead.
 
-|Server | REARCHIVE_OCR_CONCURRENCY | Model | OCR Duration / sec |
-| :-------- | --------: | :-------- | --------: |
-| llama-swap:v255-cuda13-b10902<sup>[1](#note1)</sup> | 4|  chandra-ocr-2-q8 | 17.8 |
-| llama-swap:v255-cuda13-b10902<sup>[1](#note1)</sup> | 4|  chandra-ocr-2-bf16  | 23.1 |
+For my documents I didn't notice a quality difference between the full model and the quantized version.
+
+| Server | REARCHIVE_OCR_CONCURRENCY | Model | OCR duration (s) |
+| :----- | ------------------------: | :---- | ---------------: |
+| llama-swap:v255-cuda13-b10902[^1] | 4 | chandra-ocr-2-q8 | 17.8 |
+| llama-swap:v255-cuda13-b10902[^1] | 4 | chandra-ocr-2-bf16 | 23.1 |
 | vllm:v0.30.0 | 4 | chandra-ocr-2-FP8-dynamic | 16.6 |
 | vllm:v0.30.0 | 4 | chandra-ocr-2 | 18.2 |
 
+[^1]: Runs `llama-server` 0.4.0-dev (build 10902, commit df03399b8) with GGUF models.
 
-<a name="note1">1</a>: Running `llama-server` version 0.4.0-dev (build 10902, commit df03399b8) runnin GGUF model
+So for the quantized version we're looking at 17.8 s vs 16.6 s — `llama-swap` vs `vllm`, a 7.2% increase. Not much, and I'll take the flexibility.
 
-So for the quntrisized version we are looking at 17.8 vs 16.6 seconds for `llama-swap` vs `vllm`. A 7.2% increase. 
+## Prerequisites
+
+- Docker + Docker Compose v2.
+- NVIDIA driver and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) — `docker run --gpus all … nvidia-smi` must work.
 
 ## `llama-swap` Setup
 
-Create directories and download models:
+Create the directories and download the models:
 ```bash
 mkdir -p ~/docker/llama-swap/models/chandra-ocr-2
 cd ~/docker/llama-swap/models/chandra-ocr-2
@@ -38,23 +43,22 @@ curl -L -C - -o chandra-ocr-2.BF16.gguf \
 curl -L -C - -o chandra-ocr-2.mmproj-f16.gguf \
   https://huggingface.co/prithivMLmods/chandra-ocr-2-GGUF/resolve/main/chandra-ocr-2.mmproj-f16.gguf
 
-# Hard link vor vision projector
+# Hard link for the bf16 variant (same file)
 ln chandra-ocr-2.mmproj-f16.gguf chandra-ocr-2.mmproj-bf16.gguf
 ```
 
-**mmproj note:** the repo's `mmproj-bf16.gguf` is byte-identical to
-`mmproj-f16.gguf`. This directory keeps a single physical copy; `chandra-ocr-2.mmproj-bf16.gguf`
-is a **hardlink** to `chandra-ocr-2.mmproj-f16.gguf`.
+**mmproj note:** the repo's `mmproj-bf16.gguf` is byte-identical to `mmproj-f16.gguf` (same sha256 — one projector ships with every quant). We keep a single physical copy: `chandra-ocr-2.mmproj-bf16.gguf` is a **hardlink** to `chandra-ocr-2.mmproj-f16.gguf`. Re-create it after any re-download with the `ln` command above.
 
-In the same directory as your `docker-compose.yanl` create `.env` and set your Chandra API key in it:
+In the same directory as your `docker-compose.yaml`, create a `.env` file with your Chandra API key:
+
 ```bash
-export CHANDRA_API_KEY=super-secret_key
+# .env — read by docker compose for interpolation
+CHANDRA_API_KEY=super-secret_key
 ```
-You'll need the same key when configuring your `paparless-rearchive` sidecar container.
 
-The `docker-compose.yaml` shows the config for both the full and the quantisized model. Obviously only run one at a time.
+Any random string works — it's just a bearer token shared between the sidecar and the server. You'll need the same key when configuring the `paperless-rearchive` sidecar.
 
-Create `~/docker/llama-swap/config.yaml`:
+Create `~/docker/llama-swap/config.yaml`. It defines both variants — they can coexist: llama-swap loads a model on the first request and unloads it after `ttl: 600` (10 min idle), so only one model occupies the GPU at a time:
 ```yaml
 models:
   "chandra-ocr-2-q8":
@@ -90,6 +94,9 @@ models:
       --jinja
       --chat-template-kwargs '{"enable_thinking":false}'
 ```
+
+Both entries run with `--temp 0.0` (Chandra expects greedy decoding — llama-server's default of 0.8 makes output nondeterministic) and `--chat-template-kwargs '{"enable_thinking":false}'` (GGUF builds re-enable thinking otherwise, which breaks the output).
+
 Create `docker-compose.yaml`:
 ```yaml
 services:
@@ -117,11 +124,22 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-
 ```
 
+Start it and check that it responds:
+
+```bash
+docker compose up -d
+curl http://localhost:8110/v1/models -H "Authorization: Bearer super-secret_key"
+```
+
+llama-swap answers on port `8110`; the first request triggers the model load, so give it a few seconds.
+
 ## `vLLM` Setup
-Create directories and download models:
+
+The `hf` CLI ships with `huggingface_hub` (`pip install -U huggingface_hub`).
+
+Create the directories and download the models:
 ```bash
 mkdir -p ~/docker/vllm/models/chandra-ocr-2/
 mkdir -p ~/docker/vllm/vllm-cache/chandra-ocr-2
@@ -129,15 +147,16 @@ mkdir -p ~/docker/vllm/models/chandra-ocr-2-FP8-dynamic
 mkdir -p ~/docker/vllm/vllm-cache/chandra-ocr-2-FP8-dynamic
 hf download datalab-to/chandra-ocr-2 --local-dir ~/docker/vllm/models/chandra-ocr-2
 hf download dangvansam/chandra-ocr-2-FP8-dynamic --local-dir ~/docker/vllm/models/chandra-ocr-2-FP8-dynamic
-models/chandra-ocr-2/
 ```
-In the same directory as your `docker-compose.yanl` create `.env` and set your Chandra API key in it:
-```bash
-export CHANDRA_API_KEY=super-secret_key
-```
-You'll need the same key when configuring your `paparless-rearchive` sidecar container.
 
-The `docker-compose.yaml` shows the config for both the full and the quantisized model. Obviously only run one at a time.
+In the same directory as your `docker-compose.yaml`, create the same `.env` as above:
+
+```bash
+# .env — read by docker compose for interpolation
+CHANDRA_API_KEY=super-secret_key
+```
+
+Create `docker-compose.yaml` with **one** of the two services shown below — don't run both: they bind the same host port `8000` and each reserves a GPU.
 ```yaml
 services:
   chandra-server-fp8:
@@ -203,3 +222,26 @@ services:
               capabilities: ["gpu"]
               count: 1
 ```
+
+Start it and check that it responds:
+
+```bash
+docker compose up -d
+curl http://localhost:8000/v1/models -H "Authorization: Bearer super-secret_key"
+```
+
+## Connect the sidecar
+
+Point `paperless-rearchive` at whichever server you picked:
+
+```yaml
+environment:
+  # llama-swap, same compose network:   http://llama-swap:8080/v1
+  # llama-swap, via host port:          http://<host>:8110/v1
+  # vllm, same compose network:         http://chandra-server:8000/v1
+  PAPERLESS_CHANDRA_SERVER_URL: "http://llama-swap:8080/v1"
+  PAPERLESS_CHANDRA_MODEL_NAME: "chandra-ocr-2-q8"   # llama-swap config key or vllm --served-model-name
+  PAPERLESS_CHANDRA_API_KEY: "super-secret_key"       # same CHANDRA_API_KEY from .env
+```
+
+`PAPERLESS_CHANDRA_MODEL_NAME` must match a name the server actually advertises — a mismatch aborts the poll cycle. See the [README configuration reference](../README.md#configuration-reference) for all options.
