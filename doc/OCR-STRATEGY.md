@@ -6,7 +6,7 @@ Good question. Let me trace through the code for both paths and give you a preci
 
 ## Short answer
 
-When `PDF_PROVENANCE=off`, **`SKIP_BORN_DIGICAL` is not consulted at all**. The document always proceeds to the OCR engine, and whether the born-digital content is preserved depends entirely on `OCR_MODE` (and the legacy heuristics inside `resolve_mode`), not on `SKIP_BORN_DIGITAL`.
+When `PDF_PROVENANCE=off`, **`SKIP_BORN_DIGITAL` is not consulted at all**. The document always proceeds to the OCR engine, and whether the born-digital content is preserved depends entirely on `OCR_MODE` (and the legacy heuristics inside `resolve_mode`), not on `SKIP_BORN_DIGITAL`.
 
 The `SKIP_BORN_DIGITAL` setting only fires in the `PDF_PROVENANCE=on` path, at pipeline.py:148:
 ```python
@@ -42,6 +42,14 @@ So the outcome for a born-digital document with `PDF_PROVENANCE=off` depends on 
 
 So `SKIP_BORN_DIGITAL=true` + `PDF_PROVENANCE=off` does **not** give you the same guarantee as `SKIP_BORN_DIGITAL=true` + `PDF_PROVENANCE=on`. With `on`, the doc is explicitly detected as `text_based` and skipped entirely (no OCR, no PATCH, no archive, tagged `re-ocr-preserved`). With `off`, the doc goes through ocrmypdf and the outcome is whatever `OCR_MODE` says.
 
+### How paperless-ngx decides upstream
+
+Reference for what the mode-driven fallback above mirrors (verified against upstream `main`):
+
+- `pdf_born_digital_text` runs `pdftotext` and treats ≥ 50 extracted characters as "has text" (`PDF_TEXT_MIN_LENGTH` in `paperless/parsers/utils.py`). An invisible OCR overlay clears that easily — pre-paperless archive scans look born-digital to it.
+- Mode → ocrmypdf flag (`paperless/parsers/tesseract.py`): `force` → `--force-ocr`, `redo` → `--redo-ocr`, `auto` → `--skip-text` when text was found (plain OCR otherwise), `off` → OCR never runs (pdftotext + format conversion only).
+- paperless-ngx *can* re-run OCR on existing documents — the UI **Reprocess** action, `POST /api/documents/reprocess/`, or `document_archiver --overwrite` — but the action honors the **global** `PAPERLESS_OCR_MODE`; there is no per-call override ([#6289](https://github.com/paperless-ngx/paperless-ngx/issues/6289)). Under `auto`, reprocessing an overlay scan is a silent no-op: redoing it needs a global flip to `redo` + restart + flip back, which also changes how every future ingest is handled.
+
 ---
 
 ## The documentation currently overstates this
@@ -62,7 +70,7 @@ That's true for both paths, but it should also note that it **only gates when `P
 
 Two options:
 
-1. **Document the current behaviour accurately** — `SKIP_BORN_DIGICAL` is a provenance-gated setting; with `PDF_PROVENANCE=off` it has no effect, and `OCR_MODE` + legacy heuristics determine what happens to born-digital docs.
+1. **Document the current behaviour accurately** — `SKIP_BORN_DIGITAL` is a provenance-gated setting; with `PDF_PROVENANCE=off` it has no effect, and `OCR_MODE` + legacy heuristics determine what happens to born-digital docs.
 
 2. **Extend `SKIP_BORN_DIGITAL` to also gate the mode-driven path** — when `PDF_PROVENANCE=off` and the legacy heuristics detect a born-digital PDF, skip it if `SKIP_BORN_DIGITAL=true`. This would make the setting actually work the way the docs say it does for both paths.
 

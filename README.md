@@ -1,13 +1,36 @@
 # paperless-rearchive <!-- omit from toc -->
 
 A tag-driven sidecar for [paperless-ngx](https://docs.paperless-ngx.com) that **re-OCRs documents
-already in your library** with [Chandra](https://github.com/datalab-to/chandra), an LLM vision
-OCR model and optionally regenerates the *archive* (searchable PDF/A) the same way
-paperless-ngx does at ingest. Something the paperless-ngx API deliberately does not let you do.
+already in your library** with [Chandra](https://github.com/datalab-to/chandra) (an LLM vision
+OCR model) and optionally regenerates the *archive* (searchable PDF/A) with the new OCR layer the same way
+paperless-ngx does at ingest.
 
 - Tag a document `re-ocr-content` → its `content` field is replaced with fresh OCR markdown.
 - Tag it `re-ocr-all` → content **plus** the archive file is regenerated.
 - The sidecar polls paperless for these tags and processes tagged documents in the background.
+
+## Why not just paperless-ngx?<!-- omit from toc -->
+
+paperless-ngx *can* re-run OCR on existing documents — the UI **Reprocess** action,
+`POST /api/documents/reprocess/`, and `document_archiver --overwrite --document <id>` all
+exist. For a real re-OCR campaign they fall short:
+
+- **Invisible text layers are skipped by default.** Reprocess honors the global
+  `PAPERLESS_OCR_MODE`; under the default `auto`, any PDF with ≥50 characters of extractable
+  text is treated as "already has text" and OCR is skipped (`--skip-text`). Scans carrying
+  an old, invisible OCR overlay — typical for libraries imported from earlier tools — are
+  silently left alone. Getting past that means flipping the *global* mode to `redo`,
+  restarting, reprocessing, then flipping it back — which also changes how every future
+  ingest is handled ([#6289](https://github.com/paperless-ngx/paperless-ngx/issues/6289)).
+- **The born-digital test is document-level.** A scanned page with an invisible overlay, or
+  a mixed native/scan document, is judged all-or-nothing — no per-page routing (see
+  [OCR strategy](#ocr-strategy)).
+- **Only paperless's configured OCR engine.** There is no way to say "re-OCR *these*
+  documents with Chandra, via a plain OpenAI-compatible endpoint".
+- **No safety net for bulk replacement.** No dry-run, no unconditional backups, no one-shot
+  restore — exactly what you want before anything rewrites archive files at scale.
+
+This sidecar is the tag-driven, per-page-provenance, dry-run-and-backup way to do it.
 
 ## Is this tool for you?<!-- omit from toc -->
 
