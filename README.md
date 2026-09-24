@@ -2,7 +2,7 @@
 
 A tag-driven sidecar for [paperless-ngx](https://docs.paperless-ngx.com) that **re-OCRs documents
 already in your library** with [Chandra](https://github.com/datalab-to/chandra), an LLM vision
-OCR model — and optionally regenerates the *archive* (searchable PDF/A) the same way
+OCR model and optionally regenerates the *archive* (searchable PDF/A) the same way
 paperless-ngx does at ingest. Something the paperless-ngx API deliberately does not let you do.
 
 - Tag a document `re-ocr-content` → its `content` field is replaced with fresh OCR markdown.
@@ -21,7 +21,7 @@ Re-OCR rewrites `content` and *replaces archive files*. Check every item:
 - **PostgreSQL** (`re-ocr-all` only). SQLite/MariaDB: `re-ocr-content` works, `re-ocr-all`
   cannot. Reuse paperless's `PAPERLESS_DB*` credentials. Content-only runs never open a DB
   connection.
-- **Local Chandra LLM server**. Same server as [paperless-chandra](https://github.com/flobernd/paperless-chandra) ingest.
+- **Local Chandra LLM server.** Same server as [paperless-chandra](https://github.com/flobernd/paperless-chandra) ingest — see [`doc/LLM-SERVER.md`](doc/LLM-SERVER.md) for setup.
 - **Backup mount.** Every replaced archive is copied to `/archive-backups` first. Mount it
   outside the archive tree (separate bind mount, may be another disk).
 - **No undo button.** Changes are recorded (audit note, provenance fields, `.bak` copies) — still,
@@ -37,6 +37,7 @@ what's already in your library.
 * [Trigger tags](#trigger-tags)
 * [Safety](#safety)
 * [OCR strategy](#ocr-strategy)
+  * [Why a separate provenance test?](#why-a-separate-provenance-test)
 * [Full setup (docker compose)](#full-setup-docker-compose)
   * [Chandra LLM server setup](#chandra-llm-server-setup)
   * [Get the code next to your compose file](#get-the-code-next-to-your-compose-file)
@@ -59,9 +60,7 @@ what's already in your library.
 * [Restoring from backups (`restore_backup`)](#restoring-from-backups-restore_backup)
 * [License](#license)
 
-
-
-## Quickstart 
+## Quickstart
 
 A minimal service `docker-compose.yml`. Only required settings — everything else runs on defaults (see [Configuration reference](#configuration-reference)).
 
@@ -182,128 +181,23 @@ Use it when you want behaviour parity with ingest or when pdf-inspector is unava
 
 ### Chandra LLM server setup
 
-All inference happens on a self-hosted server with an OpenAI-compatible endpoint. The sidecar itself is CPU-only.
-Any server exposing `/v1/chat/completions` works; [vLLM](https://github.com/vllm-project/vllm) is
-the reference. Same server you would use for
-[paperless-chandra](https://github.com/flobernd/paperless-chandra) ingest works as-is. If you want to host with vLLM please follow [paperless-chandra'  recommended setup](https://github.com/flobernd/paperless-chandra/tree/master#docker-compose-example).
+All inference happens on a self-hosted server with an OpenAI-compatible endpoint; the sidecar itself is CPU-only. Any server exposing `/v1/chat/completions` works — [vLLM](https://github.com/vllm-project/vllm) is the reference, and the same server you would use for [paperless-chandra](https://github.com/flobernd/paperless-chandra) ingest works as-is.
 
-Alternatively, you can host it with `llama-swap`:
+Setting one up (model downloads, `llama-swap` or vLLM compose files, benchmarks, wiring the sidecar to it) is documented in **[`doc/LLM-SERVER.md`](doc/LLM-SERVER.md)**. In short:
 
-```yaml
-services:
-    image: ghcr.io/mostlygeek/llama-swap:v255-cuda13-b10902
-    labels:
-    container_name: llama-swap
-    ports:
-      - "8080:8080"
-    volumes:
-      - ~/docker/llama.cpp/models:/models
-      - ~/docker/llama.cpp/cache:/root/.cache/huggingface
-      - ~/docker/llama-swap/config.yaml:/app/config.yaml
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=all
-      - CHANDRA_API_KEY=${CHANDRA_API_KEY:?missing CHANDRA_API_KEY in .env}
-    restart: unless-stopped
-    command: --config /app/config.yaml --listen 0.0.0.0:8080
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-```
-with `config.yaml`:
-```yaml
-models:
-  "chandra-ocr-2-q8":
-    description: "Datalab Chandra OCR 2 (5B vision model) - document/image OCR to markdown"
-    ttl: 600
-    cmd: |
-      llama-server
-      -m /models/chandra-ocr-2/chandra-ocr-2.Q8_0.gguf
-      --mmproj /models/chandra-ocr-2/chandra-ocr-2.mmproj-f16.gguf
-      --port ${PORT}
-      --api-key ${env.CHANDRA_API_KEY}
-      -ngl 999
-      --parallel 1
-      --flash-attn on
-      --ctx-size 18000
-      --temp 0.0
-      --jinja
-      --chat-template-kwargs '{"enable_thinking":false}'
-  "chandra-ocr-2-bf16":
-    description: "Datalab Chandra OCR 2 (5B vision model) - unquantized BF16, max fidelity"
-    ttl: 600
-    cmd: |
-      llama-server
-      -m /models/chandra-ocr-2/chandra-ocr-2.BF16.gguf
-      --mmproj /models/chandra-ocr-2/chandra-ocr-2.mmproj-bf16.gguf
-      --port ${PORT}
-      --api-key ${env.CHANDRA_API_KEY}
-      -ngl 999
-      --parallel 1
-      --flash-attn on
-      --ctx-size 18000
-      --temp 0.0
-      --jinja
-      --chat-template-kwargs '{"enable_thinking":false}'
-```
-
-The model name (`chandra-ocr-2-q8` and `chandra-ocr-2-bf16` in the example above) is what you specify in your `paperless-rearchive` docker compose file with the `PAPERLESS_CHANDRA_MODEL_NAME` environment variable.
-
-I've downloaded two different quants of the Chandra model to `~/docker/llama.cpp/models` and added the directory with bind mount `~/docker/llama.cpp/models:/models` to `llama-swap`. Pick the one that works for you or try both and compare the results. I found Q8 to give very good results already.
-
-```bash
-mkdir -p ~/docker/llama.cpp/models/chandra-ocr-2
-cd ~/docker/llama.cpp/models/chandra-ocr-2
-
-# Q8_0 quantized (~5.16 GB)
-curl -L -C - -o chandra-ocr-2.Q8_0.gguf \
-  https://huggingface.co/prithivMLmods/chandra-ocr-2-GGUF/resolve/main/chandra-ocr-2.Q8_0.gguf
-
-# Unquantized BF16 (~9.7 GB) — lossless repackaging of the bf16 checkpoint weights
-curl -L -C - -o chandra-ocr-2.BF16.gguf \
-  https://huggingface.co/prithivMLmods/chandra-ocr-2-GGUF/resolve/main/chandra-ocr-2.BF16.gguf
-
-# Vision projector (shared by both variants — see note below)
-curl -L -C - -o chandra-ocr-2.mmproj-f16.gguf \
-  https://huggingface.co/prithivMLmods/chandra-ocr-2-GGUF/resolve/main/chandra-ocr-2.mmproj-f16.gguf
-```
-
-Files:
-- `chandra-ocr-2.Q8_0.gguf`         5,157,833,312 bytes (~5.16 GB)
-- `chandra-ocr-2.BF16.gguf`        9,695,791,712 bytes (~9.70 GB)  ← unquantized
-- `chandra-ocr-2.mmproj-f16.gguf`     675,568,928 bytes (~676 MB)
-
-**mmproj note:** the repo's `mmproj-bf16.gguf` is byte-identical to
-`mmproj-f16.gguf` (same sha256 `a270372d…` — one projector ships with every
-quant). You can keep a single physical copy and make `chandra-ocr-2.mmproj-bf16.gguf`
-a **hardlink** to `chandra-ocr-2.mmproj-f16.gguf`. Re-create it after any
-re-download with:
-`ln chandra-ocr-2.mmproj-f16.gguf chandra-ocr-2.mmproj-bf16.gguf`
-
-Served via llama-swap, entries in `~/docker/llama-swap/config.yaml`:
-- `chandra-ocr-2-q8`  → Q8_0
-- `chandra-ocr-2-bf16` → BF16 (unquantized)
-
-Both entries use `--temp 0.0` (Chandra expects greedy decoding; llama-server
-defaults to temp 0.8 which makes output nondeterministic) and
-`--chat-template-kwargs '{"enable_thinking":false}'` is required — see
-https://github.com/flobernd/paperless-chandra (GGUF builds re-enable thinking
-otherwise, breaking the output).
+- Serve a Chandra model under a name of your choice, e.g. `chandra-ocr-2-q8`.
+- Set `PAPERLESS_CHANDRA_SERVER_URL` (e.g. `http://my-ai.local:8000/v1`) and `PAPERLESS_CHANDRA_MODEL_NAME` to that name on the sidecar — see [Chandra inference server](#chandra-inference-server).
+- Set `PAPERLESS_CHANDRA_API_KEY` when the server requires a key (both documented setups do).
 
 **Note:** Datalab's [Chandra OCR 2 model](https://github.com/datalab-to/chandra) uses a dual licensing structure: the source code is licensed under Apache-2.0, while the model weights are governed by a modified OpenRAIL-M license.
 
-* **License Breakdown:** 
+* **License Breakdown:**
   * Code License: Apache-2.0 for the repository's codebase.
   * Model Weights License: Modified OpenRAIL-M.
 * **Usage Terms & Free Tier:**
   * Free Use: Free for research, personal use, and startups with under $2 million in funding or revenue.
   * Restrictions: Cannot be used to compete directly with Datalab's API services.
   * Commercial License: Required for larger organizations, companies with over $2M in revenue/funding, or high-volume/on-prem enterprise needs. You can obtain a commercial agreement through the Datalab Pricing page.
-
-
 
 Same compose file as paperless-ngx (shared network, Postgres, archive dir). Adjust `paperless` /
 `postgres` / server URL to your setup.
@@ -319,8 +213,8 @@ git clone https://github.com/strichte/paperless-rearchive.git
 
 Abbreviated but complete: postgres, valkey/redis, tika, gotenberg, paperless (with Chandra plugin
 for ingest) plus `paperless-rearchive`. Host paths `/data/paperless/...`, UID/GID `1000` are
-placeholders. Chandra server runs elsewhere (`http://my-ai.local:8000/v1` here) — or add
-[chandra-server](#chandra-server-setup) to the same file.
+placeholders. Chandra server runs elsewhere (`http://my-ai.local:8000/v1` here) — or add one to
+the same file, see [`doc/LLM-SERVER.md`](doc/LLM-SERVER.md).
 
 ```yaml
 networks:
@@ -525,7 +419,7 @@ services:
 ```
 
 - Simplest for single-operator instances. Not recommended practice.
-- Also works via `env_file:` — 
+- Also works via `env_file:` (same `KEY=value` lines).
 
 ##### Way 2: `.env` file
 
@@ -534,7 +428,7 @@ See [`doc/deploy/env.example`](doc/deploy/env.example).
 ##### Way 3: compose `secrets:`
 
 Works for all four: `PAPERLESS_API_TOKEN`, `PAPERLESS_CHANDRA_API_KEY`, `PAPERLESS_DBPASS`,
-  `PAPERLESS_DBUSER`. Put the value only in the corresponding secret file, i.e. `./secrets/paperless_db_paperless_passwd` would conly contain your password `super-secret-password`.
+  `PAPERLESS_DBUSER`. Put the value only in the corresponding secret file, i.e. `./secrets/paperless_db_paperless_passwd` would only contain your password `super-secret-password`.
 
 ```yaml
 secrets:
