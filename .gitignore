@@ -20,6 +20,10 @@ venv/
 
 # Local deployment artefacts (secrets, staged tarballs) - top-level deploy dir
 /deploy/
+/tmp/
+/memory-bank/
+/.clinerules
+/.cline/
 *.bak-*
 
 # Keep secrets out of source control
@@ -38,10 +42,4 @@ secrets/
 *.key
 id_rsa*
 id_ed25519*
-.clinerules/memory-bank.md
-memory-bank/activeContext.md
-memory-bank/productContext.md
-memory-bank/progress.md
-memory-bank/projectbrief.md
-memory-bank/systemPatterns.md
-memory-bank/techContext.md
+
