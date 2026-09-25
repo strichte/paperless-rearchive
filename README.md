@@ -63,7 +63,7 @@ re-guesses word boundaries at the wrong positions. Markdown extras (headings,
 struck-through amounts, the drawing's description) live only in the sidecar, so they
 don't survive that round trip either — in short, a Tesseract-shaped assumption meeting
 a different engine. Some would call that a bug; an [issue](https://github.com/flobernd/paperless-chandra/issues/3) has been raised that proposes a change that prefers the sidecar
-under `redo` (keeping `pdftotext` only for missing or partial sidecars). If [paperless-chandra] implements that proposal, the difference will disappear.
+under `redo` (keeping `pdftotext` only for missing or partial sidecars). If the paperless-chandra plugin implements that proposal, the difference will disappear.
 
 paperless-rearchive reads `content` from the sidecar whenever ocrmypdf wrote a
 complete one — ocrmypdf's own `[OCR skipped on page(s)]` marker, not the mode, decides
