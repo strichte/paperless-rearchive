@@ -30,7 +30,46 @@ exist. For a real re-OCR campaign they fall short:
 - **No safety net for bulk replacement.** No dry-run, no unconditional backups, no one-shot
   restore — exactly what you want before anything rewrites archive files at scale.
 
-This sidecar is the tag-driven, per-page-provenance, dry-run-and-backup way to do it.
+### Real output, side by side
+
+Same 4-page scan (a 1960s building-permit file: typed form, two letters, a plumbing
+drawing), same server, same `chandra-ocr-2-q8`, same `format=markdown` — only the
+storage step differs.
+
+**paperless-ngx + the paperless-chandra plugin** (UI **Reprocess**, global
+`PAPERLESS_OCR_MODE=redo` — under `redo` the plugin takes `content` from the archive's
+invisible text layer via `pdftotext` rather than from the model's markdown sidecar):
+
+> I/We herebyap lyforapermitunder "The BoroughCouncilByLaws" authorising
+> theexecutionoftheworks setoutbelow inac ordancewiththelocality plandetailedplans
+> andspecificationsdepositedherewith.
+
+**paperless-rearchive** (`re-ocr-all` — `content` = the model's markdown sidecar,
+verbatim):
+
+> I/We hereby apply for a permit under "The Borough Council By Laws"
+> authorising the execution of the works set out below in accordance with the locality
+> plan detailed plans and specifications deposited herewith.
+
+Every word is recognised correctly in both — only the spacing differs. The difference
+has a history: the plugin's `extract_text` follows stock paperless-ngx's
+`tesseract.py`, where reading the stored layer back under `redo` (rather than the
+sidecar) is deliberate — Tesseract writes *measured* word boxes, so `pdftotext`
+reproduces exactly what was written. Stock paperless-ngx with Tesseract behaves as its
+docs describe; the four gaps listed above are its limitations. Chandra is a vision
+model: it reports no coordinates, so its word boxes are *estimated*
+(`estimate_word_boxes`, described there as "rough by design"), and the same read-back
+re-guesses word boundaries at the wrong positions. Markdown extras (headings,
+struck-through amounts, the drawing's description) live only in the sidecar, so they
+don't survive that round trip either — in short, a Tesseract-shaped assumption meeting
+a different engine. Some would call that a bug; an [issue](https://github.com/flobernd/paperless-chandra/issues/3) has been raised that proposes a change that prefers the sidecar
+under `redo` (keeping `pdftotext` only for missing or partial sidecars). If [paperless-chandra] implements that proposal, the difference will disappear.
+
+paperless-rearchive reads `content` from the sidecar whenever ocrmypdf wrote a
+complete one — ocrmypdf's own `[OCR skipped on page(s)]` marker, not the mode, decides
+when to fall back to `pdftotext` — which is where the second sample comes from. Around
+that sits the tag-driven, per-page-provenance, dry-run-and-backup handling described
+in the rest of this README.
 
 ## Is this tool for you?<!-- omit from toc -->
 
