@@ -1,7 +1,7 @@
 # Changelog
 
 
-## Unreleased
+## 0.2.0 — 2026-09-26
 
 ### Added
 - Born-digital provenance gate (pdf-inspector, per page): a PDF original is
