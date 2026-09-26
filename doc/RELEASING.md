@@ -17,9 +17,10 @@ released commit — it does not branch anything.
 2. **During the cycle**, collect user-facing changes under `## Unreleased`
    in `CHANGELOG.md`.
 3. **At release time**, rename `## Unreleased` → `## <version> — <date>`,
-   drop the `.dev0` suffix from `version` in `pyproject.toml`, run the
-   release check, commit `Release <version>`, tag `v<version>` and push
-   (runbook below).
+   drop the `.dev0` suffix from `version` in `pyproject.toml`, commit
+   `Release <version>`, run the release check, tag `v<version>` and push
+   (runbook below). The check requires a clean tree, so the bump must be
+   committed *before* it runs.
 
 Fix-only releases increment the patch version (`0.1.1`). If a hotfix is
 needed while `main` already carries the next feature cycle, branch
@@ -49,12 +50,17 @@ Record the ref used in the release notes when it matters.
 1. **Finalize the changelog**: rename `## Unreleased` → `## <version> — <date>`
    in `CHANGELOG.md`; drop the `.dev0` suffix from `version` in
    `pyproject.toml`.
-2. **Run the release guard** (clean tree, tag free, version/tag/changelog
+2. **Commit** the release bump (the guard requires a clean tree):
+   ```bash
+   git commit -am "Release <version>"
+   ```
+3. **Run the release guard** (clean tree, tag free, version/tag/changelog
    agreement, full test suite):
    ```bash
    scripts/release-check.sh <version>
    ```
-3. **Commit** the release bump: `git commit -am "Release <version>"`.
+   If it fails, fix the problem and `git commit --amend`, then re-run —
+   the tag does not exist yet, so amending is safe.
 4. **Tag and push**:
    ```bash
    git tag -a v<version> -m "paperless-rearchive <version>"
