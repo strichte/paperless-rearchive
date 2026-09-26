@@ -432,7 +432,7 @@ def test_upstream_generation_error_is_logged_with_model(monkeypatch, caplog) -> 
 # ── mixed-provenance ingest pass (document 5830 regression) ──────────────────
 
 
-def _mixed_provenance(page_count: int = 3) -> "object":
+def _mixed_provenance(page_count: int = 3) -> object:
     from paperless_rearchive.ocr.provenance import MIXED, PdfProvenance
 
     return PdfProvenance(
@@ -456,7 +456,7 @@ def _three_page_pdf(tmp_path: Path) -> Path:
     return path
 
 
-def _ingest_settings() -> "object":
+def _ingest_settings() -> object:
     from types import SimpleNamespace
 
     return SimpleNamespace(

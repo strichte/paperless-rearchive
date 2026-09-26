@@ -591,7 +591,7 @@ def process_document(
     )
 
 
-def _page_action_summary(result: "object") -> str:
+def _page_action_summary(result: object) -> str:
     """Human-readable per-page breakdown for the final run log.
 
     Groups pages by the action the engine took, e.g.

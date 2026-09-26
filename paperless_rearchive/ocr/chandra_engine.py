@@ -736,9 +736,9 @@ class ChandraOcrEngine:
             inference_seconds=inference_s,
             elapsed_seconds=elapsed,
             page_actions={
-                **{p: "ocr" for p in range(1, len(images) + 1)},
+                **dict.fromkeys(range(1, len(images) + 1), "ocr"),
                 **{p: "error" for p in error_pages if p <= len(images)},
-                **{p: "skipped" for p in skipped_pages},
+                **dict.fromkeys(skipped_pages, "skipped"),
             },
         )
 
@@ -966,13 +966,13 @@ class ChandraOcrEngine:
         # run the listed pages get fresh Chandra layers and the rest pass
         # through untouched; otherwise the resolved mode applies per page.
         if mixed_pages:
-            page_actions: dict[int, str] = {p: "ocr" for p in mixed_needed}
+            page_actions: dict[int, str] = dict.fromkeys(mixed_needed, "ocr")
             for p in range(1, total_pages + 1):
                 page_actions.setdefault(p, "passthrough")
         elif resolved_mode == "off":
-            page_actions = {p: "passthrough" for p in range(1, total_pages + 1)}
+            page_actions = dict.fromkeys(range(1, total_pages + 1), "passthrough")
         else:
-            page_actions = {p: "ocr" for p in range(1, total_pages + 1)}
+            page_actions = dict.fromkeys(range(1, total_pages + 1), "ocr")
 
         if mixed_pages:
             # Mixed provenance, --pages run: no sidecar (mutually exclusive
@@ -1200,7 +1200,7 @@ class ChandraOcrEngine:
             doc.close()
 
         # Per-page action map for the final pipeline log.
-        page_actions = {p: "ocr" for p in needed}
+        page_actions = dict.fromkeys(needed, "ocr")
         for p in range(1, total_pages + 1):
             if p not in needed:
                 page_actions[p] = "native"
